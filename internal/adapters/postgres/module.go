@@ -48,7 +48,8 @@ func newTxManagerFx(p TxManagerParams) *TxManager {
 //     para readiness);
 //   - *pgxpool.Pool (para repositórios que leem fora de transação);
 //   - *TxManager e Transactor (interface consumida pelos casos de uso);
-//   - *WalletRepository, *LedgerRepository e *WagerTransactionRepository
+//   - *WalletRepository, *LedgerRepository, *WagerTransactionRepository,
+//     *InboxRepository e *OutboxRepository
 //     (stateless; recebem o Querier/pgx.Tx em cada chamada).
 //
 // Depende de config.Config; *slog.Logger e *metrics.Metrics são opcionais.
@@ -60,5 +61,7 @@ var Module = fx.Module("postgres",
 		NewWalletRepository,
 		NewLedgerRepository,
 		NewWagerTransactionRepository,
+		NewInboxRepository,
+		NewOutboxRepository,
 	),
 )

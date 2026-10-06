@@ -85,6 +85,8 @@ var constraintErrors = map[string]error{
 	"wager_transactions_terminal_immutable":        ErrTransactionFinalized,
 	"wallet_ledger_entries_pkey":                   ErrDuplicateKey,
 	"wallet_ledger_entries_wallet_transaction_key": ErrLedgerEntryExists,
+	"outbox_pkey":                                  ErrDuplicateKey,
+	"outbox_event_id_key":                          ErrDuplicateEvent,
 }
 
 // mapWriteError traduz o erro de uma escrita: constraint conhecida vira a

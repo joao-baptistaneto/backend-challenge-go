@@ -62,7 +62,11 @@ const (
 // Sentinelas. *ConstraintViolation satisfaz errors.Is com
 // ErrConstraintViolation e com a sentinela do seu tipo; *TransientError
 // satisfaz errors.Is com ErrTransient. Ambos só aparecem na cadeia depois de
-// Translate (ou de WithinTx, que traduz erros de infraestrutura próprios).
+// Translate (chamado pelos repositórios ao mapear erros de escrita/leitura).
+// WithinTx NÃO traduz: devolve o erro de fn intacto e embrulha os de
+// BEGIN/COMMIT apenas com %w (e ErrCommitOutcomeUnknown no commit ambíguo).
+// Os predicados (IsTransient, IsRetryable, Is*Violation) funcionam no erro
+// cru, então quem precisa da forma tipada chama Translate no resultado.
 var (
 	ErrConstraintViolation = errors.New("postgres: violação de constraint")
 	ErrUniqueViolation     = errors.New("postgres: violação de UNIQUE")

@@ -197,18 +197,14 @@ func (c txConfig) shouldRetry(err error) bool {
 	return c.retry.RetryIf != nil && c.retry.RetryIf(err)
 }
 
-// backoff devolve o atraso antes da tentativa attempt+1 (equal jitter).
+// backoff devolve o atraso antes da tentativa attempt+1 (equal jitter). O
+// valor exponencial vem de exponentialDelay, que satura em math.MaxInt64 em
+// vez de estourar quando MaxDelay <= 0 (sem teto); assim d-half+1 nunca
+// excede math.MaxInt64 e rand.Int64N nunca recebe argumento <= 0.
 func (p RetryPolicy) backoff(attempt int) time.Duration {
-	base := p.BaseDelay
-	if base <= 0 {
+	d := exponentialDelay(p.BaseDelay, p.MaxDelay, attempt)
+	if d <= 0 {
 		return 0
-	}
-	d := base
-	for i := 1; i < attempt && (p.MaxDelay <= 0 || d < p.MaxDelay); i++ {
-		d *= 2
-	}
-	if p.MaxDelay > 0 && d > p.MaxDelay {
-		d = p.MaxDelay
 	}
 	half := d / 2
 	return half + time.Duration(rand.Int64N(int64(d-half)+1))

@@ -784,3 +784,93 @@ Pacote `internal/adapters/postgres` (`repository.go`, `wallet_repository.go`,
     transação com round-trip exato, conflitos de unicidade, lock por carteira, lost
     update, ledger append/duplicata/FK/atomicidade, cursor estável com clock skew e claim
     `SKIP LOCKED` entre duas instâncias.
+
+## ADR-015 — Repositórios de inbox e outbox (T13)
+
+Pacote `internal/adapters/postgres` (`inbox_repository.go`, `outbox_repository.go`,
+`backoff.go`). Sem migration nova: a `outbox` já tem `seq BIGINT GENERATED ALWAYS AS
+IDENTITY` (0005).
+
+- **Inbox (`InboxRepository`):**
+  - `Register(consumer, messageId, requestHash, now)` e `Complete(consumer, messageId,
+    requestHash, transactionId, now)` exigem `pgx.Tx` (`ErrTxRequired`). A inbox só evita
+    reprocessamento se registro, conclusão e efeitos de domínio entrarem no mesmo commit
+    (T15/T20).
+  - `Register` faz `INSERT ... ON CONFLICT (consumer_name, message_id) DO NOTHING
+    RETURNING`. Se a chave já existe, lê a linha com `FOR UPDATE`. Uma entrega concorrente
+    da mesma mensagem espera no índice único até o commit de quem registrou e depois vê o
+    estado final. Teste: 10 entregas paralelas resultam em 1 `NEW` e 9 `COMPLETED`.
+  - **Comparação de hash:** hash diferente para a mesma `(consumer, messageId)` devolve
+    `ErrInboxHashMismatch` junto com a linha registrada, que fica intacta. Hash igual devolve
+    `InboxCompleted` (com o `transactionId` do resultado; não reprocessar) ou
+    `InboxInProgress`. `Complete` também confere o hash. Ele devolve
+    `ErrInboxAlreadyCompleted`, `ErrNotFound` ou `ErrForeignKeyViolation` quando a transação
+    não existe.
+  - `completed_at = GREATEST(now, received_at)`, para que o relógio de outra instância um
+    pouco atrasado não viole o CHECK `inbox_completed_after_received`.
+  - Validação antes do SQL (`ErrInvalidInboxMessage`) espelha os CHECKs da 0004: 1..255
+    bytes e hash `^[0-9a-f]{64}$`.
+- **Outbox (`OutboxRepository`):**
+  - `Enqueue(q, events...)` grava `IntegrationEvent.Payload()` byte a byte (coluna `JSON`) na
+    ordem recebida, com o `Querier` do caso de uso. Um `eventId` repetido devolve
+    `ErrDuplicateEvent` (`outbox_event_id_key`).
+  - **Claim com lease, não com lock até o commit:** `Claim(owner, lease, limit)` aceita
+    qualquer `Querier`. O publisher (T22) reivindica numa transação curta ou em autocommit,
+    publica no SQS **fora** de transação e depois marca o resultado. Não há transação aberta
+    durante I/O externo. A consulta é uma CTE `SELECT seq ... WHERE published_at IS NULL
+    AND next_attempt_at <= agora AND (locked_until IS NULL OR locked_until <= agora) ORDER
+    BY seq LIMIT n FOR UPDATE SKIP LOCKED`, seguida de `UPDATE ... SET locked_by,
+    locked_until = agora + lease, attempts = attempts + 1 RETURNING`.
+  - Claimers concorrentes não esperam uns pelos outros e não duplicam. Linhas travadas por
+    um claim em andamento são puladas. Uma linha cujo lease foi confirmado entre o snapshot
+    e o lock é reavaliada pelo PostgreSQL (READ COMMITTED) e sai do lote. O lease expirado é
+    reassumido.
+  - **Ordem por `seq`** (IDENTITY, ordem de inserção), nunca por `occurred_at`, que vem do
+    relógio de cada instância. O resultado volta ordenado por `seq`, porque `RETURNING` não
+    garante ordem.
+  - **Relógio único:** leases e `next_attempt_at` usam `statement_timestamp()` do
+    PostgreSQL. Instâncias com relógios divergentes não roubam nem estendem leases umas das
+    outras.
+  - **Fencing:** cada claim incrementa `attempts`. O lease (`OutboxLease`) é
+    `(seq, eventId, owner, attempt)` e só vale com `locked_until > agora`.
+    `MarkPublished` e `MarkFailed` filtram por todos esses campos e por `published_at IS
+    NULL`. Sem efeito, devolvem `ErrOutboxLeaseLost` e não alteram nada. Isso cobre o
+    claimer com lease expirado (reassumido ou não), o worker do mesmo `owner` com token
+    antigo e a marcação repetida.
+  - Um lease expirado e não reassumido também é recusado, o que pode causar uma republicação
+    com o mesmo `eventId`. Essa republicação é absorvida pela deduplicação FIFO
+    (`MessageDeduplicationId = eventId`) e pelos consumidores idempotentes.
+  - Como `attempts` conta claims, um crash entre o claim e a marcação também entra no
+    backoff.
+  - **Backoff (`OutboxBackoff{Base, Max}`):** `MarkFailed` grava `last_error` (até 2048
+    bytes, cortado sem partir UTF-8, sem NUL) e `next_attempt_at = agora +
+    min(Base·2^(attempt-1), Max)`, e solta o lease. O atraso é determinístico (sem jitter),
+    porque é por evento e não há manada a dispersar. `Max` é obrigatório: `Validate` exige
+    `0 < Base <= Max`, senão devolve `ErrInvalidBackoff`. O padrão é 1s→5min. Teste:
+    1/2/4/8/10/10s medidos contra o relógio do banco, e `attempts = 2·10⁹` resulta
+    exatamente no teto.
+  - Limites: lote de 1 a 1000 (`MaxOutboxClaimBatch`), lease de 1ms a 1h e owner de 1 a
+    255 bytes (`ErrInvalidLease`).
+- **Backoff sem overflow (pendência da T11):** `exponentialDelay(base, max, attempt)` é
+  compartilhado por `RetryPolicy.backoff` e `OutboxBackoff`. Ele para de dobrar no teto
+  ou quando dobrar passaria de `MaxInt64`, e nesse caso satura em `MaxInt64`. Por isso
+  não há overflow nem panic em `rand.Int64N` com `MaxDelay <= 0`, e o laço roda no
+  máximo cerca de 63 vezes. O comentário de `errors.go` foi corrigido: `WithinTx` não
+  chama `Translate`. Ele devolve o erro de `fn` intacto e embrulha os de BEGIN/COMMIT só
+  com `%w`. A forma tipada vem dos repositórios ou de quem chama `Translate`.
+- **Limitação para a T22:** a ordem global por `seq` não impede que eventos posteriores do
+  mesmo `MessageGroupId` sejam publicados enquanto um anterior está em backoff. Garantir a
+  ordem por grupo sob falha exige bloqueio head-of-line por grupo no claim, por exemplo um
+  `NOT EXISTS` de evento anterior não publicado do mesmo grupo, combinado com a
+  serialização dos claims. Isso será decidido junto com a escolha do `MessageGroupId`,
+  hoje `aggregateId`.
+- **Testes:**
+  - Unitários: `exponentialDelay` (teto, saturação, attempt enorme ou negativo),
+    `RetryPolicy` sem `MaxDelay` nas tentativas 41, 64 e `MaxInt`, `OutboxBackoff`,
+    truncamento, validações antes do SQL e `ErrTxRequired`.
+  - Integração: inbox (rollback, IN_PROGRESS, COMPLETED, hash divergente, FK, relógio
+    atrasado, corrida de 10 entregas), outbox (ordem por `seq` com `occurred_at`
+    decrescente, payload idêntico byte a byte, duplicata, 8 claimers concorrentes
+    drenando 300 eventos sem duplicar, SKIP LOCKED com claim não confirmado, lease
+    expirado reassumido com `attempt=2`, fencing de owner antigo e de mesmo owner com
+    token antigo, lease expirado não reassumido e backoff com teto).
