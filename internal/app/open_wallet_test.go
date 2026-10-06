@@ -423,3 +423,17 @@ func (fakeWagers) GetByProviderExternalID(context.Context, string, string) (*dom
 func (fakeWagers) ListByProviderReference(context.Context, string, string) ([]*domain.WagerTransaction, error) {
 	return nil, errUnexpectedCall
 }
+
+// Leituras acrescentadas na T16 (não usadas por OpenWallet).
+
+func (fakeWallets) Get(context.Context, uuid.UUID) (*domain.Wallet, error) {
+	return nil, errUnexpectedCall
+}
+
+func (fakeLedger) List(context.Context, uuid.UUID, string, int) (app.LedgerPage, error) {
+	return app.LedgerPage{}, errUnexpectedCall
+}
+
+func (fakeLedger) Summarize(context.Context, uuid.UUID) (app.LedgerSummary, error) {
+	return app.LedgerSummary{}, errUnexpectedCall
+}

@@ -26,12 +26,30 @@ import (
 //     próximas tarefas (T16/T21) acrescentam o que precisarem. A T15
 //     acrescentou GetForUpdate/Update da carteira, as consultas de
 //     idempotência e de referência, Update da transação e a inbox (ADR-017).
+//     A T16 acrescentou as leituras sem lock (Wallets.Get, Ledger.List,
+//     Ledger.Summarize) e o isolamento/modo de acesso em TxOptions (ADR-018).
 
 // Operation* são os rótulos de operação das transações (métricas e logs do
 // adapter). Os valores coincidem com metrics.Operation* (teste no adapter).
 const (
 	OperationOpenWallet         = "open_wallet"
 	OperationProcessTransaction = "process_transaction"
+	OperationReconcile          = "reconcile"
+	OperationQuery              = "query"
+)
+
+// IsolationLevel é o nível de isolamento de uma unidade de trabalho.
+type IsolationLevel string
+
+const (
+	// IsolationReadCommitted é o padrão (valor zero). A consistência das
+	// escritas vem do lock por carteira, não do isolamento (ADR-013).
+	IsolationReadCommitted IsolationLevel = ""
+	// IsolationRepeatableRead fixa um snapshot no primeiro comando: todas as
+	// leituras da transação veem o mesmo estado confirmado (reconciliação).
+	IsolationRepeatableRead IsolationLevel = "REPEATABLE_READ"
+	// IsolationSerializable é o isolamento serializável.
+	IsolationSerializable IsolationLevel = "SERIALIZABLE"
 )
 
 // TxOptions configura uma chamada de UnitOfWork.WithinTx.
@@ -48,6 +66,12 @@ type TxOptions struct {
 	// sentinelas desta camada (ex.: ErrDuplicateWagerTransaction). Nunca é
 	// consultado para commit de resultado desconhecido.
 	RetryIf func(error) bool
+	// Isolation é o nível de isolamento (padrão READ COMMITTED). Valor
+	// desconhecido é recusado pelo adapter antes do BEGIN.
+	Isolation IsolationLevel
+	// ReadOnly abre a transação em modo somente leitura: o banco recusa
+	// qualquer escrita (SQLSTATE 25006), inclusive por engano do caso de uso.
+	ReadOnly bool
 }
 
 // TxFunc é o corpo de uma unidade de trabalho. tx só vale durante a chamada.
@@ -77,6 +101,9 @@ type WalletStore interface {
 	// inserida fica, até o commit, invisível e exclusiva desta transação, o
 	// que equivale à carteira travada para Ledger.Append.
 	Insert(ctx context.Context, w *domain.Wallet) error
+	// Get lê a carteira SEM lock (consultas e reconciliação). Inexistente:
+	// erro que casa com ErrRecordNotFound.
+	Get(ctx context.Context, id uuid.UUID) (*domain.Wallet, error)
 	// GetForUpdate lê e TRAVA a carteira até o fim da transação (SELECT ...
 	// FOR UPDATE). Escritores da mesma carteira esperam o commit; carteiras
 	// diferentes seguem em paralelo. Inexistente: erro que casa com
@@ -124,6 +151,32 @@ type LedgerStore interface {
 	// com lock), porque a ordem de paginação (seq) só segue a ordem de commit
 	// sob esse lock (ADR-014).
 	Append(ctx context.Context, e domain.WalletLedgerEntry) error
+	// List devolve até limit lançamentos da carteira depois do cursor opaco
+	// (vazio = início), em ordem de lançamento (seq). limit em
+	// [1, MaxLedgerPageLimit]. Cursor malformado ou de outra carteira: erro
+	// que casa com ErrInvalidCursor. Não verifica a existência da carteira.
+	List(ctx context.Context, walletID uuid.UUID, cursor string, limit int) (LedgerPage, error)
+	// Summarize reconstrói o saldo a partir do ledger: soma dos créditos
+	// menos a dos débitos, em centavos (calculada em NUMERIC, sem overflow;
+	// um total fora de int64 é erro), e o número de lançamentos. Carteira sem
+	// lançamentos: 0 e 0.
+	Summarize(ctx context.Context, walletID uuid.UUID) (LedgerSummary, error)
+}
+
+// LedgerPage é uma página do extrato.
+type LedgerPage struct {
+	Entries []domain.WalletLedgerEntry
+	// NextCursor é vazio quando não havia mais lançamentos na leitura.
+	NextCursor string
+}
+
+// LedgerSummary é o saldo reconstruído do ledger de uma carteira.
+type LedgerSummary struct {
+	// NetMinorUnits = Σ créditos − Σ débitos, em centavos, na moeda da
+	// carteira (as FKs compostas do ledger garantem a moeda).
+	NetMinorUnits int64
+	// Entries é o número de lançamentos somados.
+	Entries int64
 }
 
 // OutboxStore grava eventos de integração na transactional outbox.

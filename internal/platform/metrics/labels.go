@@ -52,7 +52,7 @@ var (
 
 	operations = newLabelSet(
 		OperationProcessTransaction, OperationOpenWallet, OperationReconcile,
-		OperationOutboxPublish, OperationSQSConsume, OperationPendingReference,
+		OperationOutboxPublish, OperationSQSConsume, OperationPendingReference, OperationQuery,
 	)
 
 	outcomes = newLabelSet(OutcomeSuccess, OutcomeRejected, OutcomeConflict, OutcomeTransient, OutcomeError)

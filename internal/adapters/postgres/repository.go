@@ -71,6 +71,9 @@ var (
 	ErrInvalidCursor = errors.New("postgres: cursor inválido")
 	// ErrInvalidPageLimit indica limite de página fora de [1, max].
 	ErrInvalidPageLimit = errors.New("postgres: limite de página inválido")
+	// ErrLedgerSumOutOfRange indica que a soma do ledger de uma carteira não
+	// cabe em int64 (dado corrompido; nunca é truncada).
+	ErrLedgerSumOutOfRange = errors.New("postgres: soma do ledger fora do intervalo de int64")
 )
 
 // constraintErrors mapeia o nome da constraint (migrations) para a sentinela.

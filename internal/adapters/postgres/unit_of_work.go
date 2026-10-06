@@ -21,7 +21,9 @@ import (
 //     transacional continua explícita e auditável (ADR-013), sem pgx nas
 //     portas da aplicação.
 //   - TxOptions.Retry liga WithRetry(DefaultRetryPolicy(Operation)), com
-//     TxOptions.RetryIf repassado à política.
+//     TxOptions.RetryIf repassado à política. TxOptions.Isolation e ReadOnly
+//     viram WithIsolation/ReadOnly (BEGIN ISOLATION LEVEL ... READ ONLY).
+//   - ErrInvalidCursor → app.ErrInvalidCursor (ADR-018).
 //   - Tradução de erros para as sentinelas da aplicação, preservando a causa:
 //     ErrWalletAlreadyExists → app.ErrWalletAlreadyExists; ErrNotFound →
 //     app.ErrRecordNotFound; ErrDuplicateExternalTransaction,
@@ -48,16 +50,39 @@ func NewUnitOfWork(t Transactor, w *WalletRepository, l *LedgerRepository, x *Wa
 
 // WithinTx executa fn numa transação (ver app.UnitOfWork).
 func (u *UnitOfWork) WithinTx(ctx context.Context, opts app.TxOptions, fn app.TxFunc) error {
+	txOpts, err := txOptionsFor(opts)
+	if err != nil {
+		return err
+	}
+	err = u.tx.WithinTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return fn(ctx, txStores{u: u, q: tx})
+	}, txOpts...)
+	return portError(err)
+}
+
+// txOptionsFor traduz app.TxOptions para as opções do TxManager. Isolamento
+// desconhecido é recusado antes do BEGIN (nunca cai silenciosamente no
+// padrão).
+func txOptionsFor(opts app.TxOptions) ([]TxOption, error) {
 	var txOpts []TxOption
+	switch opts.Isolation {
+	case app.IsolationReadCommitted:
+	case app.IsolationRepeatableRead:
+		txOpts = append(txOpts, WithIsolation(pgx.RepeatableRead))
+	case app.IsolationSerializable:
+		txOpts = append(txOpts, WithIsolation(pgx.Serializable))
+	default:
+		return nil, fmt.Errorf("postgres: nível de isolamento desconhecido: %q", opts.Isolation)
+	}
+	if opts.ReadOnly {
+		txOpts = append(txOpts, ReadOnly())
+	}
 	if opts.Retry {
 		p := DefaultRetryPolicy(opts.Operation)
 		p.RetryIf = opts.RetryIf
 		txOpts = append(txOpts, WithRetry(p))
 	}
-	err := u.tx.WithinTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		return fn(ctx, txStores{u: u, q: tx})
-	}, txOpts...)
-	return portError(err)
+	return txOpts, nil
 }
 
 // portError marca falhas transitórias com app.ErrUnavailable.
@@ -96,6 +121,11 @@ func (s walletStore) Insert(ctx context.Context, w *domain.Wallet) error {
 		return fmt.Errorf("%w: %w", app.ErrWalletAlreadyExists, err)
 	}
 	return err
+}
+
+func (s walletStore) Get(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
+	w, err := s.u.wallets.Get(ctx, s.q, id)
+	return w, notFound(err)
 }
 
 func (s walletStore) GetForUpdate(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
@@ -149,6 +179,25 @@ type ledgerStore txStores
 
 func (s ledgerStore) Append(ctx context.Context, e domain.WalletLedgerEntry) error {
 	return s.u.ledger.Append(ctx, s.q, e)
+}
+
+func (s ledgerStore) List(ctx context.Context, walletID uuid.UUID, cursor string, limit int) (app.LedgerPage, error) {
+	p, err := s.u.ledger.ListByWallet(ctx, s.q, walletID, cursor, limit)
+	if err != nil {
+		if errors.Is(err, ErrInvalidCursor) {
+			return app.LedgerPage{}, fmt.Errorf("%w: %w", app.ErrInvalidCursor, err)
+		}
+		return app.LedgerPage{}, err
+	}
+	return app.LedgerPage{Entries: p.Entries, NextCursor: p.NextCursor}, nil
+}
+
+func (s ledgerStore) Summarize(ctx context.Context, walletID uuid.UUID) (app.LedgerSummary, error) {
+	sum, err := s.u.ledger.Summarize(ctx, s.q, walletID)
+	if err != nil {
+		return app.LedgerSummary{}, err
+	}
+	return app.LedgerSummary{NetMinorUnits: sum.NetMinorUnits, Entries: sum.Entries}, nil
 }
 
 type outboxStore txStores

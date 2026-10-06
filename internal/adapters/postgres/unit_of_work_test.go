@@ -206,3 +206,100 @@ func TestStores_LockingMethodsRequireTx(t *testing.T) {
 		t.Fatalf("inbox register: %v", err)
 	}
 }
+
+func TestOperationLabelsMatchMetrics_T16(t *testing.T) {
+	if app.OperationReconcile != metrics.OperationReconcile || app.OperationQuery != metrics.OperationQuery {
+		t.Fatalf("labels: %q/%q vs %q/%q", app.OperationReconcile, app.OperationQuery,
+			metrics.OperationReconcile, metrics.OperationQuery)
+	}
+}
+
+func TestTxOptionsFor_IsolationAndReadOnly(t *testing.T) {
+	apply := func(opts []TxOption) txConfig {
+		cfg := txConfig{opts: pgx.TxOptions{IsoLevel: pgx.ReadCommitted}}
+		for _, o := range opts {
+			o(&cfg)
+		}
+		return cfg
+	}
+	cases := []struct {
+		in       app.TxOptions
+		iso      pgx.TxIsoLevel
+		access   pgx.TxAccessMode
+		retrying bool
+	}{
+		{app.TxOptions{}, pgx.ReadCommitted, "", false},
+		{app.TxOptions{Isolation: app.IsolationRepeatableRead, ReadOnly: true, Retry: true, Operation: app.OperationReconcile},
+			pgx.RepeatableRead, pgx.ReadOnly, true},
+		{app.TxOptions{Isolation: app.IsolationSerializable}, pgx.Serializable, "", false},
+		{app.TxOptions{ReadOnly: true}, pgx.ReadCommitted, pgx.ReadOnly, false},
+	}
+	for _, c := range cases {
+		opts, err := txOptionsFor(c.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := apply(opts)
+		if cfg.opts.IsoLevel != c.iso || cfg.opts.AccessMode != c.access || (cfg.retry.MaxAttempts > 1) != c.retrying {
+			t.Fatalf("%+v → %+v / %+v", c.in, cfg.opts, cfg.retry)
+		}
+	}
+	if _, err := txOptionsFor(app.TxOptions{Isolation: "READ_UNCOMMITTED"}); err == nil {
+		t.Fatal("unknown isolation accepted")
+	}
+
+	// Isolamento desconhecido não chega ao Transactor.
+	rt := &recordingTransactor{}
+	u := NewUnitOfWork(rt, nil, nil, nil, nil, nil)
+	called := false
+	err := u.WithinTx(t.Context(), app.TxOptions{Isolation: "bogus"}, func(context.Context, app.Tx) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("err %v called %v", err, called)
+	}
+}
+
+func TestLedgerStore_MapsInvalidCursor(t *testing.T) {
+	u := NewUnitOfWork(nil, nil, NewLedgerRepository(), nil, nil, nil)
+	s := txStores{u: u, q: noDBQuerier{t: t}}
+	_, err := s.Ledger().List(t.Context(), unitWalletID, "not-a-cursor", 10)
+	if !errors.Is(err, app.ErrInvalidCursor) || !errors.Is(err, app.ErrInvalidInput) || !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := s.Ledger().List(t.Context(), unitWalletID, "", 0); !errors.Is(err, ErrInvalidPageLimit) || errors.Is(err, app.ErrInvalidCursor) {
+		t.Fatalf("limit err = %v", err)
+	}
+}
+
+// textRow devolve (count, texto) para Summarize sem banco.
+type textRow struct {
+	count int64
+	net   string
+}
+
+func (r textRow) Scan(dest ...any) error {
+	*(dest[0].(*int64)) = r.count
+	*(dest[1].(*string)) = r.net
+	return nil
+}
+
+type rowQuerier struct {
+	noDBQuerier
+	row pgx.Row
+}
+
+func (q rowQuerier) QueryRow(context.Context, string, ...any) pgx.Row { return q.row }
+
+func TestLedgerSummarize_ParsesAndRejectsOutOfRange(t *testing.T) {
+	r := NewLedgerRepository()
+	s, err := r.Summarize(t.Context(), rowQuerier{noDBQuerier{t}, textRow{3, "-1250"}}, unitWalletID)
+	if err != nil || s.NetMinorUnits != -1250 || s.Entries != 3 {
+		t.Fatalf("summary = %+v, %v", s, err)
+	}
+	_, err = r.Summarize(t.Context(), rowQuerier{noDBQuerier{t}, textRow{2, "18446744073709551614"}}, unitWalletID)
+	if !errors.Is(err, ErrLedgerSumOutOfRange) {
+		t.Fatalf("overflow: %v", err)
+	}
+}

@@ -88,6 +88,7 @@ const (
 	OperationProcessTransaction = "process_transaction"
 	OperationOpenWallet         = "open_wallet"
 	OperationReconcile          = "reconcile"
+	OperationQuery              = "query"
 	OperationOutboxPublish      = "outbox_publish"
 	OperationSQSConsume         = "sqs_consume"
 	OperationPendingReference   = "pending_reference"

@@ -55,6 +55,9 @@ var (
 	// ErrInboxHashMismatch: mesma (consumer, messageId) com conteúdo
 	// diferente do registrado. Também casa com ErrConflict.
 	ErrInboxHashMismatch = fmt.Errorf("%w: inbox message registered with another content", ErrConflict)
+	// ErrInvalidCursor: cursor de paginação malformado ou de outra carteira.
+	// Também casa com ErrInvalidInput.
+	ErrInvalidCursor = fmt.Errorf("%w: invalid pagination cursor", ErrInvalidInput)
 )
 
 // Códigos estáveis dos erros de aplicação.
@@ -76,6 +79,22 @@ const (
 	CodeMessageConflict = "MESSAGE_CONFLICT"
 	// CodeInvalidMessage: consumerName ou messageId da inbox inválidos.
 	CodeInvalidMessage = "INVALID_MESSAGE"
+	// CodeWalletNotFound: carteira inexistente (consultas e reconciliação).
+	CodeWalletNotFound = "WALLET_NOT_FOUND"
+	// CodeTransactionNotFound: transação inexistente OU de outro provedor
+	// (não se revela a existência de dados alheios).
+	CodeTransactionNotFound = "TRANSACTION_NOT_FOUND"
+	// CodeInvalidWalletID / CodeInvalidTransactionID: id interno nulo.
+	CodeInvalidWalletID      = "INVALID_WALLET_ID"
+	CodeInvalidTransactionID = "INVALID_TRANSACTION_ID"
+	// CodeInvalidProviderID / CodeInvalidExternalTransactionID: identificador
+	// externo vazio, com mais de 255 bytes, UTF-8 inválido ou com caracteres
+	// de controle.
+	CodeInvalidProviderID            = "INVALID_PROVIDER_ID"
+	CodeInvalidExternalTransactionID = "INVALID_EXTERNAL_TRANSACTION_ID"
+	// CodeInvalidCursor / CodeInvalidPageLimit: paginação do extrato.
+	CodeInvalidCursor    = "INVALID_CURSOR"
+	CodeInvalidPageLimit = "INVALID_PAGE_LIMIT"
 )
 
 // Error é o erro tipado devolvido pelos casos de uso.

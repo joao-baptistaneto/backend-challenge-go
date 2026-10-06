@@ -1095,3 +1095,103 @@ HTTP (T18) e SQS (T20), com as mesmas garantias de idempotência.
   - Rollback total com falha injetada após cada escrita, inclusive `Inbox.Complete`.
   - 10 entregas concorrentes da mesma mensagem, com a inbox no mesmo commit (`xmin`).
   - Composição Fx.
+
+## ADR-018 — Reconciliação e consultas (T16)
+
+Pacotes `internal/app` (`reconcile.go`, `queries.go`, portas em `ports.go`, erros em
+`errors.go`, `module.go`) e `internal/adapters/postgres` (`unit_of_work.go`,
+`ledger_repository.go`). Sem migration nova.
+
+- **Isolamento e modo de acesso pelas portas.** `app.TxOptions` ganhou `Isolation`
+  (`IsolationReadCommitted` = valor zero, `IsolationRepeatableRead`,
+  `IsolationSerializable`) e `ReadOnly`. O adapter traduz para `WithIsolation`/`ReadOnly()`
+  do TxManager (ADR-013), ou seja, `BEGIN ISOLATION LEVEL ... READ ONLY`. Um nível
+  desconhecido é recusado antes do BEGIN, nunca cai silenciosamente no padrão.
+- **Reconciliação (`ReconcileWallet`).**
+  - Uma transação **REPEATABLE READ + READ ONLY**, sem lock. O snapshot é fixado no
+    primeiro comando (`Wallets.Get`), então o saldo gravado e a soma do ledger
+    (`Ledger.Summarize`) vêm do mesmo estado confirmado, mesmo com operações
+    confirmando no meio. A reconciliação não bloqueia escritores nem é bloqueada por eles.
+  - `READ ONLY` faz o PostgreSQL recusar qualquer escrita (`25006`): a reconciliação
+    não pode alterar saldo nem nenhum outro dado, nem por engano. O corpo só lê, então
+    usa o retry limitado de falhas transitórias.
+  - `calculated` = Σ créditos − Σ débitos do ledger (inclusive a abertura), somado no
+    banco em `NUMERIC` e devolvido como texto. Um total fora de `int64` dá
+    `ErrLedgerSumOutOfRange` (erro interno), nunca é truncado. A moeda é a da
+    carteira, garantida pelas FKs compostas do ledger (ADR-011).
+    `difference = stored − calculated` (pode ser negativa); `consistent = difference == 0`;
+    `checkedEntries` = lançamentos somados; o relatório traz também `walletVersion`.
+    Optamos pela soma em vez de percorrer a cadeia `balance_before/after`: a cadeia já é
+    garantida pelo CHECK aritmético + lock por carteira, e a soma é uma única consulta
+    agregada, independente da ordem.
+  - **Divergência não é erro.** O relatório volta com `consistent=false`, um log `WARN`
+    "divergência de reconciliação" (walletId, currency, storedBalance, calculatedBalance,
+    difference em string exata, checkedEntries, walletVersion, correlationId) e a
+    métrica `wallet_reconciliation_divergences_total{currency}`. Toda reconciliação
+    concluída conta em `wallet_reconciliations_total{outcome=consistent|divergent}`.
+    Nada é corrigido automaticamente: correção exige lançamento compensatório
+    auditável, fora do escopo.
+  - A métrica entra por uma porta (`app.ReconciliationRecorder`, satisfeita por
+    `*metrics.Metrics.Reconciliation`), porque `app` não importa `platform`. No Fx ela é
+    opcional; a composição (T23) deve prover `fx.Provide(func(m *metrics.Metrics)
+    app.ReconciliationRecorder { return m })` (fiação coberta por teste de integração).
+  - Carteira inexistente → `404 WALLET_NOT_FOUND`; `walletId` nulo → `INVALID_WALLET_ID`.
+- **Consultas (`Queries`).**
+  - Todas rodam numa transação **READ ONLY** (READ COMMITTED), sem lock e com retry
+    (rótulo de operação `query`, acrescentado a `metrics.Operation*`).
+  - `GetWallet(walletId)` → `WalletSnapshot` ou `WALLET_NOT_FOUND`.
+  - `ListLedger{walletId, cursor, limit}`: verifica a carteira e lê a página na mesma
+    transação (carteira inexistente → `WALLET_NOT_FOUND`, não página vazia). Usa a
+    paginação keyset por `seq` com cursor opaco do ADR-014. `limit` 0 → 50; fora de
+    `[1, 200]` → `INVALID_PAGE_LIMIT`. Cursor malformado ou de outra carteira →
+    `INVALID_CURSOR` (o adapter traduz `ErrInvalidCursor` para `app.ErrInvalidCursor`,
+    que casa com `ErrInvalidInput`).
+  - `GetTransaction{transactionId, providerId}` e
+    `GetTransactionByProvider{providerId, externalTransactionId}` recebem o
+    **providerId explícito**. A borda (T18) o preenche com a identidade autenticada. Na
+    rota `/providers/{providerId}/...`, o path precisa casar com a identidade antes de
+    chamar. A transação de outro provedor (ou interna, como OPENING) responde exatamente
+    como inexistente (`TRANSACTION_NOT_FOUND`), sem revelar a existência. Por
+    externalId, o filtro está no SQL. Por id, a linha é descartada no caso de uso se o
+    provedor não casar.
+  - Identificadores externos inválidos (vazio, > 255 bytes, UTF-8 inválido, caracteres
+    de controle) → `INVALID_PROVIDER_ID`/`INVALID_EXTERNAL_TRANSACTION_ID` sem abrir
+    transação.
+  - `TransactionView` aplica as regras de exposição do ADR-017: `referenceTransactionId`
+    só em `PROCESSED`; saldo (`balance_after`) omitido em `WALLET_NOT_FOUND`,
+    `WALLET_PLAYER_MISMATCH` e `CURRENCY_MISMATCH`; a chave de idempotência e o hash
+    não são expostos. Inclui `attempts`/`nextAttemptAt` para acompanhar
+    `PENDING_REFERENCE`.
+  - A autorização de carteira (só serviço interno) é da borda (T17/T18): `GetWallet`,
+    `ListLedger` e a reconciliação não recebem identidade.
+- **Portas acrescentadas:** `WalletStore.Get` (sem lock), `LedgerStore.List` e
+  `LedgerStore.Summarize` (`app.LedgerPage`, `app.LedgerSummary`), `TxOptions.Isolation`
+  e `TxOptions.ReadOnly`, `ErrInvalidCursor`, os códigos `WALLET_NOT_FOUND`,
+  `TRANSACTION_NOT_FOUND`, `INVALID_WALLET_ID`, `INVALID_TRANSACTION_ID`,
+  `INVALID_PROVIDER_ID`, `INVALID_EXTERNAL_TRANSACTION_ID`, `INVALID_CURSOR` e
+  `INVALID_PAGE_LIMIT`, e `app.Module` provendo `*ReconcileWallet` e `*Queries`.
+- **Testes:**
+  - Unitários (`queries_test.go`, memUoW): relatório consistente e divergente (diferença
+    positiva e negativa), recorder e log JSON, estado inalterado, opções da transação
+    (RR + READ ONLY + retry), erros (inválido sem tx, 404, 503, interno, ctx
+    cancelado), consultas (encontrado, inexistente, outro provedor, OPENING invisível,
+    entradas inválidas sem tx, paginação, limites, cursor), visão sem dados alheios e
+    `fx.ValidateApp`. No adapter: mapeamento de `TxOptions` (inclusive nível
+    desconhecido), `ErrInvalidCursor`, parse e overflow do `Summarize` e igualdade dos
+    rótulos de operação.
+  - Integração (PostgreSQL real):
+    - consistente: 985.00 / 3 lançamentos, métrica `consistent`;
+    - divergente: saldo alterado direto no banco com os triggers desligados só na sessão
+      do teste (`SET LOCAL session_replication_role = replica`), relatório 980.50 ×
+      975.00 = 5.50, métrica e log;
+    - o estado do banco é comparado antes e depois por uma impressão digital de todas as
+      tabelas (conteúdo + `xmin`), que prova que nada foi escrito;
+    - escrita dentro da transação da reconciliação recusada com `25006`;
+    - snapshot: uma BET confirmada entre a leitura da carteira e a soma não aparece, e o
+      controle negativo forçado para READ COMMITTED mostra a falsa divergência que o
+      snapshot evita;
+    - `current_setting('transaction_isolation'/'transaction_read_only')` pela própria
+      UnitOfWork;
+    - consultas: paginação com commit concorrente, cursor de outra carteira, isolamento
+      por provedor com o mesmo externalId, pendência e OPENING invisível;
+    - composição Fx com a métrica.

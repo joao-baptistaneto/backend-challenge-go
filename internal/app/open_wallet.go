@@ -87,6 +87,8 @@ type options struct {
 	newID  func() (uuid.UUID, error)
 	// referenceDelay: só ProcessWagerTransaction (WithReferenceRetryDelay).
 	referenceDelay time.Duration
+	// reconciliations: só ReconcileWallet (WithReconciliationRecorder).
+	reconciliations ReconciliationRecorder
 }
 
 // WithLogger define o logger (nil = descarta).

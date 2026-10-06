@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -137,6 +138,39 @@ LIMIT $3`, walletID, after, limit+1)
 		page.NextCursor = encodeLedgerCursor(walletID, lastSeq)
 	}
 	return page, nil
+}
+
+// LedgerSummary é o saldo reconstruído a partir do ledger de uma carteira.
+type LedgerSummary struct {
+	// NetMinorUnits = Σ créditos − Σ débitos, em centavos.
+	NetMinorUnits int64
+	// Entries é o número de lançamentos somados.
+	Entries int64
+}
+
+// Summarize soma o ledger da carteira (créditos − débitos) e conta os
+// lançamentos, numa única consulta. A soma é feita em NUMERIC (exata, sem
+// overflow intermediário) e devolvida como texto; um total fora de int64
+// devolve ErrLedgerSumOutOfRange em vez de truncar. Carteira sem lançamentos
+// (ou inexistente) devolve zero. Para reconciliar, chame dentro da mesma
+// transação REPEATABLE READ da leitura da carteira (mesmo snapshot).
+func (LedgerRepository) Summarize(ctx context.Context, q Querier, walletID uuid.UUID) (LedgerSummary, error) {
+	const op = "postgres: somar lançamentos"
+	var (
+		count int64
+		net   string
+	)
+	err := q.QueryRow(ctx, `SELECT count(*),
+       COALESCE(SUM(CASE direction WHEN 'CREDIT' THEN amount::NUMERIC ELSE -amount::NUMERIC END), 0)::TEXT
+FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID).Scan(&count, &net)
+	if err != nil {
+		return LedgerSummary{}, mapReadError(op, err)
+	}
+	n, err := strconv.ParseInt(net, 10, 64)
+	if err != nil {
+		return LedgerSummary{}, fmt.Errorf("%s: %w: %s", op, ErrLedgerSumOutOfRange, net)
+	}
+	return LedgerSummary{NetMinorUnits: n, Entries: count}, nil
 }
 
 // GetByTransaction devolve o lançamento de (carteira, transação), se houver.

@@ -379,10 +379,13 @@ func (s failInbox) Complete(ctx context.Context, c, m, h string, txID uuid.UUID,
 	return s.after("inbox_complete", s.InboxStore.Complete(ctx, c, m, h, txID, now))
 }
 
-type failLedger struct{ failingTx }
+type failLedger struct {
+	failingTx
+	app.LedgerStore
+}
 
 func (s failLedger) Append(ctx context.Context, en domain.WalletLedgerEntry) error {
-	return s.after("ledger", s.Tx.Ledger().Append(ctx, en))
+	return s.after("ledger", s.LedgerStore.Append(ctx, en))
 }
 
 type failOutbox struct{ failingTx }
@@ -395,7 +398,7 @@ func (t failingTx) Wallets() app.WalletStore { return failWallets{t, t.Tx.Wallet
 func (t failingTx) Transactions() app.WagerTransactionStore {
 	return failWagers{t, t.Tx.Transactions()}
 }
-func (t failingTx) Ledger() app.LedgerStore { return failLedger{t} }
+func (t failingTx) Ledger() app.LedgerStore { return failLedger{t, t.Tx.Ledger()} }
 func (t failingTx) Outbox() app.OutboxStore { return failOutbox{t} }
 func (t failingTx) Inbox() app.InboxStore   { return failInbox{t, t.Tx.Inbox()} }
 
