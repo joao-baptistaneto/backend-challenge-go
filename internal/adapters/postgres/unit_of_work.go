@@ -156,6 +156,25 @@ func (s wagerStore) Update(ctx context.Context, t *domain.WagerTransaction) erro
 	return notFound(err)
 }
 
+func (s wagerStore) ClaimDue(ctx context.Context, p app.ClaimDueParams) ([]app.ClaimedWager, error) {
+	got, err := s.u.wagers.ClaimDue(ctx, s.q, ClaimParams{
+		Now: p.Now, Token: p.Token, Lease: p.Lease, Limit: p.Limit, OrphanGrace: p.OrphanGrace,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]app.ClaimedWager, len(got))
+	for i, c := range got {
+		out[i] = app.ClaimedWager{ID: c.ID, Status: c.Status}
+	}
+	return out, nil
+}
+
+func (s wagerStore) GetClaimedForUpdate(ctx context.Context, id, token uuid.UUID) (*domain.WagerTransaction, error) {
+	t, err := s.u.wagers.GetClaimedForUpdate(ctx, s.q, id, token)
+	return t, notFound(err)
+}
+
 func (s wagerStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error) {
 	t, err := s.u.wagers.GetByID(ctx, s.q, id)
 	return t, notFound(err)

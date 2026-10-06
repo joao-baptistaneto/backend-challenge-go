@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/junglegaming/backend-challenge-go/internal/adapters/postgres"
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
@@ -736,7 +737,25 @@ func TestIntegrationWagerTransactionRepository_CRUDAndQueries(t *testing.T) {
 	}
 }
 
-func TestIntegrationWagerTransactionRepository_ClaimDuePendingReferences(t *testing.T) {
+// claimState lê as colunas de lease (fora do agregado de domínio).
+func claimState(t *testing.T, r repos, id uuid.UUID) (by pgtype.UUID, until pgtype.Timestamptz) {
+	t.Helper()
+	if err := r.db.Pool().QueryRow(t.Context(),
+		`SELECT claimed_by, claimed_until FROM wager_transactions WHERE id = $1`, id).Scan(&by, &until); err != nil {
+		t.Fatal(err)
+	}
+	return by, until
+}
+
+func claimedIDs(c []postgres.ClaimedWager) []uuid.UUID {
+	out := make([]uuid.UUID, len(c))
+	for i, x := range c {
+		out[i] = x.ID
+	}
+	return out
+}
+
+func TestIntegrationWagerTransactionRepository_ClaimDue(t *testing.T) {
 	t.Parallel()
 	r := newRepos(t)
 	ctx := t.Context()
@@ -744,6 +763,8 @@ func TestIntegrationWagerTransactionRepository_ClaimDuePendingReferences(t *test
 	now := baseTime()
 	created := now.Add(-time.Hour)
 	w := r.openWallet(t, "100.00", created)
+	const lease = time.Minute
+	grace := 30 * time.Second
 
 	// 3 vencidas (next_attempt_at no passado, em ordem crescente) e 2 futuras.
 	var due, future []*domain.WagerTransaction
@@ -766,85 +787,243 @@ func TestIntegrationWagerTransactionRepository_ClaimDuePendingReferences(t *test
 			future = append(future, tx)
 		}
 	}
-	// Um PENDING comum não entra.
-	if err := r.wagers.Insert(ctx, pool, newWager(t, w, wagerSpec{external: "plain-bet", kind: domain.WagerKindBet, amount: "1.00", now: created})); err != nil {
+	// PENDING órfão (criado há 1h) e PENDING recente (dentro da carência).
+	orphan := newWager(t, w, wagerSpec{external: "orphan-bet", kind: domain.WagerKindBet, amount: "1.00", now: created})
+	fresh := newWager(t, w, wagerSpec{external: "fresh-bet", kind: domain.WagerKindBet, amount: "1.00", now: now.Add(-time.Second)})
+	// Terminal nunca é elegível.
+	done := newWager(t, w, wagerSpec{external: "done-loss", kind: domain.WagerKindLoss, amount: "0.00", now: created})
+	if err := done.MarkProcessed(domain.MarkWagerProcessedParams{BalanceAfter: money(t, "100.00"), Now: created}); err != nil {
 		t.Fatal(err)
 	}
+	for _, x := range []*domain.WagerTransaction{orphan, fresh, done} {
+		if err := r.wagers.Insert(ctx, pool, x); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	// Instância A pega as 2 mais atrasadas e segura o lock.
+	claim := func(q postgres.Querier, at time.Time, token uuid.UUID, limit int) []postgres.ClaimedWager {
+		t.Helper()
+		got, err := r.wagers.ClaimDue(ctx, q, postgres.ClaimParams{Now: at, Token: token, Lease: lease, Limit: limit, OrphanGrace: grace})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	// Instância A (transação ainda aberta: linhas travadas) pega as 2 mais
+	// atrasadas.
+	tokenA, tokenB := newID(t), newID(t)
 	txA, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer txA.Rollback(context.Background())
-	claimedA, err := r.wagers.ClaimDuePendingReferences(ctx, txA, now, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(claimedA) != 2 || claimedA[0].ID() != due[0].ID() || claimedA[1].ID() != due[1].ID() {
-		t.Fatalf("A claimed %d (want the two oldest due)", len(claimedA))
-	}
-	if !reflect.DeepEqual(claimedA[0], due[0]) {
-		t.Fatalf("claimed round-trip mismatch: %+v", claimedA[0])
+	claimedA := claim(txA, now, tokenA, 2)
+	if got := claimedIDs(claimedA); !reflect.DeepEqual(got, []uuid.UUID{due[0].ID(), due[1].ID()}) ||
+		claimedA[0].Status != domain.WagerStatusPendingReference {
+		t.Fatalf("A claimed %v, want the two oldest due", got)
 	}
 
-	// Instância B, em paralelo, não espera nem duplica: pega só a restante.
-	var claimedB []*domain.WagerTransaction
+	// Instância B, em paralelo, não espera (lock_timeout curto) nem duplica:
+	// pega a referência restante e depois o órfão (referências primeiro).
+	var claimedB []postgres.ClaimedWager
 	if err := r.within(t, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '150ms'`); err != nil {
+		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '150ms'"); err != nil {
 			return err
 		}
-		var err error
-		claimedB, err = r.wagers.ClaimDuePendingReferences(ctx, tx, now, 10)
-		if err != nil {
-			return err
-		}
-		// O worker reagenda (backoff) e grava na mesma transação.
-		for _, c := range claimedB {
-			if err := c.RescheduleReferenceRetry(domain.MarkWagerPendingReferenceParams{NextAttemptAt: now.Add(time.Hour), Now: now}); err != nil {
-				return err
-			}
-			if err := r.wagers.Update(ctx, tx, c); err != nil {
-				return err
-			}
-		}
+		claimedB = claim(tx, now, tokenB, 10)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(claimedB) != 1 || claimedB[0].ID() != due[2].ID() {
-		t.Fatalf("B claimed %d, want only the third due transaction", len(claimedB))
+	if got := claimedIDs(claimedB); !reflect.DeepEqual(got, []uuid.UUID{due[2].ID(), orphan.ID()}) ||
+		claimedB[1].Status != domain.WagerStatusPending {
+		t.Fatalf("B claimed %v, want [third due, orphan]", got)
 	}
-	got, err := r.wagers.GetByID(ctx, pool, due[2].ID())
-	if err != nil || got.Attempts() != 2 || !got.NextAttemptAt().Equal(now.Add(time.Hour)) {
+	by, until := claimState(t, r, orphan.ID())
+	if !by.Valid || uuid.UUID(by.Bytes) != tokenB || !until.Time.Equal(now.Add(lease)) {
+		t.Fatalf("orphan lease = %v until %v", by, until.Time)
+	}
+
+	// A confirma; os leases vigentes impedem nova reivindicação.
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if again := claim(pool, now.Add(10*time.Second), newID(t), 10); len(again) != 0 {
+		t.Fatalf("claimed %v while leases are valid", claimedIDs(again))
+	}
+
+	// Fencing: só o dono do lease trava a linha.
+	if err := r.within(t, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := r.wagers.GetClaimedForUpdate(ctx, tx, due[2].ID(), tokenA); !errors.Is(err, postgres.ErrNotFound) {
+			return fmt.Errorf("foreign token err = %v", err)
+		}
+		got, err := r.wagers.GetClaimedForUpdate(ctx, tx, due[2].ID(), tokenB)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(got, due[2]) {
+			return fmt.Errorf("claimed read mismatch")
+		}
+		// Reagenda e solta o lease no mesmo UPDATE.
+		if err := got.RescheduleReferenceRetry(domain.MarkWagerPendingReferenceParams{NextAttemptAt: now.Add(time.Hour), Now: now}); err != nil {
+			return err
+		}
+		return r.wagers.Update(ctx, tx, got)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if by, until := claimState(t, r, due[2].ID()); by.Valid || until.Valid {
+		t.Fatalf("Update kept the lease: %v %v", by, until)
+	}
+	if got, err := r.wagers.GetByID(ctx, pool, due[2].ID()); err != nil || got.Attempts() != 2 || !got.NextAttemptAt().Equal(now.Add(time.Hour)) {
 		t.Fatalf("rescheduled: %+v, %v", got, err)
 	}
 
-	// Liberado o lock de A, as duas voltam a ser reivindicáveis.
-	if err := txA.Rollback(ctx); err != nil {
-		t.Fatal(err)
+	// Lease expirado (worker morto): outra instância reassume, e o dono antigo
+	// perde o fencing. O PENDING recente já passou da carência; a reagendada
+	// (+1h) e as futuras ainda não venceram.
+	tokenC := newID(t)
+	reclaimed := claim(pool, now.Add(lease), tokenC, 10)
+	if got := claimedIDs(reclaimed); !reflect.DeepEqual(got, []uuid.UUID{due[0].ID(), due[1].ID(), orphan.ID(), fresh.ID()}) {
+		t.Fatalf("after lease claimed %v, want [due0, due1, orphan, fresh]", got)
 	}
-	var again []*domain.WagerTransaction
 	if err := r.within(t, func(ctx context.Context, tx pgx.Tx) error {
-		var err error
-		again, err = r.wagers.ClaimDuePendingReferences(ctx, tx, now, 10)
+		if _, err := r.wagers.GetClaimedForUpdate(ctx, tx, due[0].ID(), tokenA); !errors.Is(err, postgres.ErrNotFound) {
+			return fmt.Errorf("stale owner err = %v", err)
+		}
+		_, err := r.wagers.GetClaimedForUpdate(ctx, tx, due[0].ID(), tokenC)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(again) != 2 || again[0].ID() != due[0].ID() || again[1].ID() != due[1].ID() {
-		t.Fatalf("after release claimed %d, want 2", len(again))
+
+	// Mais tarde: as futuras vencem e os leases de C expiram (o PENDING recente
+	// volta a ser elegível); a terminal nunca entra.
+	later := claim(pool, now.Add(2*time.Hour), newID(t), 10)
+	got := map[uuid.UUID]bool{}
+	for _, c := range later {
+		got[c.ID] = true
 	}
-	// As futuras ficam de fora até vencerem.
-	var later []*domain.WagerTransaction
-	if err := r.within(t, func(ctx context.Context, tx pgx.Tx) error {
-		var err error
-		later, err = r.wagers.ClaimDuePendingReferences(ctx, tx, now.Add(10*time.Minute), 10)
-		return err
-	}); err != nil {
+	for _, want := range []uuid.UUID{future[0].ID(), future[1].ID(), fresh.ID(), due[2].ID()} {
+		if !got[want] {
+			t.Errorf("claim at +2h missing %s", want)
+		}
+	}
+	if got[done.ID()] {
+		t.Fatal("terminal transaction claimed")
+	}
+}
+
+// Muitos claimers concorrentes: cada linha vencida é reivindicada por
+// exatamente um deles.
+func TestIntegrationWagerTransactionRepository_ClaimDueConcurrent(t *testing.T) {
+	t.Parallel()
+	r := newRepos(t)
+	ctx := t.Context()
+	now := baseTime()
+	created := now.Add(-time.Hour)
+	w := r.openWallet(t, "100.00", created)
+	const n = 60
+	for i := range n {
+		tx := newWager(t, w, wagerSpec{external: fmt.Sprintf("rb-%d", i), kind: domain.WagerKindRollback,
+			amount: "1.00", reference: fmt.Sprintf("missing-%d", i), now: created})
+		if err := tx.MarkPendingReference(domain.MarkWagerPendingReferenceParams{NextAttemptAt: created, Now: created}); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.wagers.Insert(ctx, r.db.Pool(), tx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var (
+		mu    sync.Mutex
+		seen  = map[uuid.UUID]int{}
+		wg    sync.WaitGroup
+		errCh = make(chan error, 8)
+	)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			token := uuid.New()
+			for {
+				got, err := r.wagers.ClaimDue(ctx, r.db.Pool(), postgres.ClaimParams{
+					Now: now, Token: token, Lease: time.Minute, Limit: 3,
+				})
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if len(got) == 0 {
+					return
+				}
+				mu.Lock()
+				for _, c := range got {
+					seen[c.ID]++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
 		t.Fatal(err)
 	}
-	if len(later) != 4 || later[2].ID() != future[0].ID() || later[3].ID() != future[1].ID() {
-		t.Fatalf("claim at +10m = %d, want 2 due + 2 future", len(later))
+	if len(seen) != n {
+		t.Fatalf("claimed %d distinct, want %d", len(seen), n)
+	}
+	for id, c := range seen {
+		if c != 1 {
+			t.Fatalf("%s claimed %d times", id, c)
+		}
+	}
+}
+
+// O schema (0007) impede lease pela metade e lease em linha terminal.
+func TestIntegrationWagerTransactionRepository_ClaimConstraints(t *testing.T) {
+	t.Parallel()
+	r := newRepos(t)
+	ctx := t.Context()
+	pool := r.db.Pool()
+	now := baseTime()
+	w := r.openWallet(t, "100.00", now)
+	pending := newWager(t, w, wagerSpec{external: "p-bet", kind: domain.WagerKindBet, amount: "1.00", now: now})
+	done := newWager(t, w, wagerSpec{external: "d-loss", kind: domain.WagerKindLoss, amount: "0.00", now: now})
+	if err := done.MarkProcessed(domain.MarkWagerProcessedParams{BalanceAfter: money(t, "100.00"), Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []*domain.WagerTransaction{pending, done} {
+		if err := r.wagers.Insert(ctx, pool, x); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]struct {
+		sql        string
+		id         uuid.UUID
+		constraint string
+	}{
+		"half lease (token only)": {"UPDATE wager_transactions SET claimed_by = gen_random_uuid() WHERE id = $1", pending.ID(), "wager_transactions_claim_pair"},
+		"half lease (until only)": {"UPDATE wager_transactions SET claimed_until = now() WHERE id = $1", pending.ID(), "wager_transactions_claim_pair"},
+	}
+	for name, c := range cases {
+		_, err := pool.Exec(ctx, c.sql, c.id)
+		var cv *postgres.ConstraintViolation
+		if !errors.As(postgres.Translate(err), &cv) || cv.Constraint != c.constraint {
+			t.Errorf("%s: err = %v, want %s", name, err, c.constraint)
+		}
+	}
+	// Linha terminal: o trigger de guarda barra qualquer UPDATE, e o CHECK
+	// barra uma inserção já reivindicada.
+	if _, err := pool.Exec(ctx, "UPDATE wager_transactions SET claimed_by = gen_random_uuid(), claimed_until = now() WHERE id = $1", done.ID()); err == nil {
+		t.Fatal("terminal transaction accepted a lease")
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE wager_transactions DISABLE TRIGGER wager_transactions_guard_update`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pool.Exec(ctx, "UPDATE wager_transactions SET claimed_by = gen_random_uuid(), claimed_until = now() WHERE id = $1", done.ID())
+	var cv *postgres.ConstraintViolation
+	if !errors.As(postgres.Translate(err), &cv) || cv.Constraint != "wager_transactions_terminal_unclaimed" {
+		t.Fatalf("terminal lease without trigger: err = %v", err)
 	}
 }

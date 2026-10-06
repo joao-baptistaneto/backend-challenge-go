@@ -36,6 +36,8 @@ const (
 	OperationProcessTransaction = "process_transaction"
 	OperationReconcile          = "reconcile"
 	OperationQuery              = "query"
+	// OperationPendingReference: claim e retomada do worker de pendências (T21).
+	OperationPendingReference = "pending_reference"
 )
 
 // IsolationLevel é o nível de isolamento de uma unidade de trabalho.
@@ -129,8 +131,20 @@ type WagerTransactionStore interface {
 	// terminal. Contrato: a linha deve ter sido lida sob lock nesta transação
 	// (o lock da carteira, que serializa as operações dela, ou o lock da
 	// própria linha no worker), porque Update não tem versão otimista.
-	// Transação já terminal devolve erro.
+	// Transação já terminal devolve erro. Update também solta o lease do
+	// worker (ClaimDue), no mesmo comando.
 	Update(ctx context.Context, t *domain.WagerTransaction) error
+	// ClaimDue reivindica até p.Limit transações vencidas (PENDING_REFERENCE
+	// com nextAttemptAt <= p.Now e PENDING órfãos) e sem lease vigente,
+	// gravando na linha o token e o fim do lease (p.Now + p.Lease). Instâncias
+	// concorrentes recebem conjuntos disjuntos (SKIP LOCKED). O lease é
+	// persistido: se o worker morrer, a linha volta a ser elegível quando ele
+	// expirar. Usado pelo worker (T21, ADR-023) numa transação própria e curta.
+	ClaimDue(ctx context.Context, p ClaimDueParams) ([]ClaimedWager, error)
+	// GetClaimedForUpdate lê e trava a transação SE ela ainda estiver
+	// reivindicada por token (fencing). Reassumida por outro token (lease
+	// expirado) ou inexistente: erro que casa com ErrRecordNotFound.
+	GetClaimedForUpdate(ctx context.Context, id, token uuid.UUID) (*domain.WagerTransaction, error)
 	// GetByID lê pelo id interno. Inexistente: ErrRecordNotFound.
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error)
 	// GetByProviderIdempotencyKey lê por (providerId, idempotencyKey).
@@ -142,6 +156,27 @@ type WagerTransactionStore interface {
 	// ListByProviderReference lista as operações do provedor que citam
 	// referenceExternalTransactionId, em qualquer estado e tipo.
 	ListByProviderReference(ctx context.Context, providerID, referenceExternalTransactionID string) ([]*domain.WagerTransaction, error)
+}
+
+// ClaimDueParams são os parâmetros de WagerTransactionStore.ClaimDue.
+type ClaimDueParams struct {
+	// Now é o instante de referência (relógio da aplicação).
+	Now time.Time
+	// Token identifica o lote reivindicado (fencing).
+	Token uuid.UUID
+	// Lease é a duração da reivindicação.
+	Lease time.Duration
+	// Limit é o tamanho máximo do lote.
+	Limit int
+	// OrphanGrace é a idade mínima de um PENDING (sem nextAttemptAt) para ser
+	// retomado como órfão.
+	OrphanGrace time.Duration
+}
+
+// ClaimedWager é uma transação reivindicada por ClaimDue.
+type ClaimedWager struct {
+	ID     uuid.UUID
+	Status domain.WagerStatus
 }
 
 // LedgerStore grava o ledger append-only.

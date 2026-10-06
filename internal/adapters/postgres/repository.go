@@ -19,7 +19,7 @@ import (
 //   - SQL explícito com pgx. Cada método recebe um Querier: dentro de
 //     WithinTx é o pgx.Tx do caso de uso, e assim wallet, transação, ledger e
 //     outbox entram no mesmo commit. Os métodos que travam linhas
-//     (GetForUpdate, ClaimDuePendingReferences) exigem um pgx.Tx
+//     (GetForUpdate, GetByIDForUpdate, GetClaimedForUpdate) exigem um pgx.Tx
 //     (ErrTxRequired): FOR UPDATE fora de transação solta o lock na hora e
 //     daria uma falsa sensação de exclusão.
 //   - Money ↔ BIGINT + CHAR(3): MinorUnits() e Currency() na escrita e

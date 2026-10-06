@@ -437,3 +437,13 @@ func (fakeLedger) List(context.Context, uuid.UUID, string, int) (app.LedgerPage,
 func (fakeLedger) Summarize(context.Context, uuid.UUID) (app.LedgerSummary, error) {
 	return app.LedgerSummary{}, errUnexpectedCall
 }
+
+// Worker de pendências (T21; não usados por OpenWallet).
+
+func (fakeWagers) ClaimDue(context.Context, app.ClaimDueParams) ([]app.ClaimedWager, error) {
+	return nil, errUnexpectedCall
+}
+
+func (fakeWagers) GetClaimedForUpdate(context.Context, uuid.UUID, uuid.UUID) (*domain.WagerTransaction, error) {
+	return nil, errUnexpectedCall
+}

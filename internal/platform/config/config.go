@@ -80,6 +80,16 @@ const (
 	EnvOutboxLease                 = "OUTBOX_LEASE"
 	EnvPendingReferenceMaxAttempts = "PENDING_REFERENCE_MAX_ATTEMPTS"
 	EnvPendingReferenceTTL         = "PENDING_REFERENCE_TTL"
+
+	EnvPendingReferenceRetryBaseDelay = "PENDING_REFERENCE_RETRY_BASE_DELAY"
+	EnvPendingReferenceRetryMaxDelay  = "PENDING_REFERENCE_RETRY_MAX_DELAY"
+	EnvPendingWorkerPollInterval      = "PENDING_WORKER_POLL_INTERVAL"
+	EnvPendingWorkerBatchSize         = "PENDING_WORKER_BATCH_SIZE"
+	EnvPendingWorkerConcurrency       = "PENDING_WORKER_CONCURRENCY"
+	EnvPendingWorkerLease             = "PENDING_WORKER_LEASE"
+	EnvPendingWorkerProcessTimeout    = "PENDING_WORKER_PROCESS_TIMEOUT"
+	EnvPendingWorkerDrainTimeout      = "PENDING_WORKER_DRAIN_TIMEOUT"
+	EnvPendingOrphanGrace             = "PENDING_ORPHAN_GRACE"
 )
 
 // Ambientes aceitos em APP_ENV.
@@ -132,6 +142,24 @@ const (
 	maxSQSMaxAttempts       = 999
 	maxSQSWaitTime          = 20 * time.Second
 	maxSQSVisibilityTimeout = 12 * time.Hour
+)
+
+// Defaults e limites do worker de pendências (ARCHITECTURE.md, ADR-023).
+const (
+	DefaultPendingReferenceRetryBaseDelay = 2 * time.Second
+	DefaultPendingReferenceRetryMaxDelay  = time.Minute
+	DefaultPendingWorkerPollInterval      = time.Second
+	DefaultPendingWorkerBatchSize         = 20
+	DefaultPendingWorkerConcurrency       = 4
+	DefaultPendingWorkerLease             = 30 * time.Second
+	DefaultPendingWorkerProcessTimeout    = 5 * time.Second
+	DefaultPendingWorkerDrainTimeout      = 10 * time.Second
+	DefaultPendingOrphanGrace             = 30 * time.Second
+
+	maxPendingDelay             = 24 * time.Hour
+	maxPendingWorkerBatchSize   = 1000
+	maxPendingWorkerConcurrency = 100
+	maxPendingWorkerLease       = 24 * time.Hour
 )
 
 // Defaults de autorização (ARCHITECTURE.md, ADR-019). Os nomes são os
@@ -283,11 +311,43 @@ type OIDCConfig struct {
 // WorkersConfig agrupa parâmetros dos workers de outbox e de referências
 // pendentes.
 type WorkersConfig struct {
-	OutboxPollInterval          time.Duration
-	OutboxBatchSize             int
-	OutboxLease                 time.Duration
+	OutboxPollInterval time.Duration
+	OutboxBatchSize    int
+	OutboxLease        time.Duration
+	// PendingReferenceMaxAttempts é o máximo de buscas da referência,
+	// contando a do aceite; PendingReferenceTTL é o prazo desde a criação.
+	// Esgotado qualquer um, a operação vira REJECTED REFERENCE_NOT_FOUND
+	// (ADR-023).
 	PendingReferenceMaxAttempts int
 	PendingReferenceTTL         time.Duration
+	// PendingReferenceRetryBaseDelay/MaxDelay: backoff entre buscas
+	// (base·2^(tentativa−1), com teto).
+	PendingReferenceRetryBaseDelay time.Duration
+	PendingReferenceRetryMaxDelay  time.Duration
+	// PendingWorker são os parâmetros do worker de pendências.
+	PendingWorker PendingWorkerConfig
+}
+
+// PendingWorkerConfig agrupa os parâmetros do worker de referências
+// pendentes e PENDING órfãos (ADR-023).
+type PendingWorkerConfig struct {
+	// PollInterval é a espera entre ciclos quando o último lote não veio
+	// cheio.
+	PollInterval time.Duration
+	// BatchSize é o tamanho máximo de um lote reivindicado.
+	BatchSize int
+	// Concurrency é o número de itens do lote processados em paralelo.
+	Concurrency int
+	// Lease é a duração da reivindicação persistida; um item não processado
+	// dentro dele (crash) volta a ser elegível. Maior que ProcessTimeout.
+	Lease time.Duration
+	// ProcessTimeout limita a retomada de um item.
+	ProcessTimeout time.Duration
+	// DrainTimeout é o prazo, no shutdown, para concluir os itens em voo.
+	DrainTimeout time.Duration
+	// OrphanGrace é a idade mínima de um PENDING (sem next_attempt_at) para
+	// ser retomado como órfão.
+	OrphanGrace time.Duration
 }
 
 // LookupFunc tem a mesma assinatura de os.LookupEnv.
@@ -368,6 +428,14 @@ func Load(lookup LookupFunc) (Config, error) {
 	c.Workers.OutboxLease = p.positiveDuration(EnvOutboxLease, 30*time.Second)
 	c.Workers.PendingReferenceMaxAttempts = p.intRange(EnvPendingReferenceMaxAttempts, 10, 1, math.MaxInt32)
 	c.Workers.PendingReferenceTTL = p.positiveDuration(EnvPendingReferenceTTL, 10*time.Minute)
+	c.Workers.PendingReferenceRetryBaseDelay = p.durationRange(EnvPendingReferenceRetryBaseDelay,
+		DefaultPendingReferenceRetryBaseDelay, time.Millisecond, maxPendingDelay)
+	c.Workers.PendingReferenceRetryMaxDelay = p.durationRange(EnvPendingReferenceRetryMaxDelay,
+		DefaultPendingReferenceRetryMaxDelay, time.Millisecond, maxPendingDelay)
+	if b, m := c.Workers.PendingReferenceRetryBaseDelay, c.Workers.PendingReferenceRetryMaxDelay; b > 0 && m > 0 && m < b {
+		p.fail(EnvPendingReferenceRetryMaxDelay, "não pode ser menor que "+EnvPendingReferenceRetryBaseDelay)
+	}
+	c.Workers.PendingWorker = p.pendingWorker()
 
 	// O lease precisa ser maior que o intervalo de polling; caso contrário um
 	// lote reivindicado expira antes do próximo ciclo e outro publisher o
@@ -513,6 +581,25 @@ func (p *parser) sqsConsumer() SQSConsumerConfig {
 	}
 	if c.RetryBaseDelay > 0 && c.RetryMaxDelay > 0 && c.RetryMaxDelay < c.RetryBaseDelay {
 		p.fail(EnvSQSRetryMaxDelay, "não pode ser menor que "+EnvSQSRetryBaseDelay)
+	}
+	return c
+}
+
+// pendingWorker lê e valida os parâmetros do worker de pendências.
+func (p *parser) pendingWorker() PendingWorkerConfig {
+	var c PendingWorkerConfig
+	c.PollInterval = p.durationRange(EnvPendingWorkerPollInterval, DefaultPendingWorkerPollInterval, time.Millisecond, maxPendingDelay)
+	c.BatchSize = p.intRange(EnvPendingWorkerBatchSize, DefaultPendingWorkerBatchSize, 1, maxPendingWorkerBatchSize)
+	c.Concurrency = p.intRange(EnvPendingWorkerConcurrency, DefaultPendingWorkerConcurrency, 1, maxPendingWorkerConcurrency)
+	c.Lease = p.durationRange(EnvPendingWorkerLease, DefaultPendingWorkerLease, time.Second, maxPendingWorkerLease)
+	c.ProcessTimeout = p.positiveDuration(EnvPendingWorkerProcessTimeout, DefaultPendingWorkerProcessTimeout)
+	c.DrainTimeout = p.positiveDuration(EnvPendingWorkerDrainTimeout, DefaultPendingWorkerDrainTimeout)
+	c.OrphanGrace = p.durationRange(EnvPendingOrphanGrace, DefaultPendingOrphanGrace, 0, maxPendingDelay)
+	// Um item precisa caber no lease; senão outra instância o reassume no
+	// meio do processamento (o fencing impede efeito duplicado, mas o
+	// trabalho seria perdido).
+	if c.Lease > 0 && c.ProcessTimeout > 0 && c.ProcessTimeout >= c.Lease {
+		p.fail(EnvPendingWorkerProcessTimeout, "deve ser menor que "+EnvPendingWorkerLease)
 	}
 	return c
 }

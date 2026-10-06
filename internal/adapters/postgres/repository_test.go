@@ -165,23 +165,38 @@ func TestRepositories_ValidateBeforeSQL(t *testing.T) {
 		}
 	}
 
+	claimErr := func(p ClaimParams) error {
+		_, err := wagers.ClaimDue(ctx, q, p)
+		return err
+	}
 	cases := map[string]struct {
 		err  error
 		want error
 	}{
-		"insert nil wallet":          {wallets.Insert(ctx, q, nil), ErrInvalidAggregate},
-		"insert zero wallet":         {wallets.Insert(ctx, q, &domain.Wallet{}), domain.ErrUninitializedWallet},
-		"insert rehydrated wallet":   {wallets.Insert(ctx, q, rehydratedWallet(t, "1.00", 1)), ErrInvalidAggregate},
-		"update new wallet":          {wallets.Update(ctx, q, fresh), ErrInvalidAggregate},
-		"update two movements":       {wallets.Update(ctx, q, twice), ErrInvalidAggregate},
-		"update zero wallet":         {wallets.Update(ctx, q, &domain.Wallet{}), ErrInvalidAggregate},
-		"append zero entry":          {ledger.Append(ctx, q, domain.WalletLedgerEntry{}), ErrInvalidAggregate},
-		"insert nil transaction":     {wagers.Insert(ctx, q, nil), ErrInvalidAggregate},
-		"insert zero transaction":    {wagers.Insert(ctx, q, &domain.WagerTransaction{}), domain.ErrUninitializedWagerTransaction},
-		"update zero transaction":    {wagers.Update(ctx, q, &domain.WagerTransaction{}), ErrInvalidAggregate},
-		"wallet lock outside tx":     {func() error { _, err := wallets.GetForUpdate(ctx, q, unitWalletID); return err }(), ErrTxRequired},
-		"transaction lock outside":   {func() error { _, err := wagers.GetByIDForUpdate(ctx, q, unitWalletID); return err }(), ErrTxRequired},
-		"claim outside tx":           {func() error { _, err := wagers.ClaimDuePendingReferences(ctx, q, unitT0, 10); return err }(), ErrTxRequired},
+		"insert nil wallet":        {wallets.Insert(ctx, q, nil), ErrInvalidAggregate},
+		"insert zero wallet":       {wallets.Insert(ctx, q, &domain.Wallet{}), domain.ErrUninitializedWallet},
+		"insert rehydrated wallet": {wallets.Insert(ctx, q, rehydratedWallet(t, "1.00", 1)), ErrInvalidAggregate},
+		"update new wallet":        {wallets.Update(ctx, q, fresh), ErrInvalidAggregate},
+		"update two movements":     {wallets.Update(ctx, q, twice), ErrInvalidAggregate},
+		"update zero wallet":       {wallets.Update(ctx, q, &domain.Wallet{}), ErrInvalidAggregate},
+		"append zero entry":        {ledger.Append(ctx, q, domain.WalletLedgerEntry{}), ErrInvalidAggregate},
+		"insert nil transaction":   {wagers.Insert(ctx, q, nil), ErrInvalidAggregate},
+		"insert zero transaction":  {wagers.Insert(ctx, q, &domain.WagerTransaction{}), domain.ErrUninitializedWagerTransaction},
+		"update zero transaction":  {wagers.Update(ctx, q, &domain.WagerTransaction{}), ErrInvalidAggregate},
+		"wallet lock outside tx":   {func() error { _, err := wallets.GetForUpdate(ctx, q, unitWalletID); return err }(), ErrTxRequired},
+		"transaction lock outside": {func() error { _, err := wagers.GetByIDForUpdate(ctx, q, unitWalletID); return err }(), ErrTxRequired},
+		"claimed lock outside tx": {func() error {
+			_, err := wagers.GetClaimedForUpdate(ctx, q, unitWalletID, uuid.New())
+			return err
+		}(), ErrTxRequired},
+		"claim zero now":    {claimErr(ClaimParams{Token: uuid.New(), Lease: time.Second, Limit: 1}), ErrInvalidClaim},
+		"claim nil token":   {claimErr(ClaimParams{Now: unitT0, Lease: time.Second, Limit: 1}), ErrInvalidClaim},
+		"claim short lease": {claimErr(ClaimParams{Now: unitT0, Token: uuid.New(), Lease: time.Microsecond, Limit: 1}), ErrInvalidClaim},
+		"claim long lease":  {claimErr(ClaimParams{Now: unitT0, Token: uuid.New(), Lease: MaxClaimLease + 1, Limit: 1}), ErrInvalidClaim},
+		"claim batch zero":  {claimErr(ClaimParams{Now: unitT0, Token: uuid.New(), Lease: time.Second}), ErrInvalidClaim},
+		"claim batch high":  {claimErr(ClaimParams{Now: unitT0, Token: uuid.New(), Lease: time.Second, Limit: MaxClaimBatch + 1}), ErrInvalidClaim},
+		"claim neg grace": {claimErr(ClaimParams{Now: unitT0, Token: uuid.New(), Lease: time.Second, Limit: 1,
+			OrphanGrace: -time.Second}), ErrInvalidClaim},
 		"ledger page limit zero":     {func() error { _, err := ledger.ListByWallet(ctx, q, unitWalletID, "", 0); return err }(), ErrInvalidPageLimit},
 		"ledger page limit over max": {func() error { _, err := ledger.ListByWallet(ctx, q, unitWalletID, "", MaxLedgerPageSize+1); return err }(), ErrInvalidPageLimit},
 		"ledger bad cursor":          {func() error { _, err := ledger.ListByWallet(ctx, q, unitWalletID, "x", 10); return err }(), ErrInvalidCursor},

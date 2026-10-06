@@ -44,6 +44,8 @@ type memState struct {
 	ledger  []domain.WalletLedgerEntry
 	events  []domain.IntegrationEvent
 	inbox   map[string]memInbox
+	// claims é o lease do worker (T21) por transação.
+	claims map[uuid.UUID]memClaim
 }
 
 func cloneWallet(w *domain.Wallet) *domain.Wallet {
@@ -63,7 +65,10 @@ func cloneWager(t *domain.WagerTransaction) *domain.WagerTransaction {
 }
 
 func (s memState) clone() memState {
-	c := memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}}
+	c := memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}}
+	for k, v := range s.claims {
+		c.claims[k] = v
+	}
 	for k, v := range s.wallets {
 		c.wallets[k] = cloneWallet(v)
 	}
@@ -79,7 +84,7 @@ func (s memState) clone() memState {
 }
 
 func newMemUoW() *memUoW {
-	return &memUoW{state: memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}}}
+	return &memUoW{state: memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}}}
 }
 
 func (u *memUoW) WithinTx(ctx context.Context, opts app.TxOptions, fn app.TxFunc) error {
@@ -166,8 +171,58 @@ func (s memWagers) Insert(_ context.Context, t *domain.WagerTransaction) error {
 	return nil
 }
 
-func (s memWagers) Update(context.Context, *domain.WagerTransaction) error {
-	return errors.New("mem: update not used by ProcessWagerTransaction")
+// Update espelha o adapter: só linhas não terminais, e solta o lease.
+func (s memWagers) Update(_ context.Context, t *domain.WagerTransaction) error {
+	for i, w := range s.s.wagers {
+		if w.ID() != t.ID() {
+			continue
+		}
+		if w.IsTerminal() {
+			return errors.New("mem: transaction is terminal")
+		}
+		s.s.wagers[i] = cloneWager(t)
+		delete(s.s.claims, t.ID())
+		return nil
+	}
+	return app.ErrRecordNotFound
+}
+
+type memClaim struct {
+	token uuid.UUID
+	until time.Time
+}
+
+// ClaimDue espelha o SQL: vencidas, sem lease vigente, referências primeiro.
+func (s memWagers) ClaimDue(_ context.Context, p app.ClaimDueParams) ([]app.ClaimedWager, error) {
+	free := func(id uuid.UUID) bool {
+		c, ok := s.s.claims[id]
+		return !ok || !c.until.After(p.Now)
+	}
+	var out []app.ClaimedWager
+	for _, pass := range []domain.WagerStatus{domain.WagerStatusPendingReference, domain.WagerStatusPending} {
+		for _, w := range s.s.wagers {
+			if len(out) == p.Limit || w.Status() != pass || !free(w.ID()) {
+				continue
+			}
+			due := w.NextAttemptAt()
+			if due.IsZero() {
+				due = w.CreatedAt().Add(p.OrphanGrace)
+			}
+			if due.After(p.Now) {
+				continue
+			}
+			s.s.claims[w.ID()] = memClaim{token: p.Token, until: p.Now.Add(p.Lease)}
+			out = append(out, app.ClaimedWager{ID: w.ID(), Status: w.Status()})
+		}
+	}
+	return out, nil
+}
+
+func (s memWagers) GetClaimedForUpdate(_ context.Context, id, token uuid.UUID) (*domain.WagerTransaction, error) {
+	if c, ok := s.s.claims[id]; !ok || c.token != token {
+		return nil, app.ErrRecordNotFound
+	}
+	return s.find(func(w *domain.WagerTransaction) bool { return w.ID() == id })
 }
 
 func (s memWagers) find(match func(*domain.WagerTransaction) bool) (*domain.WagerTransaction, error) {

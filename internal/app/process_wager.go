@@ -344,28 +344,10 @@ func (uc *ProcessWagerTransaction) process(ctx context.Context, tx Tx, p wagerPl
 	clone := *p.pending
 	t := &clone
 
-	var (
-		ref       *domain.WagerTransaction
-		reversals []*domain.WagerTransaction
-	)
-	if t.HasReference() {
-		if ref, err = lookup(txs.GetByProviderExternalID(ctx, cmd.ProviderID, t.ReferenceExternalTransactionID())); err != nil {
-			return WagerResult{}, err
-		}
-		if ref != nil && t.Kind().IsReversal() {
-			all, err := txs.ListByProviderReference(ctx, cmd.ProviderID, t.ReferenceExternalTransactionID())
-			if err != nil {
-				return WagerResult{}, err
-			}
-			// Só reversões contam (um WIN também pode citar a BET).
-			for _, r := range all {
-				if r.Kind().IsReversal() {
-					reversals = append(reversals, r)
-				}
-			}
-		}
+	ref, reversals, err := loadReference(ctx, txs, t)
+	if err != nil {
+		return WagerResult{}, err
 	}
-
 	decision, err := domain.DecideWager(domain.WagerRuleInput{
 		Transaction: t, Wallet: wallet, Reference: ref, ReferenceReversals: reversals,
 	})
@@ -380,35 +362,73 @@ func (uc *ProcessWagerTransaction) process(ctx context.Context, tx Tx, p wagerPl
 		return WagerResult{}, fmt.Errorf("app: %s: apply decision: %w", opProcessWager, err)
 	}
 
-	events, err := uc.events(t, entry, wallet, p.meta)
+	events, err := wagerEvents(opProcessWager, t, entry, wallet, p.meta, true)
 	if err != nil {
 		return WagerResult{}, err
 	}
-
-	if entry.IsInitialized() {
-		// Carteira lida com GetForUpdate nesta transação: um movimento.
-		if err := tx.Wallets().Update(ctx, wallet); err != nil {
-			return WagerResult{}, err
-		}
-	}
-	if err := txs.Insert(ctx, t); err != nil {
-		return WagerResult{}, err
-	}
-	if entry.IsInitialized() {
-		// Carteira travada nesta transação (contrato de LedgerStore.Append);
-		// a transação já existe (FK do ledger).
-		if err := tx.Ledger().Append(ctx, entry); err != nil {
-			return WagerResult{}, err
-		}
-	}
-	if err := tx.Outbox().Enqueue(ctx, events...); err != nil {
+	if err := persistWagerOutcome(ctx, tx, t, wallet, entry, events, txs.Insert); err != nil {
 		return WagerResult{}, err
 	}
 	return resultOf(t, false), nil
 }
 
-// events monta os eventos do estado final, na ordem de publicação.
-func (uc *ProcessWagerTransaction) events(t *domain.WagerTransaction, entry domain.WalletLedgerEntry, w *domain.Wallet, meta domain.EventMetadata) ([]domain.IntegrationEvent, error) {
+// loadReference lê, sob o lock da carteira, a referência de t por (provider,
+// referenceExternalTransactionId) e as reversões já existentes dela. Sem
+// referência (ou ainda não recebida): nil. Compartilhado com o worker (T21).
+func loadReference(ctx context.Context, txs WagerTransactionStore, t *domain.WagerTransaction) (*domain.WagerTransaction, []*domain.WagerTransaction, error) {
+	if !t.HasReference() {
+		return nil, nil, nil
+	}
+	ref, err := lookup(txs.GetByProviderExternalID(ctx, t.ProviderID(), t.ReferenceExternalTransactionID()))
+	if err != nil || ref == nil || !t.Kind().IsReversal() {
+		return ref, nil, err
+	}
+	all, err := txs.ListByProviderReference(ctx, t.ProviderID(), t.ReferenceExternalTransactionID())
+	if err != nil {
+		return nil, nil, err
+	}
+	// Só reversões contam (um WIN também pode citar a BET).
+	var reversals []*domain.WagerTransaction
+	for _, r := range all {
+		if r.Kind().IsReversal() {
+			reversals = append(reversals, r)
+		}
+	}
+	return ref, reversals, nil
+}
+
+// persistWagerOutcome grava o resultado de uma decisão na ordem exigida pelas
+// FKs e pelo contrato de lock (ADR-017): carteira (só com movimento; lida com
+// GetForUpdate nesta transação), a transação (save = Insert no caso de uso,
+// Update no worker), o lançamento (carteira travada; a transação já existe) e
+// os eventos na outbox.
+func persistWagerOutcome(ctx context.Context, tx Tx, t *domain.WagerTransaction, wallet *domain.Wallet,
+	entry domain.WalletLedgerEntry, events []domain.IntegrationEvent,
+	save func(context.Context, *domain.WagerTransaction) error,
+) error {
+	if entry.IsInitialized() {
+		if err := tx.Wallets().Update(ctx, wallet); err != nil {
+			return err
+		}
+	}
+	if err := save(ctx, t); err != nil {
+		return err
+	}
+	if entry.IsInitialized() {
+		if err := tx.Ledger().Append(ctx, entry); err != nil {
+			return err
+		}
+	}
+	return tx.Outbox().Enqueue(ctx, events...)
+}
+
+// wagerEvents monta os eventos do estado final, na ordem de publicação.
+// pendingEvent controla WagerTransactionPendingReference: emitido só na
+// transição PENDING -> PENDING_REFERENCE (ADR-012); o reagendamento do worker
+// (PENDING_REFERENCE -> PENDING_REFERENCE) não gera evento.
+func wagerEvents(op string, t *domain.WagerTransaction, entry domain.WalletLedgerEntry, w *domain.Wallet,
+	meta domain.EventMetadata, pendingEvent bool,
+) ([]domain.IntegrationEvent, error) {
 	var (
 		ev  domain.IntegrationEvent
 		err error
@@ -419,20 +439,22 @@ func (uc *ProcessWagerTransaction) events(t *domain.WagerTransaction, entry doma
 	case domain.WagerStatusRejected:
 		ev, err = domain.NewWagerTransactionRejectedEvent(t, meta)
 	case domain.WagerStatusPendingReference:
-		// Emitido só na transição PENDING -> PENDING_REFERENCE (ADR-012).
+		if !pendingEvent {
+			return nil, nil
+		}
 		ev, err = domain.NewWagerTransactionPendingReferenceEvent(t, meta)
 	default:
-		return nil, fmt.Errorf("app: %s: unexpected status %s after decision", opProcessWager, t.Status())
+		return nil, fmt.Errorf("app: %s: unexpected status %s after decision", op, t.Status())
 	}
 	if err != nil {
-		return nil, fmt.Errorf("app: %s: build event: %w", opProcessWager, err)
+		return nil, fmt.Errorf("app: %s: build event: %w", op, err)
 	}
 	events := []domain.IntegrationEvent{ev}
 	if entry.IsInitialized() {
 		// Mesma instância de carteira que produziu o lançamento (ADR-012).
 		changed, err := domain.NewWalletBalanceChangedEvent(entry, w, meta)
 		if err != nil {
-			return nil, fmt.Errorf("app: %s: build balance changed event: %w", opProcessWager, err)
+			return nil, fmt.Errorf("app: %s: build balance changed event: %w", op, err)
 		}
 		events = append(events, changed)
 	}

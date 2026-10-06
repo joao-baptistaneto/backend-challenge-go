@@ -95,6 +95,8 @@ const (
 	// CodeInvalidCursor / CodeInvalidPageLimit: paginação do extrato.
 	CodeInvalidCursor    = "INVALID_CURSOR"
 	CodeInvalidPageLimit = "INVALID_PAGE_LIMIT"
+	// CodeInvalidClaim: token de claim ou id nulo no worker de pendências.
+	CodeInvalidClaim = "INVALID_CLAIM"
 )
 
 // Error é o erro tipado devolvido pelos casos de uso.

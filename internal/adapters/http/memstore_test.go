@@ -307,3 +307,13 @@ func (memInbox) Register(context.Context, string, string, string, time.Time) (ap
 func (memInbox) Complete(context.Context, string, string, string, uuid.UUID, time.Time) error {
 	return errors.New("mem: inbox not used by HTTP")
 }
+
+// Worker de pendências (T21): não usados pela API HTTP.
+
+func (memWagers) ClaimDue(context.Context, app.ClaimDueParams) ([]app.ClaimedWager, error) {
+	return nil, errors.New("mem: claim not used by the HTTP API")
+}
+
+func (memWagers) GetClaimedForUpdate(context.Context, uuid.UUID, uuid.UUID) (*domain.WagerTransaction, error) {
+	return nil, errors.New("mem: claimed lock not used by the HTTP API")
+}

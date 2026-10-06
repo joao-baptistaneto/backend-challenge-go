@@ -30,6 +30,7 @@ internal/adapters/http/     handlers net/http (package httpadapter, evita colis�
 internal/adapters/postgres/ repositórios pgx, gerenciador de transações
 internal/adapters/sqs/      consumidor de entrada e publisher da outbox
 internal/adapters/auth/     verificação OIDC e autorização
+internal/adapters/pendingworker/ worker temporizado de referências pendentes e PENDING órfãos (T21)
 internal/platform/config/   configuração por variáveis de ambiente
 internal/platform/logging/  slog JSON
 internal/platform/metrics/  registro Prometheus
@@ -701,7 +702,7 @@ Pacote `internal/adapters/postgres` (`repository.go`, `wallet_repository.go`,
   método recebe o `Querier` da chamada. Dentro de `WithinTx` ele é o `pgx.Tx` do caso de
   uso, então carteira, transação, ledger (e depois inbox/outbox) entram no mesmo commit
   (ADR-013). Os métodos que travam linhas (`WalletRepository.GetForUpdate`,
-  `WagerTransactionRepository.GetByIDForUpdate` e `ClaimDuePendingReferences`) recusam um
+  `WagerTransactionRepository.GetByIDForUpdate` e `GetClaimedForUpdate`, T21) recusam um
   `Querier` que não seja `pgx.Tx` (`ErrTxRequired`), porque `FOR UPDATE` em autocommit
   solta o lock na hora.
 - **Money ↔ BIGINT + CHAR(3):** escrita por `MinorUnits()`/`Currency()` e leitura por
@@ -757,13 +758,10 @@ Pacote `internal/adapters/postgres` (`repository.go`, `wallet_repository.go`,
     `wager_transactions_guard_update` continua sendo a barreira final. Quem atualiza
     precisa ter lido sob lock: o lock da carteira serializa as operações dela, e o
     worker usa o lock da própria linha.
-  - `ClaimDuePendingReferences(now, limit)`: `status = 'PENDING_REFERENCE' AND
-    next_attempt_at <= now ORDER BY next_attempt_at, id LIMIT n FOR UPDATE SKIP LOCKED`,
-    com lote de 1 a 1000 (`MaxClaimBatch`). Instâncias concorrentes pegam lotes
-    disjuntos sem esperar umas pelas outras, e o lock vale até o commit, no qual o worker
-    grava o reagendamento ou a conclusão. Para a T21: a ordem de locks precisa ser
-    consistente. O worker deve travar a carteira (`GetForUpdate`) antes de mexer em
-    saldo, e um deadlock eventual (`40P01`) é retentável pelo TxManager.
+  - *(Substituído na T21, ADR-023.)* O antigo `ClaimDuePendingReferences` (lock da linha
+    até o commit do lote) deu lugar a `ClaimDue` (lease persistido em
+    `claimed_by`/`claimed_until`, `FOR NO KEY UPDATE SKIP LOCKED`) e
+    `GetClaimedForUpdate` (fencing por token). `Update` também solta o lease.
 - **Erros:** as violações viram sentinelas pelo nome da constraint, preservando a causa
   (`*ConstraintViolation`/`*pgconn.PgError` continuam na cadeia):
   `wallets_player_currency_key` → `ErrWalletAlreadyExists`; `*_pkey` →
@@ -1834,3 +1832,180 @@ o `*awssqs.Client` satisfaz e os testes unitários substituem por uma fila FIFO 
 - **Para a T23:** compor `config.Module`, `postgres.Module`, `app.Module` e `sqs.Module`.
   Usar `fx.StopTimeout` > `SHUTDOWN_TIMEOUT` (HTTP) + `SQS_DRAIN_TIMEOUT` + folga para os
   releases (5s por chamada): o Fx não espera um OnStop além do seu prazo.
+
+## ADR-023 — Worker de referências pendentes e PENDING órfãos (T21)
+
+Pacotes `internal/app/resume_wager.go` (caso de uso `ResumeWagerTransaction` e
+`PendingWagerPolicy`), `internal/adapters/pendingworker` (laço, lifecycle Fx) e
+`internal/adapters/postgres` (`ClaimDue`, `GetClaimedForUpdate`), além da migration `0007`.
+
+- **O que é retomado.**
+  - `PENDING_REFERENCE` vencido (`next_attempt_at <= agora`).
+  - `PENDING` órfão. O fluxo síncrono nunca confirma `PENDING` (ADR-017). Uma linha
+    `PENDING` confirmada só existe se um aceite foi interrompido (ou se um aceite
+    assíncrono futuro gravá-la). Ela é órfã quando vence o seu `next_attempt_at` ou, sem
+    ele, `PENDING_ORPHAN_GRACE` desde `created_at`.
+  - A retomada é idempotente: a linha órfã é a própria operação, e a idempotência por
+    chave já a protege de uma segunda entrada. Uma linha terminal não é elegível nem
+    atualizável.
+- **Claim com lease persistido** (migration `0007`):
+  - Colunas `claimed_by UUID` (token do lote) e `claimed_until TIMESTAMPTZ`.
+  - `CHECK` de par (as duas juntas) e `CHECK` de que linha terminal não fica
+    reivindicada.
+  - `ClaimDue` roda dois comandos `UPDATE ... FROM (SELECT ... LIMIT n FOR NO KEY UPDATE
+    SKIP LOCKED)`: primeiro as referências vencidas, depois os órfãos com o que sobrar do
+    lote. Eles pegam só linhas sem lease vigente (`claimed_until IS NULL OR <= agora`) e
+    gravam `claimed_by = token` e `claimed_until = agora + lease`.
+  - **Por que dois comandos:** um único comando com duas CTEs travadas trava também os
+    órfãos que não entram no lote. Achado no teste de integração: outro claimer
+    concorrente os pulava.
+  - **Por que lease e não lock até o commit do lote** (o desenho anterior,
+    `ClaimDuePendingReferences`):
+    - um lote não segura locks de várias carteiras;
+    - cada item tem sua própria transação curta;
+    - um worker que morre não perde o item, que volta quando o lease expira.
+  - `FOR NO KEY UPDATE` não conflita com o `KEY SHARE` que a FK
+    `reference_transaction_id` toma. Por isso uma operação nova que cita a linha não espera
+    o claim.
+  - Relógio: o da aplicação, o mesmo que grava `next_attempt_at`. Um desvio de relógio só
+    antecipa ou atrasa uma reassunção e nunca duplica efeito, por causa do fencing.
+- **Fencing e exatamente uma vez.**
+  - `Resume(id, token)` lê a linha sem lock só para descobrir a carteira (`wallet_id` é
+    imutável).
+  - Trava a carteira (`GetForUpdate`) **antes** da linha. É a mesma ordem de quem insere
+    uma operação nova (carteira → `KEY SHARE` da FK), então não há deadlock entre o worker
+    e HTTP/SQS.
+  - Em seguida chama `GetClaimedForUpdate(id, token)`: `SELECT ... WHERE id = $1 AND
+    claimed_by = $2 FOR NO KEY UPDATE`. Uma instância cujo lease expirou e foi reassumido
+    encontra outro token e devolve `ResumeSkipped` sem gravar nada.
+  - A transição grava com `Transactions.Update`, que tem `WHERE status não terminal` e
+    também solta o lease no mesmo `UPDATE`.
+  - Barreiras finais: `UNIQUE(wallet_id, transaction_id)` do ledger, o índice de reversão
+    única e o trigger de imutabilidade terminal.
+- **Mesmo caminho do caso de uso** (pendência da T15). `process_wager.go` foi fatorado em
+  `loadReference`, `wagerEvents` e `persistWagerOutcome`. `ProcessWagerTransaction` grava
+  com `Insert` e o worker com `Update`. `DecideWager` e `ApplyWagerDecision` são os mesmos,
+  com a carteira travada (contratos dos ADR-014/017).
+- **Limite: tentativas e TTL** (`PendingWagerPolicy`):
+  - `attempts` continua contando só as buscas sem sucesso (ADR-008).
+    `PENDING_REFERENCE_MAX_ATTEMPTS` conta todas as buscas, inclusive a do aceite.
+  - Quando a referência continua indisponível (ausente, ou existente mas ainda
+    `PENDING`/`PENDING_REFERENCE`), a operação expira se esta busca for a de número
+    `MaxAttempts` ou se `PENDING_REFERENCE_TTL` desde `created_at` tiver vencido. Ela vira
+    `REJECTED REFERENCE_NOT_FOUND`, com o saldo observado e `WagerTransactionRejected` no
+    mesmo commit. `attempts` não é incrementado na expiração.
+  - A busca vem **antes** da expiração: uma referência que chegou é aplicada mesmo na
+    última tentativa ou depois do TTL (se o worker atrasou).
+  - Referência existente que terminou sem sucesso (`REJECTED`/`FAILED`) não espera:
+    `DecideWager` rejeita na hora com `REFERENCE_NOT_PROCESSED` (ADR-009).
+  - Referência pendente no TTL: `REFERENCE_NOT_FOUND`. O código significa "não ficou
+    disponível no prazo" e nunca carrega `referenceTransactionId`.
+- **Backoff exponencial persistido.**
+  - `next_attempt_at = agora + PENDING_REFERENCE_RETRY_BASE_DELAY · 2^(attempts−1)`, com
+    teto `PENDING_REFERENCE_RETRY_MAX_DELAY` e sem overflow. `attempts` é o valor já
+    incrementado.
+  - Nunca agenda depois do fim do TTL, para que a expiração aconteça no prazo.
+  - A primeira espera é a do aceite (`WithReferenceRetryDelay`, padrão 2s). A T23 deve
+    passar o mesmo `PENDING_REFERENCE_RETRY_BASE_DELAY`.
+  - Com os defaults (2s, teto 1m, 10 buscas, TTL 10m), a última busca acontece cerca de
+    5 min depois do aceite.
+- **Eventos.**
+  - `PROCESSED`: `WagerTransactionProcessed` e `WalletBalanceChanged`. `REJECTED`:
+    `WagerTransactionRejected`.
+  - `PENDING` → `PENDING_REFERENCE` gera `WagerTransactionPendingReference`. O
+    reagendamento não gera evento (ADR-012).
+  - `correlationId` = id da transação (o correlation da entrada original não é
+    persistido). `causationId` = token do claim, rastreável até o lote.
+- **Worker** (`pendingworker.Worker`):
+  - Cada ciclo gera um token UUIDv7, chama `Claim` (lote `PENDING_WORKER_BATCH_SIZE`) e
+    reaplica os itens com até `PENDING_WORKER_CONCURRENCY` em paralelo, cada um com
+    `PENDING_WORKER_PROCESS_TIMEOUT`.
+  - Lote cheio dispara novo ciclo imediato. Senão, o worker espera
+    `PENDING_WORKER_POLL_INTERVAL`.
+  - Um item cujo lease já não cobre um processamento completo não é iniciado. Ele volta
+    para a próxima reivindicação.
+  - Erro em um item (transitório ou não) não interrompe o ciclo: o lease fica gravado e o
+    item volta quando ele expirar.
+  - Erro no claim (banco indisponível): log e nova tentativa no próximo ciclo.
+- **Lifecycle Fx.**
+  - `pendingworker.Module` provê `*app.ResumeWagerTransaction` (política vinda da config)
+    como `Resumer` e o `*Worker`, que é instanciado por `fx.Invoke`.
+  - `OnStart` inicia o laço em goroutine.
+  - `OnStop` para de reivindicar e de iniciar itens. Os itens em voo terminam até
+    `PENDING_WORKER_DRAIN_TIMEOUT` (ou o prazo do OnStop). Estourado o prazo, o contexto do
+    processamento é cancelado (rollback; o lease expira e outra instância retoma) e o
+    OnStop devolve `ErrDrainTimeout`.
+  - O `Stop` sempre espera as goroutines do worker. O worker depende do caso de uso, que
+    depende do pool, então para antes do pool.
+  - Itens reivindicados e ainda não iniciados no shutdown ficam com o lease e voltam
+    quando ele expirar (≤ `PENDING_WORKER_LEASE`).
+- **Configuração** (validada no start; `.env.example`):
+
+  | Variável | Default | Regra |
+  |---|---|---|
+  | `PENDING_REFERENCE_MAX_ATTEMPTS` | 10 | 1..2^31−1, buscas totais |
+  | `PENDING_REFERENCE_TTL` | 10m | > 0, desde a criação |
+  | `PENDING_REFERENCE_RETRY_BASE_DELAY` / `_MAX_DELAY` | 2s / 1m | 1ms..24h, base <= max |
+  | `PENDING_WORKER_POLL_INTERVAL` | 1s | 1ms..24h |
+  | `PENDING_WORKER_BATCH_SIZE` | 20 | 1..1000 |
+  | `PENDING_WORKER_CONCURRENCY` | 4 | 1..100 |
+  | `PENDING_WORKER_LEASE` | 30s | 1s..24h |
+  | `PENDING_WORKER_PROCESS_TIMEOUT` | 5s | < `PENDING_WORKER_LEASE` |
+  | `PENDING_WORKER_DRAIN_TIMEOUT` | 10s | > 0 |
+  | `PENDING_ORPHAN_GRACE` | 30s | 0..24h |
+- **Observabilidade.**
+  - Logs: `transactionId`, `walletId`, `providerId`, `kind`, `previousStatus`, `status`,
+    `attempts`, `failureCode`, `nextAttemptAt` e `outcome`. Resolução e expiração saem em
+    INFO; reagendamento e skip em DEBUG; falhas em WARN.
+  - Métricas: `wager_transactions_total{source="worker"}` (resolução, expiração e órfão
+    que passou a aguardar) e `processing_duration_seconds{source="worker",
+    operation="pending_reference", outcome}`. Os retries transitórios são contados pelo
+    TxManager (`retries_total{operation="pending_reference"}`).
+- **Limitações.**
+  - Um item que falha sempre (ex.: dado corrompido que não reidrata) volta a cada lease,
+    sem limite, com log WARN e métrica `outcome="error"`. Não há poison counter nem
+    transição para `FAILED`.
+  - Pendências não são "acordadas" quando a referência chega: a resolução espera o próximo
+    `next_attempt_at`, que é no máximo `RETRY_MAX_DELAY` depois. O índice
+    `wager_transactions_reference_external_idx` permite acrescentar isso depois.
+- **Testes.**
+  - Unitários (`go test -race`, UnitOfWork em memória que espelha claim, fencing e
+    Update):
+    - política (backoff, teto, overflow, validação);
+    - item não vencido não é reivindicado;
+    - reagendamento 4s/8s sem efeitos e com o lease solto;
+    - resolução com ledger, eventos e metadados;
+    - expiração por tentativas e por TTL, com o backoff limitado ao fim do TTL;
+    - última tentativa ainda resolve;
+    - `REFERENCE_NOT_PROCESSED`;
+    - fencing (dono antigo não grava);
+    - órfãos (BET concluída; REFUND sem referência → `PENDING_REFERENCE` + evento).
+  - Unitários do worker (fake `Resumer`, `goleak.VerifyTestMain`): lotes com token
+    próprio, limite de concorrência, erros de item, retry do claim, início barrado perto
+    do fim do lease, drenagem, prazo de drenagem com cancelamento, `fx.ValidateApp` e
+    ciclo Fx.
+  - Integração do repositório: `ClaimDue` (ordem, carência, leases vigentes, claimer
+    concorrente sem espera com `lock_timeout`, fencing, reassunção após expiração,
+    `Update` solta o lease), 8 claimers × 60 linhas sem duplicidade, e `CHECK`s da
+    `0007`. A migration é testada em up/down/up (`Down(4)`).
+  - Integração do worker (`pendingworker`, PostgreSQL real, pool próprio por instância,
+    goleak ao fim):
+    - **resolução após a chegada da referência**, com reagendamentos antes, um único
+      lançamento e eventos, reconciliação, e replay devolvendo o estado final com o saldo
+      da resolução;
+    - **expiração** por tentativas e por TTL (`REFERENCE_NOT_FOUND`, um evento, sem
+      ledger; a referência que chega depois não reabre);
+    - **sobrevivência a restart**: worker parado e pool fechado preservam `attempts`; um
+      item reivindicado por uma instância que "morreu" só é retomado depois do lease; um
+      `PENDING` órfão é concluído pela nova instância;
+    - **múltiplas instâncias**: 4 instâncias × (40 rollbacks + 5 órfãos), com as
+      referências chegando em paralelo por instâncias diferentes. Cada pendência tem
+      exatamente um lançamento e um `WagerTransactionProcessed`, nenhum `event_id`
+      repetido, nenhum lease sobrando, e saldo = ledger.
+- **Para a T23:**
+  - Compor `pendingworker.Module` junto de `config.Module`, `postgres.Module` e
+    `app.Module`.
+  - Prover `app.WithReferenceRetryDelay(cfg.Workers.PendingReferenceRetryBaseDelay)` ao
+    `ProcessWagerTransaction`. Hoje `app.Module` usa o padrão de 2s, igual ao default da
+    config.
+  - O `fx.StopTimeout` precisa cobrir também `PENDING_WORKER_DRAIN_TIMEOUT`.

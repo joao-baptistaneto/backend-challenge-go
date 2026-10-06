@@ -1,8 +1,11 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,10 +27,15 @@ import (
 //     ainda não é terminal (WHERE status IN ('PENDING','PENDING_REFERENCE')).
 //     Transação já terminal devolve ErrTransactionFinalized; o trigger
 //     wager_transactions_guard_update é a barreira final. Quem atualiza deve
-//     ter lido a linha sob lock (GetByIDForUpdate, ClaimDuePendingReferences
-//     ou o lock da carteira, que serializa as operações da mesma carteira).
-//   - ClaimDuePendingReferences usa FOR UPDATE SKIP LOCKED: várias instâncias
-//     do worker (T21) pegam lotes disjuntos sem esperar umas pelas outras.
+//     ter lido a linha sob lock (GetByIDForUpdate, GetClaimedForUpdate ou o
+//     lock da carteira, que serializa as operações da mesma carteira). Update
+//     também solta o lease do worker (claimed_by/claimed_until = NULL).
+//   - ClaimDue (T21, ADR-023) grava um lease na linha (claimed_by =
+//     token, claimed_until = now + lease) num único comando, escolhendo as
+//     linhas com FOR NO KEY UPDATE SKIP LOCKED: várias instâncias pegam lotes
+//     disjuntos sem esperar umas pelas outras, e um worker que morre não perde
+//     a linha (o lease expira). GetClaimedForUpdate é o fencing: só devolve a
+//     linha se ela ainda estiver reivindicada pelo mesmo token.
 type WagerTransactionRepository struct{}
 
 // NewWagerTransactionRepository cria o repositório (stateless).
@@ -35,8 +43,14 @@ func NewWagerTransactionRepository() *WagerTransactionRepository {
 	return &WagerTransactionRepository{}
 }
 
-// MaxClaimBatch é o maior lote aceito por ClaimDuePendingReferences.
+// MaxClaimBatch é o maior lote aceito por ClaimDue.
 const MaxClaimBatch = 1000
+
+// MaxClaimLease é o maior lease aceito por ClaimDue.
+const MaxClaimLease = 24 * time.Hour
+
+// ErrInvalidClaim indica parâmetros de ClaimDue inválidos.
+var ErrInvalidClaim = errors.New("postgres: parâmetros de reivindicação inválidos")
 
 const wagerColumns = `id, origin, kind, status, wallet_id, player_id, amount, currency,
 provider_id, external_transaction_id, idempotency_key, request_hash, round_id, game_id,
@@ -82,7 +96,8 @@ func (WagerTransactionRepository) Update(ctx context.Context, q Querier, tx *dom
 	}
 	tag, err := q.Exec(ctx, `UPDATE wager_transactions
 SET status = $2, reference_transaction_id = $3, failure_code = $4, balance_after = $5,
-    attempts = $6, next_attempt_at = $7, updated_at = $8, completed_at = $9
+    attempts = $6, next_attempt_at = $7, updated_at = $8, completed_at = $9,
+    claimed_by = NULL, claimed_until = NULL
 WHERE id = $1 AND status IN ('PENDING', 'PENDING_REFERENCE')`,
 		tx.ID(), tx.Status().String(), nullUUID(tx.ReferenceTransactionID()), nullText(tx.FailureCode().String()),
 		balanceAfter, tx.Attempts(), nullTime(tx.NextAttemptAt()), tx.UpdatedAt(), nullTime(tx.CompletedAt()))
@@ -139,24 +154,154 @@ WHERE provider_id = $1 AND reference_external_transaction_id = $2
 ORDER BY created_at, id`, providerID, referenceExternalTransactionID)
 }
 
-// ClaimDuePendingReferences trava e devolve até limit transações em
-// PENDING_REFERENCE com next_attempt_at <= now, as mais atrasadas primeiro.
-// Linhas já travadas por outra instância são puladas (SKIP LOCKED). Exige
-// pgx.Tx: o lock vale até o commit, e o worker deve reprocessar e gravar
-// (Update) na mesma transação.
-func (WagerTransactionRepository) ClaimDuePendingReferences(ctx context.Context, q Querier, now time.Time, limit int) ([]*domain.WagerTransaction, error) {
-	const op = "postgres: reivindicar referências pendentes"
+// ClaimParams são os parâmetros de ClaimDue.
+type ClaimParams struct {
+	// Now é o instante de referência (relógio da aplicação, o mesmo que
+	// grava next_attempt_at): vencimento e fim do lease contam a partir dele.
+	Now time.Time
+	// Token identifica o lote reivindicado (fencing). Não pode ser nulo.
+	Token uuid.UUID
+	// Lease é a duração da reivindicação (1ms..MaxClaimLease).
+	Lease time.Duration
+	// Limit é o tamanho máximo do lote (1..MaxClaimBatch).
+	Limit int
+	// OrphanGrace é a idade mínima de um PENDING sem next_attempt_at para ser
+	// tratado como órfão (>= 0).
+	OrphanGrace time.Duration
+}
+
+// ClaimedWager é uma linha reivindicada por ClaimDue.
+type ClaimedWager struct {
+	ID     uuid.UUID
+	Status domain.WagerStatus
+	// DueAt é o instante em que a linha venceu (ordem de processamento).
+	DueAt time.Time
+}
+
+// ClaimDue reivindica até Limit transações vencidas e sem lease vigente,
+// gravando claimed_by = Token e claimed_until = Now + Lease. São elegíveis,
+// nesta ordem:
+//   - PENDING_REFERENCE com next_attempt_at <= Now (as mais atrasadas
+//     primeiro);
+//   - PENDING órfão: COALESCE(next_attempt_at, created_at + OrphanGrace) <=
+//     Now (as mais antigas primeiro). O fluxo síncrono não confirma PENDING
+//     (ADR-017); uma linha PENDING confirmada é resto de um aceite
+//     interrompido e precisa de retomada.
+//
+// Cada grupo é um UPDATE ... FROM (SELECT ... LIMIT ... FOR NO KEY UPDATE SKIP
+// LOCKED): só as linhas efetivamente reivindicadas ficam travadas, instâncias
+// concorrentes pegam conjuntos disjuntos sem esperar, e o modo NO KEY não
+// conflita com o KEY SHARE da FK reference_transaction_id (uma operação nova
+// que cita a linha não espera pelo claim). Aceita qualquer Querier: com o
+// pool cada comando é autocommit; numa transação, o lease vale a partir do
+// commit dela. Devolve só id, estado e vencimento (nada é reidratado aqui: uma
+// linha corrompida falha sozinha no processamento, sem derrubar o lote), na
+// ordem acima.
+func (WagerTransactionRepository) ClaimDue(ctx context.Context, q Querier, p ClaimParams) ([]ClaimedWager, error) {
+	const op = "postgres: reivindicar transações pendentes"
+	switch {
+	case p.Now.IsZero():
+		return nil, fmt.Errorf("%s: %w: instante zero", op, ErrInvalidClaim)
+	case p.Token == uuid.Nil:
+		return nil, fmt.Errorf("%s: %w: token nulo", op, ErrInvalidClaim)
+	case p.Lease < time.Millisecond || p.Lease > MaxClaimLease:
+		return nil, fmt.Errorf("%s: %w: lease %v (1ms..%v)", op, ErrInvalidClaim, p.Lease, MaxClaimLease)
+	case p.Limit < 1 || p.Limit > MaxClaimBatch:
+		return nil, fmt.Errorf("%s: %w: lote %d (1..%d)", op, ErrInvalidClaim, p.Limit, MaxClaimBatch)
+	case p.OrphanGrace < 0:
+		return nil, fmt.Errorf("%s: %w: carência negativa %v", op, ErrInvalidClaim, p.OrphanGrace)
+	}
+	refs, err := claimGroup(ctx, q, `WITH due AS (
+    SELECT id, next_attempt_at AS due_at FROM wager_transactions
+    WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= $1
+      AND (claimed_until IS NULL OR claimed_until <= $1)
+    ORDER BY next_attempt_at, id
+    LIMIT $3
+    FOR NO KEY UPDATE SKIP LOCKED
+)
+UPDATE wager_transactions w
+SET claimed_by = $2, claimed_until = $1 + $4 * interval '1 microsecond'
+FROM due
+WHERE w.id = due.id
+RETURNING w.id, w.status, due.due_at`, p.Now, p.Token, p.Limit, p.Lease.Microseconds())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	if len(refs) == p.Limit {
+		return refs, nil
+	}
+	orphans, err := claimGroup(ctx, q, `WITH due AS (
+    SELECT id, COALESCE(next_attempt_at, created_at + $5 * interval '1 microsecond') AS due_at
+    FROM wager_transactions
+    WHERE status = 'PENDING'
+      AND COALESCE(next_attempt_at, created_at + $5 * interval '1 microsecond') <= $1
+      AND (claimed_until IS NULL OR claimed_until <= $1)
+    ORDER BY created_at, id
+    LIMIT $3
+    FOR NO KEY UPDATE SKIP LOCKED
+)
+UPDATE wager_transactions w
+SET claimed_by = $2, claimed_until = $1 + $4 * interval '1 microsecond'
+FROM due
+WHERE w.id = due.id
+RETURNING w.id, w.status, due.due_at`, p.Now, p.Token, p.Limit-len(refs), p.Lease.Microseconds(), p.OrphanGrace.Microseconds())
+	if err != nil {
+		// O primeiro grupo pode já estar confirmado (autocommit): o lease dele
+		// expira sozinho.
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	return append(refs, orphans...), nil
+}
+
+// claimGroup executa um UPDATE ... RETURNING id, status, due_at e ordena o
+// resultado (RETURNING não garante ordem).
+func claimGroup(ctx context.Context, q Querier, sql string, args ...any) ([]ClaimedWager, error) {
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, Translate(err)
+	}
+	defer rows.Close()
+	var out []ClaimedWager
+	for rows.Next() {
+		var (
+			c      ClaimedWager
+			status string
+		)
+		if err := rows.Scan(&c.ID, &status, &c.DueAt); err != nil {
+			return nil, Translate(err)
+		}
+		c.Status = domain.WagerStatus(status)
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, Translate(err)
+	}
+	slices.SortFunc(out, func(a, b ClaimedWager) int {
+		if c := a.DueAt.Compare(b.DueAt); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.ID[:], b.ID[:])
+	})
+	return out, nil
+}
+
+// GetClaimedForUpdate lê e trava (FOR NO KEY UPDATE) a transação só se ela
+// ainda estiver reivindicada por token (fencing do lease, ADR-023). Outra
+// instância que reassumiu a linha depois de um lease expirado tem outro token:
+// o chamador recebe ErrNotFound e desiste sem efeito. A linha pode estar com o
+// lease vencido e ainda ser devolvida, desde que ninguém a tenha reassumido:
+// o lock garante a exclusão daqui até o commit. Exige pgx.Tx.
+func (WagerTransactionRepository) GetClaimedForUpdate(ctx context.Context, q Querier, id, token uuid.UUID) (*domain.WagerTransaction, error) {
+	const op = "postgres: travar transação reivindicada"
 	if err := requireTx(op, q); err != nil {
 		return nil, err
 	}
-	if limit < 1 || limit > MaxClaimBatch {
-		return nil, fmt.Errorf("%s: %w: %d (1..%d)", op, ErrInvalidPageLimit, limit, MaxClaimBatch)
+	if token == uuid.Nil {
+		return nil, fmt.Errorf("%s: %w: token nulo", op, ErrInvalidClaim)
 	}
-	return listWagers(ctx, q, op, `SELECT `+wagerColumns+` FROM wager_transactions
-WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= $1
-ORDER BY next_attempt_at, id
-LIMIT $2
-FOR UPDATE SKIP LOCKED`, now, limit)
+	return getWager(ctx, q, op, `SELECT `+wagerColumns+` FROM wager_transactions
+WHERE id = $1 AND claimed_by = $2
+FOR NO KEY UPDATE`, id, token)
 }
 
 // balanceAfterColumn devolve balance_after (NULL quando ausente). Presente,

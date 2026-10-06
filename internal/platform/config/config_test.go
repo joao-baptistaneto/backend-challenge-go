@@ -29,46 +29,55 @@ const (
 // detectáveis nos testes de vazamento).
 func validEnv() map[string]string {
 	return map[string]string{
-		EnvAppEnv:                      "local",
-		EnvHTTPAddr:                    ":8080",
-		EnvLogLevel:                    "info",
-		EnvShutdownTimeout:             "15s",
-		EnvHTTPReadHeaderTimeout:       "5s",
-		EnvHTTPReadTimeout:             "30s",
-		EnvHTTPWriteTimeout:            "30s",
-		EnvHTTPIdleTimeout:             "120s",
-		EnvHTTPDrainDelay:              "0s",
-		EnvDatabaseURL:                 validDBURL,
-		EnvDatabaseMaxConns:            "20",
-		EnvDatabaseConnectTimeout:      "30s",
-		EnvAWSRegion:                   "us-east-1",
-		EnvAWSAccessKeyID:              "test",
-		EnvAWSSecretAccessKey:          awsSecret,
-		EnvAWSEndpointURL:              "http://localhost:4566",
-		EnvSQSInboundQueueURL:          inboundURL,
-		EnvSQSInboundDLQURL:            dlqURL,
-		EnvSQSEventsQueueURL:           eventsURL,
-		EnvSQSConsumerName:             "wager-transactions-consumer",
-		EnvSQSConsumerConcurrency:      "4",
-		EnvSQSWaitTime:                 "20s",
-		EnvSQSVisibilityTimeout:        "30s",
-		EnvSQSProcessTimeout:           "15s",
-		EnvSQSRetryBaseDelay:           "1s",
-		EnvSQSRetryMaxDelay:            "5m",
-		EnvSQSDrainTimeout:             "10s",
-		EnvSQSMaxAttempts:              "3",
-		EnvOIDCIssuerURL:               issuerURL,
-		EnvOIDCAudience:                oidcAudienc,
-		EnvOIDCJWKSURL:                 jwksURL,
-		EnvOIDCProviderClaim:           "provider_id",
-		EnvOIDCProviderRole:            "wager-provider",
-		EnvOIDCInternalRole:            "wallet-internal",
-		EnvOIDCClockSkew:               "30s",
-		EnvOutboxPollInterval:          "1s",
-		EnvOutboxBatchSize:             "50",
-		EnvOutboxLease:                 "30s",
-		EnvPendingReferenceMaxAttempts: "10",
-		EnvPendingReferenceTTL:         "10m",
+		EnvAppEnv:                         "local",
+		EnvHTTPAddr:                       ":8080",
+		EnvLogLevel:                       "info",
+		EnvShutdownTimeout:                "15s",
+		EnvHTTPReadHeaderTimeout:          "5s",
+		EnvHTTPReadTimeout:                "30s",
+		EnvHTTPWriteTimeout:               "30s",
+		EnvHTTPIdleTimeout:                "120s",
+		EnvHTTPDrainDelay:                 "0s",
+		EnvDatabaseURL:                    validDBURL,
+		EnvDatabaseMaxConns:               "20",
+		EnvDatabaseConnectTimeout:         "30s",
+		EnvAWSRegion:                      "us-east-1",
+		EnvAWSAccessKeyID:                 "test",
+		EnvAWSSecretAccessKey:             awsSecret,
+		EnvAWSEndpointURL:                 "http://localhost:4566",
+		EnvSQSInboundQueueURL:             inboundURL,
+		EnvSQSInboundDLQURL:               dlqURL,
+		EnvSQSEventsQueueURL:              eventsURL,
+		EnvSQSConsumerName:                "wager-transactions-consumer",
+		EnvSQSConsumerConcurrency:         "4",
+		EnvSQSWaitTime:                    "20s",
+		EnvSQSVisibilityTimeout:           "30s",
+		EnvSQSProcessTimeout:              "15s",
+		EnvSQSRetryBaseDelay:              "1s",
+		EnvSQSRetryMaxDelay:               "5m",
+		EnvSQSDrainTimeout:                "10s",
+		EnvSQSMaxAttempts:                 "3",
+		EnvOIDCIssuerURL:                  issuerURL,
+		EnvOIDCAudience:                   oidcAudienc,
+		EnvOIDCJWKSURL:                    jwksURL,
+		EnvOIDCProviderClaim:              "provider_id",
+		EnvOIDCProviderRole:               "wager-provider",
+		EnvOIDCInternalRole:               "wallet-internal",
+		EnvOIDCClockSkew:                  "30s",
+		EnvOutboxPollInterval:             "1s",
+		EnvOutboxBatchSize:                "50",
+		EnvOutboxLease:                    "30s",
+		EnvPendingReferenceMaxAttempts:    "10",
+		EnvPendingReferenceTTL:            "10m",
+		EnvPendingReferenceRetryBaseDelay: "2s",
+		EnvPendingReferenceRetryMaxDelay:  "1m",
+		EnvPendingWorkerPollInterval:      "1s",
+		EnvPendingWorkerBatchSize:         "20",
+		EnvPendingWorkerConcurrency:       "4",
+		EnvPendingWorkerLease:             "30s",
+		EnvPendingWorkerProcessTimeout:    "5s",
+		EnvPendingWorkerDrainTimeout:      "10s",
+		EnvPendingOrphanGrace:             "30s",
 	}
 }
 
@@ -109,6 +118,8 @@ func TestLoadValidEnvExample(t *testing.T) {
 		Workers: WorkersConfig{
 			OutboxPollInterval: time.Second, OutboxBatchSize: 50, OutboxLease: 30 * time.Second,
 			PendingReferenceMaxAttempts: 10, PendingReferenceTTL: 10 * time.Minute,
+			PendingReferenceRetryBaseDelay: 2 * time.Second, PendingReferenceRetryMaxDelay: time.Minute,
+			PendingWorker: defaultPendingWorker(),
 		},
 	}
 	if c != want {
@@ -133,7 +144,9 @@ func TestLoadDefaults(t *testing.T) {
 		EnvHTTPReadHeaderTimeout, EnvHTTPReadTimeout, EnvHTTPWriteTimeout, EnvHTTPIdleTimeout,
 		EnvHTTPDrainDelay, EnvSQSConsumerName, EnvSQSConsumerConcurrency, EnvSQSWaitTime,
 		EnvSQSVisibilityTimeout, EnvSQSProcessTimeout, EnvSQSRetryBaseDelay, EnvSQSRetryMaxDelay,
-		EnvSQSDrainTimeout, EnvSQSMaxAttempts,
+		EnvSQSDrainTimeout, EnvSQSMaxAttempts, EnvPendingReferenceRetryBaseDelay, EnvPendingReferenceRetryMaxDelay,
+		EnvPendingWorkerPollInterval, EnvPendingWorkerBatchSize, EnvPendingWorkerConcurrency, EnvPendingWorkerLease,
+		EnvPendingWorkerProcessTimeout, EnvPendingWorkerDrainTimeout, EnvPendingOrphanGrace,
 	} {
 		delete(env, k)
 	}
@@ -146,7 +159,10 @@ func TestLoadDefaults(t *testing.T) {
 		c.App.ShutdownTimeout != 15*time.Second || c.Database.MaxConns != 20 ||
 		c.Database.ConnectTimeout != 30*time.Second || c.Workers.OutboxPollInterval != time.Second ||
 		c.Workers.OutboxBatchSize != 50 || c.Workers.OutboxLease != 30*time.Second ||
-		c.Workers.PendingReferenceMaxAttempts != 10 || c.Workers.PendingReferenceTTL != 10*time.Minute {
+		c.Workers.PendingReferenceMaxAttempts != 10 || c.Workers.PendingReferenceTTL != 10*time.Minute ||
+		c.Workers.PendingReferenceRetryBaseDelay != DefaultPendingReferenceRetryBaseDelay ||
+		c.Workers.PendingReferenceRetryMaxDelay != DefaultPendingReferenceRetryMaxDelay ||
+		c.Workers.PendingWorker != defaultPendingWorker() {
 		t.Fatalf("defaults inesperados: %#v", c)
 	}
 	if c.AWS.HasStaticCredentials() || c.AWS.EndpointURL != "" || c.SQS.InboundDLQURL != "" {
@@ -322,6 +338,19 @@ func TestLoadInvalid(t *testing.T) {
 		{"lease <= poll", func(e map[string]string) { e[EnvOutboxLease] = "1s" }, EnvOutboxLease},
 		{"max attempts", func(e map[string]string) { e[EnvPendingReferenceMaxAttempts] = "-1" }, EnvPendingReferenceMaxAttempts},
 		{"ttl", func(e map[string]string) { e[EnvPendingReferenceTTL] = "1d" }, EnvPendingReferenceTTL},
+		{"pending base zero", func(e map[string]string) { e[EnvPendingReferenceRetryBaseDelay] = "0s" }, EnvPendingReferenceRetryBaseDelay},
+		{"pending max < base", func(e map[string]string) { e[EnvPendingReferenceRetryMaxDelay] = "1s" }, EnvPendingReferenceRetryMaxDelay},
+		{"pending max alto", func(e map[string]string) { e[EnvPendingReferenceRetryMaxDelay] = "48h" }, EnvPendingReferenceRetryMaxDelay},
+		{"pending poll zero", func(e map[string]string) { e[EnvPendingWorkerPollInterval] = "0s" }, EnvPendingWorkerPollInterval},
+		{"pending batch zero", func(e map[string]string) { e[EnvPendingWorkerBatchSize] = "0" }, EnvPendingWorkerBatchSize},
+		{"pending batch alto", func(e map[string]string) { e[EnvPendingWorkerBatchSize] = "1001" }, EnvPendingWorkerBatchSize},
+		{"pending concurrency zero", func(e map[string]string) { e[EnvPendingWorkerConcurrency] = "0" }, EnvPendingWorkerConcurrency},
+		{"pending concurrency alta", func(e map[string]string) { e[EnvPendingWorkerConcurrency] = "101" }, EnvPendingWorkerConcurrency},
+		{"pending lease curto", func(e map[string]string) { e[EnvPendingWorkerLease] = "500ms" }, EnvPendingWorkerLease},
+		{"pending process >= lease", func(e map[string]string) { e[EnvPendingWorkerProcessTimeout] = "30s" }, EnvPendingWorkerProcessTimeout},
+		{"pending process inválido", func(e map[string]string) { e[EnvPendingWorkerProcessTimeout] = "x" }, EnvPendingWorkerProcessTimeout},
+		{"pending drain zero", func(e map[string]string) { e[EnvPendingWorkerDrainTimeout] = "0s" }, EnvPendingWorkerDrainTimeout},
+		{"pending grace negativa", func(e map[string]string) { e[EnvPendingOrphanGrace] = "-1s" }, EnvPendingOrphanGrace},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -541,5 +570,14 @@ func TestLoadOIDCOptionals(t *testing.T) {
 	}
 	if c.OIDC.RolesClient != "wallet-roles" || c.OIDC.ClockSkew != 0 {
 		t.Fatalf("OIDC inesperado: %#v", c.OIDC)
+	}
+}
+
+func defaultPendingWorker() PendingWorkerConfig {
+	return PendingWorkerConfig{
+		PollInterval: DefaultPendingWorkerPollInterval, BatchSize: DefaultPendingWorkerBatchSize,
+		Concurrency: DefaultPendingWorkerConcurrency, Lease: DefaultPendingWorkerLease,
+		ProcessTimeout: DefaultPendingWorkerProcessTimeout, DrainTimeout: DefaultPendingWorkerDrainTimeout,
+		OrphanGrace: DefaultPendingOrphanGrace,
 	}
 }

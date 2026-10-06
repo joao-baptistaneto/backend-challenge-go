@@ -208,6 +208,9 @@ func TestStores_LockingMethodsRequireTx(t *testing.T) {
 }
 
 func TestOperationLabelsMatchMetrics_T16(t *testing.T) {
+	if app.OperationPendingReference != metrics.OperationPendingReference {
+		t.Fatalf("pending label: %q vs %q", app.OperationPendingReference, metrics.OperationPendingReference)
+	}
 	if app.OperationReconcile != metrics.OperationReconcile || app.OperationQuery != metrics.OperationQuery {
 		t.Fatalf("labels: %q/%q vs %q/%q", app.OperationReconcile, app.OperationQuery,
 			metrics.OperationReconcile, metrics.OperationQuery)
