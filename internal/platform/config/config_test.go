@@ -22,6 +22,7 @@ const (
 	eventsURL   = "http://localhost:4566/000000000000/wallet-events.fifo"
 	issuerURL   = "http://localhost:8081/realms/junglegaming"
 	oidcAudienc = "wallet-api"
+	jwksURL     = "http://localhost:8081/realms/junglegaming/protocol/openid-connect/certs"
 )
 
 // validEnv espelha .env.example (com senhas trocadas por marcadores
@@ -44,6 +45,11 @@ func validEnv() map[string]string {
 		EnvSQSEventsQueueURL:           eventsURL,
 		EnvOIDCIssuerURL:               issuerURL,
 		EnvOIDCAudience:                oidcAudienc,
+		EnvOIDCJWKSURL:                 jwksURL,
+		EnvOIDCProviderClaim:           "provider_id",
+		EnvOIDCProviderRole:            "wager-provider",
+		EnvOIDCInternalRole:            "wallet-internal",
+		EnvOIDCClockSkew:               "30s",
 		EnvOutboxPollInterval:          "1s",
 		EnvOutboxBatchSize:             "50",
 		EnvOutboxLease:                 "30s",
@@ -73,8 +79,12 @@ func TestLoadValidEnvExample(t *testing.T) {
 			Region: "us-east-1", AccessKeyID: "test", SecretAccessKey: Secret(awsSecret),
 			EndpointURL: "http://localhost:4566",
 		},
-		SQS:  SQSConfig{InboundQueueURL: inboundURL, InboundDLQURL: dlqURL, EventsQueueURL: eventsURL},
-		OIDC: OIDCConfig{IssuerURL: issuerURL, Audience: oidcAudienc},
+		SQS: SQSConfig{InboundQueueURL: inboundURL, InboundDLQURL: dlqURL, EventsQueueURL: eventsURL},
+		OIDC: OIDCConfig{
+			IssuerURL: issuerURL, Audience: oidcAudienc, JWKSURL: jwksURL,
+			ProviderClaim: "provider_id", ProviderRole: "wager-provider", InternalRole: "wallet-internal",
+			RolesClient: oidcAudienc, ClockSkew: 30 * time.Second,
+		},
 		Workers: WorkersConfig{
 			OutboxPollInterval: time.Second, OutboxBatchSize: 50, OutboxLease: 30 * time.Second,
 			PendingReferenceMaxAttempts: 10, PendingReferenceTTL: 10 * time.Minute,
@@ -97,7 +107,8 @@ func TestLoadDefaults(t *testing.T) {
 		EnvAppEnv, EnvHTTPAddr, EnvLogLevel, EnvShutdownTimeout, EnvDatabaseMaxConns,
 		EnvDatabaseConnectTimeout, EnvAWSAccessKeyID, EnvAWSSecretAccessKey, EnvAWSEndpointURL,
 		EnvSQSInboundDLQURL, EnvOutboxPollInterval, EnvOutboxBatchSize, EnvOutboxLease,
-		EnvPendingReferenceMaxAttempts, EnvPendingReferenceTTL,
+		EnvPendingReferenceMaxAttempts, EnvPendingReferenceTTL, EnvOIDCJWKSURL, EnvOIDCProviderClaim,
+		EnvOIDCProviderRole, EnvOIDCInternalRole, EnvOIDCRolesClient, EnvOIDCClockSkew,
 	} {
 		delete(env, k)
 	}
@@ -115,6 +126,14 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.AWS.HasStaticCredentials() || c.AWS.EndpointURL != "" || c.SQS.InboundDLQURL != "" {
 		t.Fatalf("opcionais deveriam estar vazios: %#v", c)
+	}
+	wantOIDC := OIDCConfig{
+		IssuerURL: issuerURL, Audience: oidcAudienc, ProviderClaim: DefaultOIDCProviderClaim,
+		ProviderRole: DefaultOIDCProviderRole, InternalRole: DefaultOIDCInternalRole,
+		RolesClient: oidcAudienc, ClockSkew: DefaultOIDCClockSkew,
+	}
+	if c.OIDC != wantOIDC {
+		t.Fatalf("defaults OIDC inesperados: %#v", c.OIDC)
 	}
 }
 
@@ -180,6 +199,19 @@ func TestLoadInvalid(t *testing.T) {
 			e[EnvOIDCIssuerURL] = "http://admin:pw@localhost:8081/realms/x"
 		}, EnvOIDCIssuerURL},
 		{"audience vazia", func(e map[string]string) { e[EnvOIDCAudience] = "" }, EnvOIDCAudience},
+		{"jwks url esquema", func(e map[string]string) { e[EnvOIDCJWKSURL] = "file:///certs" }, EnvOIDCJWKSURL},
+		{"jwks url com credenciais", func(e map[string]string) {
+			e[EnvOIDCJWKSURL] = "http://u:p@localhost:8081/certs"
+		}, EnvOIDCJWKSURL},
+		{"provider claim inválida", func(e map[string]string) { e[EnvOIDCProviderClaim] = "provider id" }, EnvOIDCProviderClaim},
+		{"provider claim reservada", func(e map[string]string) { e[EnvOIDCProviderClaim] = "aud" }, EnvOIDCProviderClaim},
+		{"provider claim longa", func(e map[string]string) { e[EnvOIDCProviderClaim] = strings.Repeat("a", 129) }, EnvOIDCProviderClaim},
+		{"provider role inválido", func(e map[string]string) { e[EnvOIDCProviderRole] = "role/x" }, EnvOIDCProviderRole},
+		{"internal role inválido", func(e map[string]string) { e[EnvOIDCInternalRole] = "a b" }, EnvOIDCInternalRole},
+		{"roles iguais", func(e map[string]string) { e[EnvOIDCInternalRole] = "wager-provider" }, EnvOIDCInternalRole},
+		{"clock skew negativo", func(e map[string]string) { e[EnvOIDCClockSkew] = "-1s" }, EnvOIDCClockSkew},
+		{"clock skew alto", func(e map[string]string) { e[EnvOIDCClockSkew] = "10m" }, EnvOIDCClockSkew},
+		{"clock skew inválido", func(e map[string]string) { e[EnvOIDCClockSkew] = "30" }, EnvOIDCClockSkew},
 		{"poll interval", func(e map[string]string) { e[EnvOutboxPollInterval] = "0" }, EnvOutboxPollInterval},
 		{"batch zero", func(e map[string]string) { e[EnvOutboxBatchSize] = "0" }, EnvOutboxBatchSize},
 		{"batch alto", func(e map[string]string) { e[EnvOutboxBatchSize] = "5000" }, EnvOutboxBatchSize},
@@ -393,4 +425,17 @@ func TestModuleFailsOnInvalidConfig(t *testing.T) {
 		t.Fatalf("erro pouco claro: %v", err)
 	}
 	assertNoSecrets(t, err.Error())
+}
+
+func TestLoadOIDCOptionals(t *testing.T) {
+	env := validEnv()
+	env[EnvOIDCRolesClient] = "wallet-roles"
+	env[EnvOIDCClockSkew] = "0s"
+	c, err := Load(lookupFrom(env))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.OIDC.RolesClient != "wallet-roles" || c.OIDC.ClockSkew != 0 {
+		t.Fatalf("OIDC inesperado: %#v", c.OIDC)
+	}
 }

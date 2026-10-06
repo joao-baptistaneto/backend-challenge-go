@@ -50,8 +50,14 @@ const (
 	EnvSQSInboundDLQURL   = "SQS_INBOUND_DLQ_URL"
 	EnvSQSEventsQueueURL  = "SQS_EVENTS_QUEUE_URL"
 
-	EnvOIDCIssuerURL = "OIDC_ISSUER_URL"
-	EnvOIDCAudience  = "OIDC_AUDIENCE"
+	EnvOIDCIssuerURL     = "OIDC_ISSUER_URL"
+	EnvOIDCAudience      = "OIDC_AUDIENCE"
+	EnvOIDCJWKSURL       = "OIDC_JWKS_URL"
+	EnvOIDCProviderClaim = "OIDC_PROVIDER_CLAIM"
+	EnvOIDCProviderRole  = "OIDC_PROVIDER_ROLE"
+	EnvOIDCInternalRole  = "OIDC_INTERNAL_ROLE"
+	EnvOIDCRolesClient   = "OIDC_ROLES_CLIENT"
+	EnvOIDCClockSkew     = "OIDC_CLOCK_SKEW"
 
 	EnvOutboxPollInterval          = "OUTBOX_POLL_INTERVAL"
 	EnvOutboxBatchSize             = "OUTBOX_BATCH_SIZE"
@@ -74,6 +80,19 @@ const (
 const (
 	maxDatabaseConns   = 1000
 	maxOutboxBatchSize = 1000
+	// maxOIDCClockSkew limita a tolerância de relógio na validação de
+	// exp/nbf/iat: uma tolerância grande estende a vida útil de tokens
+	// expirados.
+	maxOIDCClockSkew = 2 * time.Minute
+)
+
+// Defaults de autorização (ARCHITECTURE.md, ADR-019). Os nomes são os
+// provisionados no realm do Keycloak (T24).
+const (
+	DefaultOIDCProviderClaim = "provider_id"
+	DefaultOIDCProviderRole  = "wager-provider"
+	DefaultOIDCInternalRole  = "wallet-internal"
+	DefaultOIDCClockSkew     = 30 * time.Second
 )
 
 // ErrInvalidConfig é envolvido por todo erro devolvido por Load, permitindo
@@ -136,10 +155,27 @@ type SQSConfig struct {
 	EventsQueueURL string
 }
 
-// OIDCConfig agrupa parâmetros do IdP (Keycloak).
+// OIDCConfig agrupa parâmetros do IdP (Keycloak) e do modelo de permissões
+// (ADR-019).
 type OIDCConfig struct {
+	// IssuerURL é comparado exatamente com a claim iss do token.
 	IssuerURL string
-	Audience  string
+	// Audience precisa constar da claim aud do token.
+	Audience string
+	// JWKSURL é opcional: vazio → descoberto em
+	// {IssuerURL}/.well-known/openid-configuration no primeiro uso.
+	JWKSURL string
+	// ProviderClaim é a claim (string) que carrega o providerId autorizado.
+	ProviderClaim string
+	// ProviderRole e InternalRole são os papéis (realm_access ou
+	// resource_access[RolesClient]) de provedor e de serviço interno.
+	ProviderRole string
+	InternalRole string
+	// RolesClient é o client cujos papéis em resource_access são
+	// considerados, além dos papéis de realm. Default: Audience.
+	RolesClient string
+	// ClockSkew é a tolerância de relógio para exp/nbf/iat.
+	ClockSkew time.Duration
 }
 
 // WorkersConfig agrupa parâmetros dos workers de outbox e de referências
@@ -196,6 +232,18 @@ func Load(lookup LookupFunc) (Config, error) {
 
 	c.OIDC.IssuerURL = p.httpURL(EnvOIDCIssuerURL, true)
 	c.OIDC.Audience = p.required(EnvOIDCAudience)
+	c.OIDC.JWKSURL = p.httpURL(EnvOIDCJWKSURL, false)
+	c.OIDC.ProviderClaim = p.claimName(EnvOIDCProviderClaim, DefaultOIDCProviderClaim)
+	c.OIDC.ProviderRole = p.roleName(EnvOIDCProviderRole, DefaultOIDCProviderRole)
+	c.OIDC.InternalRole = p.roleName(EnvOIDCInternalRole, DefaultOIDCInternalRole)
+	if c.OIDC.ProviderRole != "" && c.OIDC.ProviderRole == c.OIDC.InternalRole {
+		p.fail(EnvOIDCInternalRole, "deve ser diferente de "+EnvOIDCProviderRole)
+	}
+	c.OIDC.RolesClient = p.optional(EnvOIDCRolesClient)
+	if c.OIDC.RolesClient == "" {
+		c.OIDC.RolesClient = c.OIDC.Audience
+	}
+	c.OIDC.ClockSkew = p.durationRange(EnvOIDCClockSkew, DefaultOIDCClockSkew, 0, maxOIDCClockSkew)
 
 	c.Workers.OutboxPollInterval = p.positiveDuration(EnvOutboxPollInterval, time.Second)
 	c.Workers.OutboxBatchSize = p.intRange(EnvOutboxBatchSize, 50, 1, maxOutboxBatchSize)
@@ -305,6 +353,82 @@ func (p *parser) positiveDuration(key string, def time.Duration) time.Duration {
 	}
 	return d
 }
+
+// durationRange aceita durações em [minV, maxV] (zero permitido se minV = 0).
+func (p *parser) durationRange(key string, def, minV, maxV time.Duration) time.Duration {
+	v, ok := p.get(key)
+	if !ok {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		p.fail(key, fmt.Sprintf("duração %q inválida (ex.: 0s, 30s, 1m)", v))
+		return 0
+	}
+	if d < minV || d > maxV {
+		p.fail(key, fmt.Sprintf("deve estar entre %s e %s, recebido %q", minV, maxV, v))
+		return 0
+	}
+	return d
+}
+
+// reservedClaims não podem carregar o providerId: são claims registradas
+// (RFC 7519) ou de papéis, com semântica própria validada pelo verificador.
+var reservedClaims = map[string]bool{
+	"iss": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	"typ": true, "realm_access": true, "resource_access": true,
+}
+
+// claimName aceita um nome de claim simples (1–128 caracteres
+// [A-Za-z0-9_.:-]) fora das claims reservadas.
+func (p *parser) claimName(key, def string) string {
+	v, ok := p.get(key)
+	if !ok {
+		return def
+	}
+	if !IsSimpleName(v) {
+		p.fail(key, fmt.Sprintf("nome de claim %q inválido (1-128 caracteres [A-Za-z0-9_.:-])", v))
+		return ""
+	}
+	if reservedClaims[v] {
+		p.fail(key, fmt.Sprintf("a claim %q é reservada e não pode carregar o providerId", v))
+		return ""
+	}
+	return v
+}
+
+// roleName aceita um nome de papel (1–128 caracteres [A-Za-z0-9_.:-]).
+func (p *parser) roleName(key, def string) string {
+	v, ok := p.get(key)
+	if !ok {
+		return def
+	}
+	if !IsSimpleName(v) {
+		p.fail(key, fmt.Sprintf("nome de papel %q inválido (1-128 caracteres [A-Za-z0-9_.:-])", v))
+		return ""
+	}
+	return v
+}
+
+// IsSimpleName informa se v tem 1–128 caracteres [A-Za-z0-9_.:-]. É a
+// regra dos nomes de claim e de papel (também usada pelo adapter de auth).
+func IsSimpleName(v string) bool {
+	if v == "" || len(v) > 128 {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '_', r == '.', r == ':', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// IsReservedClaim informa se a claim não pode carregar o providerId.
+func IsReservedClaim(name string) bool { return reservedClaims[name] }
 
 func (p *parser) intRange(key string, def, minV, maxV int) int {
 	v, ok := p.get(key)

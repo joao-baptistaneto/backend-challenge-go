@@ -1195,3 +1195,132 @@ Pacotes `internal/app` (`reconcile.go`, `queries.go`, portas em `ports.go`, erro
     - consultas: paginação com commit concorrente, cursor de outra carteira, isolamento
       por provedor com o mesmo externalId, pendência e OPENING invisível;
     - composição Fx com a métrica.
+
+## ADR-019 — Autenticação OIDC (Keycloak) e autorização (T17)
+
+Pacotes `internal/adapters/auth` (validação, middleware, autorização, módulo Fx) e
+`internal/adapters/http/apierror` (corpo de erro padronizado, compartilhado com T18).
+Config em `internal/platform/config` (variáveis `OIDC_*`).
+
+- **IdP e fluxo.** Keycloak como IdP externo OAuth 2.0/OIDC; os serviços chamadores
+  (provedores e o serviço interno) obtêm tokens por `client_credentials` (cada um é um
+  client confidencial com service account). A aplicação só **valida** tokens: não emite
+  tokens nem guarda credenciais. Validação local por JWT assinado + JWKS (sem
+  introspecção por requisição): latência baixa e o IdP não vira dependência síncrona de
+  cada chamada. Custo aceito: revogação só vale quando o token expira (tokens de acesso
+  curtos no realm, T24).
+- **Bibliotecas.** `go-oidc` (`oidc.NewVerifier`) faz parse com allowlist de algoritmos,
+  assinatura primeiro e depois `iss` (igualdade exata) e `aud` (precisa conter
+  `OIDC_AUDIENCE`). O `KeySet` é próprio (`jwks.go`, sobre `go-jose/v4`, agora dependência
+  direta; `go-oidc` saiu de `tools.go`), porque o `RemoteKeySet` do go-oidc não distingue
+  "IdP fora do ar" de "assinatura inválida" (o verificador embrulha o erro com `%v`). O
+  resultado do KeySet volta ao Authenticator por um estado no `context` da chamada.
+- **Regras de validação** (tudo → 401, exceto IdP indisponível → 503):
+  - algoritmos permitidos fixos e só assimétricos (RS/PS/ES 256-512, EdDSA); `none` e
+    `HS*` são recusados no parse (proteção contra confusão de algoritmo); a chave do JWKS
+    precisa casar em `kid` e, se declarar, em `alg`;
+  - chaves do JWKS: só públicas, `use` vazio ou `sig`; chaves `oct`/privadas/`enc`/de tipo
+    desconhecido são descartadas individualmente (o JWKS do Keycloak traz uma chave
+    RSA-OAEP de cifragem);
+  - `exp` obrigatório; `exp`, `nbf` e `iat` com tolerância `OIDC_CLOCK_SKEW` (default
+    30s, máx. 2m). O verificador do go-oidc roda com `SkipExpiryCheck`, porque não tem
+    tolerância em `exp` e usa 5 min fixos em `nbf`;
+  - `typ`, se presente, precisa ser `Bearer` (o Keycloak marca `ID`/`Refresh` nos outros
+    tokens; um ID token com a mesma audiência não serve de credencial);
+  - claims com tipo errado (ex.: `nbf` string, `realm_access` string) e token > 16 KiB
+    são recusados;
+  - cabeçalho: exatamente um `Authorization: Bearer <token>`; outro esquema ou ausência
+    → 401 sem `error`; vários cabeçalhos, token vazio ou com espaços → `invalid_token`.
+- **JWKS e rotação.** Busca preguiçosa (o start não depende do Keycloak no ar). `kid`
+  desconhecido força nova busca (rotação), limitada a uma a cada 10s, para que tokens com
+  `kid` aleatório não virem ataque ao IdP; chaves com mais de 10 min são renovadas no
+  próximo uso (remove chaves revogadas), e, se a renovação falhar, as antigas continuam
+  valendo. Buscas são serializadas e reaproveitadas por geração (N requisições com cache
+  frio = 1 busca). Busca com timeout de 5s, desligada do cancelamento da requisição e
+  corpo limitado a 1 MiB. Sem chaves utilizáveis (IdP fora, discovery inválido) → **503
+  `TEMPORARILY_UNAVAILABLE` + `Retry-After: 5`**, não 401: o cliente não errou.
+- **`OIDC_JWKS_URL` opcional.** Vazio → discovery em
+  `{OIDC_ISSUER_URL}/.well-known/openid-configuration`, exigindo `issuer` igual ao
+  configurado. Informado → usado direto; serve ao Docker Compose, em que o app alcança o
+  Keycloak por `http://keycloak:8080` mas o `iss` dos tokens é o host público
+  (`KC_HOSTNAME`), situação que T24 precisa acertar.
+- **Principal.** `sub`, `azp` (client), `providerId` da claim `OIDC_PROVIDER_CLAIM`
+  (default `provider_id`, mapper "hardcoded claim" em cada client de provedor no realm)
+  e papéis = `realm_access.roles` ∪ `resource_access[OIDC_ROLES_CLIENT].roles` (default:
+  o client da audiência). Papéis de outros clients são ignorados. A claim do provedor é
+  desacoplada do `client_id` para que trocar credenciais não mude a identidade de
+  negócio. Se presente, ela precisa ser string válida como identificador (mesmos limites
+  com que o providerId é gravado), senão 401. Claims reservadas (`iss`, `aud`, `exp`,
+  `realm_access`...) não podem ser a claim do provedor.
+- **Modelo de permissões** (`Authorizer`):
+  - papel `OIDC_INTERNAL_ROLE` (default `wallet-internal`): operações de carteira
+    (`POST /wallets`, `GET /wallets/{id}`, ledger, reconciliação), por `RequireInternal`
+    ou `Internal(ctx)`;
+  - papel `OIDC_PROVIDER_ROLE` (default `wager-provider`) **e** `providerId` na
+    identidade: transações de aposta (envio, consultas por id e por externalId), por
+    `RequireProvider` ou `Provider(ctx)`, que devolve o providerId a usar nos casos de
+    uso;
+  - `MatchProvider(ctx, requested)`: o providerId do corpo de
+    `POST /wagering/transactions` e o do path `/providers/{providerId}/...` precisam ser
+    exatamente (byte a byte) o da identidade, senão **403 `PROVIDER_MISMATCH`**. Assim um
+    provedor nunca consulta nem faz replay de transação alheia, mesmo conhecendo a chave
+    de idempotência, porque o caso de uso sempre recebe o providerId da identidade. Por
+    id, a transação de outro provedor responde como inexistente (ADR-018);
+  - os papéis são disjuntos e validados no start (precisam ser diferentes). Um token com
+    os dois papéis tem os dois acessos (decisão do realm);
+  - sem papel, ou provedor sem providerId → **403 `FORBIDDEN`** com
+    `WWW-Authenticate: Bearer ... error="insufficient_scope"`.
+- **Rotas públicas.** `Authenticator.Middleware(publicPaths...)` envolve o roteador
+  inteiro, ou seja, o padrão é exigir token. Só caminhos declarados com comparação exata
+  de `r.URL.Path` (T18: `/health/live`, `/health/ready`) passam sem token. Variações
+  (`/health/live/`, `..`) exigem token. Em rota pública, o cabeçalho é ignorado.
+  `/metrics` fica para T18 decidir (hoje exige token).
+- **Respostas** (`WriteError`, corpo `apierror.Body {code, message, correlationId?}`,
+  `Cache-Control: no-store`): 401 `UNAUTHENTICATED` com `WWW-Authenticate: Bearer
+  realm="wallet"` (+ `error="invalid_token"` e `error_description` genérica
+  `invalid token`/`token expired`); 403 `FORBIDDEN`/`PROVIDER_MISMATCH`; 503
+  `TEMPORARILY_UNAVAILABLE`. A mensagem nunca diz qual verificação falhou.
+- **Logs.** Falhas de autenticação em INFO e negações em INFO, só com a categoria
+  (`reason`: `expired`, `signature`, `unknown_key`, `claims`, `provider_mismatch`...),
+  método, path, papel exigido e `clientId`. Nunca o token, o cabeçalho ou valores de
+  claims (testado: nem a assinatura aparece). IdP indisponível em WARN com a causa
+  técnica. Com token válido, o `providerId` entra nos IDs de log do contexto.
+- **Config** (validada no start, `errors.Is(err, config.ErrInvalidConfig)`):
+  `OIDC_ISSUER_URL`, `OIDC_AUDIENCE` (obrigatórias), `OIDC_JWKS_URL` (http(s) sem
+  credenciais), `OIDC_PROVIDER_CLAIM`, `OIDC_PROVIDER_ROLE`, `OIDC_INTERNAL_ROLE` (nomes
+  `[A-Za-z0-9_.:-]{1,128}`, papéis distintos), `OIDC_ROLES_CLIENT` e `OIDC_CLOCK_SKEW`
+  (0–2m). `auth.Settings.Validate` repete as regras para quem constrói sem env.
+- **Fx.** `auth.Module` provê `Settings`, `*Authenticator` e `*Authorizer` a partir de
+  `config.Config`, com logger opcional. Config inválida faz `fx.New` falhar, e o start
+  não abre conexão com o IdP. Ainda não está ligado em `cmd/server` (T23).
+- **Testes.**
+  - Unitários (`go test -race`): IdP falso com `httptest` e chaves RSA geradas no teste,
+    cobrindo:
+    - os casos de 401: ausente, vazio, Basic, Bearer sem token, múltiplos cabeçalhos,
+      malformado, grande demais, assinatura de outra chave com mesmo `kid`, payload
+      adulterado, `kid` desconhecido, expirado, sem `exp`, `nbf`/`iat` futuros, `aud`
+      errada/ausente, `iss` errado, `alg none`, HS256 com a chave pública, `typ`
+      ID/Refresh, claim de provedor inválida;
+    - tolerância de relógio;
+    - principal no contexto, com papéis de realm e do client e só deles;
+    - rotas públicas e variações;
+    - rotação: `kid` novo → nova busca, chave retirada deixa de valer, limite de
+      frequência e expiração do cache;
+    - 503 com IdP fora, recuperação e chaves antigas reaproveitadas;
+    - discovery (inclusive issuer divergente);
+    - chaves inutilizáveis no JWKS;
+    - concorrência com cache frio (1 busca);
+    - matriz de autorização (403 `FORBIDDEN`/`PROVIDER_MISMATCH`, inclusive diferença
+      só de caixa);
+    - mapeamento de erros, `Settings.Validate`, `fx.ValidateApp` e start com config
+      inválida (direta e por env).
+  - Integração (`-tags=integration`, `keycloak_integration_test.go`): obtém um token real
+    por `client_credentials` (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`,
+    `KEYCLOAK_CLIENT_SECRET`, opcionais `KEYCLOAK_ISSUER`, `OIDC_AUDIENCE`,
+    `KEYCLOAK_EXPECT_PROVIDER_ID`, `KEYCLOAK_EXPECT_ROLE`) e o valida por discovery + JWKS
+    reais. Cobre middleware 200/401, assinatura adulterada e aud/iss errados. Sem
+    `KEYCLOAK_URL` faz `t.Skip` com mensagem explícita: nesta máquina não há
+    Docker/Keycloak. **Ele roda de verdade em T24/T27** com o Keycloak do Docker
+    Compose. O realm precisa ter: mapper de audiência `wallet-api` nos clients,
+    hardcoded claim `provider_id` nos clients de provedor, papéis `wager-provider` e
+    `wallet-internal`, e `iss` consistente com `OIDC_ISSUER_URL`.
