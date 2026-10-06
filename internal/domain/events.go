@@ -109,6 +109,13 @@ type EventMetadata struct {
 	CausationID string
 }
 
+// Validate aplica aos metadados as mesmas regras dos construtores de eventos.
+// Os casos de uso chamam Validate antes de abrir a transação, para que um
+// correlationId ou causationId malformado seja rejeitado como entrada mesmo
+// quando o resultado não gera evento. Erros satisfazem
+// ErrInvalidIntegrationEvent.
+func (m EventMetadata) Validate() error { return m.validate() }
+
 func (m EventMetadata) validate() error {
 	if err := validateEventIdentifier("correlationId", m.CorrelationID); err != nil {
 		return err

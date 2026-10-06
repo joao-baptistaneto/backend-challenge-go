@@ -44,6 +44,17 @@ var (
 	// ErrWalletAlreadyExists: já existe carteira para (playerId, currency).
 	// Também casa com ErrConflict.
 	ErrWalletAlreadyExists = fmt.Errorf("%w: wallet already exists for player and currency", ErrConflict)
+	// ErrRecordNotFound: a linha procurada não existe. Também casa com
+	// ErrNotFound.
+	ErrRecordNotFound = fmt.Errorf("%w: record not found", ErrNotFound)
+	// ErrDuplicateWagerTransaction: uma operação concorrente, já confirmada,
+	// violou uma unicidade de idempotência ((provider, externalId) ou
+	// (provider, key)) ou a reversão única por referência. Também casa com
+	// ErrConflict.
+	ErrDuplicateWagerTransaction = fmt.Errorf("%w: wager transaction already registered", ErrConflict)
+	// ErrInboxHashMismatch: mesma (consumer, messageId) com conteúdo
+	// diferente do registrado. Também casa com ErrConflict.
+	ErrInboxHashMismatch = fmt.Errorf("%w: inbox message registered with another content", ErrConflict)
 )
 
 // Códigos estáveis dos erros de aplicação.
@@ -52,7 +63,19 @@ const (
 	CodeInvalidPlayerID        = "INVALID_PLAYER_ID"
 	CodeInvalidInitialBalance  = "INVALID_INITIAL_BALANCE"
 	CodeInvalidCorrelationID   = "INVALID_CORRELATION_ID"
+	CodeInvalidCausationID     = "INVALID_CAUSATION_ID"
 	CodeTemporarilyUnavailable = "TEMPORARILY_UNAVAILABLE"
+	// CodeIdempotencyKeyConflict: Idempotency-Key já usada pelo provedor com
+	// outro conteúdo (hash diferente).
+	CodeIdempotencyKeyConflict = "IDEMPOTENCY_KEY_CONFLICT"
+	// CodeExternalTransactionConflict: (providerId, externalTransactionId) já
+	// registrado sob outra Idempotency-Key.
+	CodeExternalTransactionConflict = "EXTERNAL_TRANSACTION_CONFLICT"
+	// CodeMessageConflict: messageId já recebido pelo consumidor com outro
+	// conteúdo.
+	CodeMessageConflict = "MESSAGE_CONFLICT"
+	// CodeInvalidMessage: consumerName ou messageId da inbox inválidos.
+	CodeInvalidMessage = "INVALID_MESSAGE"
 )
 
 // Error é o erro tipado devolvido pelos casos de uso.

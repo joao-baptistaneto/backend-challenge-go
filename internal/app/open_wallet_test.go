@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,6 +281,12 @@ func TestOpenWallet_InvalidInput(t *testing.T) {
 		{"negative", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: negative, CorrelationID: "c"}, app.CodeInvalidInitialBalance},
 		{"no correlation", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "1.00")}, app.CodeInvalidCorrelationID},
 		{"bad correlation", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "1.00"), CorrelationID: " x"}, app.CodeInvalidCorrelationID},
+		// Pendência da T14 resolvida na T15: o formato é validado mesmo sem
+		// eventos (saldo zero), e causationId tem código próprio.
+		{"bad correlation zero balance", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "0.00"), CorrelationID: "c\n"}, app.CodeInvalidCorrelationID},
+		{"long correlation zero balance", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "0.00"), CorrelationID: strings.Repeat("a", 256)}, app.CodeInvalidCorrelationID},
+		{"bad causation", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "1.00"), CorrelationID: "c", CausationID: "m "}, app.CodeInvalidCausationID},
+		{"bad causation zero balance", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "0.00"), CorrelationID: "c", CausationID: "\x00"}, app.CodeInvalidCausationID},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -375,4 +382,44 @@ func TestModule_Validate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Métodos das portas que OpenWallet não usa (acrescentados na T15): o fake
+// falha alto se forem chamados.
+var errUnexpectedCall = errors.New("fake: unexpected call")
+
+func (t fakeTx) Inbox() app.InboxStore { return fakeInbox(t) }
+
+type fakeInbox fakeTx
+
+func (fakeInbox) Register(context.Context, string, string, string, time.Time) (app.InboxRecord, error) {
+	return app.InboxRecord{}, errUnexpectedCall
+}
+
+func (fakeInbox) Complete(context.Context, string, string, string, uuid.UUID, time.Time) error {
+	return errUnexpectedCall
+}
+
+func (fakeWallets) GetForUpdate(context.Context, uuid.UUID) (*domain.Wallet, error) {
+	return nil, errUnexpectedCall
+}
+
+func (fakeWallets) Update(context.Context, *domain.Wallet) error { return errUnexpectedCall }
+
+func (fakeWagers) Update(context.Context, *domain.WagerTransaction) error { return errUnexpectedCall }
+
+func (fakeWagers) GetByID(context.Context, uuid.UUID) (*domain.WagerTransaction, error) {
+	return nil, errUnexpectedCall
+}
+
+func (fakeWagers) GetByProviderIdempotencyKey(context.Context, string, string) (*domain.WagerTransaction, error) {
+	return nil, errUnexpectedCall
+}
+
+func (fakeWagers) GetByProviderExternalID(context.Context, string, string) (*domain.WagerTransaction, error) {
+	return nil, errUnexpectedCall
+}
+
+func (fakeWagers) ListByProviderReference(context.Context, string, string) ([]*domain.WagerTransaction, error) {
+	return nil, errUnexpectedCall
 }

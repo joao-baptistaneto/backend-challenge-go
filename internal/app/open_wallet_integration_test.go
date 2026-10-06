@@ -35,7 +35,7 @@ func newEnv(t *testing.T) env {
 	db := startedDB(t)
 	tm := postgres.NewTxManager(db, nil, nil)
 	uow := postgres.NewUnitOfWork(tm, postgres.NewWalletRepository(), postgres.NewLedgerRepository(),
-		postgres.NewWagerTransactionRepository(), postgres.NewOutboxRepository())
+		postgres.NewWagerTransactionRepository(), postgres.NewOutboxRepository(), postgres.NewInboxRepository())
 	return env{db: db, uow: uow}
 }
 
@@ -347,16 +347,36 @@ func (t failingTx) after(step string, err error) error {
 	return nil
 }
 
-type failWallets struct{ failingTx }
-
-func (s failWallets) Insert(ctx context.Context, w *domain.Wallet) error {
-	return s.after("wallet", s.Tx.Wallets().Insert(ctx, w))
+// Os stores embutem o store real (métodos sem falha injetada passam direto).
+type failWallets struct {
+	failingTx
+	app.WalletStore
 }
 
-type failWagers struct{ failingTx }
+func (s failWallets) Insert(ctx context.Context, w *domain.Wallet) error {
+	return s.after("wallet", s.WalletStore.Insert(ctx, w))
+}
+
+func (s failWallets) Update(ctx context.Context, w *domain.Wallet) error {
+	return s.after("wallet_update", s.WalletStore.Update(ctx, w))
+}
+
+type failWagers struct {
+	failingTx
+	app.WagerTransactionStore
+}
 
 func (s failWagers) Insert(ctx context.Context, w *domain.WagerTransaction) error {
-	return s.after("wager", s.Tx.Transactions().Insert(ctx, w))
+	return s.after("wager", s.WagerTransactionStore.Insert(ctx, w))
+}
+
+type failInbox struct {
+	failingTx
+	app.InboxStore
+}
+
+func (s failInbox) Complete(ctx context.Context, c, m, h string, txID uuid.UUID, now time.Time) error {
+	return s.after("inbox_complete", s.InboxStore.Complete(ctx, c, m, h, txID, now))
 }
 
 type failLedger struct{ failingTx }
@@ -371,10 +391,13 @@ func (s failOutbox) Enqueue(ctx context.Context, events ...domain.IntegrationEve
 	return s.after("outbox", s.Tx.Outbox().Enqueue(ctx, events...))
 }
 
-func (t failingTx) Wallets() app.WalletStore                { return failWallets{t} }
-func (t failingTx) Transactions() app.WagerTransactionStore { return failWagers{t} }
-func (t failingTx) Ledger() app.LedgerStore                 { return failLedger{t} }
-func (t failingTx) Outbox() app.OutboxStore                 { return failOutbox{t} }
+func (t failingTx) Wallets() app.WalletStore { return failWallets{t, t.Tx.Wallets()} }
+func (t failingTx) Transactions() app.WagerTransactionStore {
+	return failWagers{t, t.Tx.Transactions()}
+}
+func (t failingTx) Ledger() app.LedgerStore { return failLedger{t} }
+func (t failingTx) Outbox() app.OutboxStore { return failOutbox{t} }
+func (t failingTx) Inbox() app.InboxStore   { return failInbox{t, t.Tx.Inbox()} }
 
 func TestIntegrationOpenWallet_AtomicRollback(t *testing.T) {
 	t.Parallel()

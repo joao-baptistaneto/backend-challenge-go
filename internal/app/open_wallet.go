@@ -85,6 +85,8 @@ type options struct {
 	logger *slog.Logger
 	now    func() time.Time
 	newID  func() (uuid.UUID, error)
+	// referenceDelay: só ProcessWagerTransaction (WithReferenceRetryDelay).
+	referenceDelay time.Duration
 }
 
 // WithLogger define o logger (nil = descarta).
@@ -193,8 +195,11 @@ func (uc *OpenWallet) plan(cmd OpenWalletCommand) (openingPlan, error) {
 	if cmd.InitialBalance.IsNegative() {
 		return openingPlan{}, invalid(CodeInvalidInitialBalance, domain.ErrNegativeAmount)
 	}
-	if cmd.CorrelationID == "" {
-		return openingPlan{}, invalid(CodeInvalidCorrelationID, errors.New("correlationId is required"))
+	// Formato de correlationId/causationId validado sempre, mesmo com saldo
+	// zero (sem eventos), e com códigos distintos (ADR-017).
+	meta, err := validateEventMetadata(opOpenWallet, cmd.CorrelationID, cmd.CausationID)
+	if err != nil {
+		return openingPlan{}, err
 	}
 
 	walletID, err := uc.newID()
@@ -227,10 +232,9 @@ func (uc *OpenWallet) plan(cmd OpenWalletCommand) (openingPlan, error) {
 	if err != nil {
 		return openingPlan{}, fmt.Errorf("app: %s: build opening: %w", opOpenWallet, err)
 	}
-	meta := domain.EventMetadata{CorrelationID: cmd.CorrelationID, CausationID: cmd.CausationID}
 	processed, err := domain.NewWagerTransactionProcessedEvent(opening, meta)
 	if err != nil {
-		return openingPlan{}, invalid(CodeInvalidCorrelationID, err)
+		return openingPlan{}, fmt.Errorf("app: %s: build processed event: %w", opOpenWallet, err)
 	}
 	// Mesma instância de carteira que produziu o lançamento (walletVersion 1).
 	changed, err := domain.NewWalletBalanceChangedEvent(*entry, w, meta)

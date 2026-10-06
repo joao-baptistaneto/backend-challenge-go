@@ -928,9 +928,10 @@ Pacotes `internal/app` (`ports.go`, `errors.go`, `open_wallet.go`, `module.go`) 
     `*app.Error` `KindConflict`/`WALLET_ALREADY_EXISTS`, sem efeito colateral (rollback).
   - Entradas inválidas (`playerId` nulo, `Money` não inicializado ou negativo,
     `correlationId` ausente ou malformado) viram `KindInvalidInput` antes de abrir
-    transação. O `correlationId` malformado só é detectado quando há eventos (saldo > 0),
-    porque a validação de formato é do construtor de eventos. A borda (T18) sempre gera um
-    id válido.
+    transação. Desde a T15 (ADR-017), o formato de `correlationId` e `causationId` é
+    validado sempre, mesmo com saldo zero, por `domain.EventMetadata.Validate`. O
+    `causationId` inválido tem código próprio (`INVALID_CAUSATION_ID`). A borda (T18)
+    sempre gera um id válido.
   - **Limitação:** o contrato `POST /wallets` não tem chave de idempotência. Se o commit
     tiver resultado desconhecido (503) e o cliente repetir a chamada, ele recebe 409 e deve
     consultar a carteira existente. Não há risco financeiro, porque o UNIQUE impede uma
@@ -952,3 +953,145 @@ Pacotes `internal/app` (`ports.go`, `errors.go`, `open_wallet.go`, `module.go`) 
     - rollback total com falha injetada depois de cada passo (carteira, OPENING, ledger,
       outbox) e com falha real do PostgreSQL (trigger) no INSERT do 2º evento da outbox;
     - composição Fx `postgres.Module` + `app.Module` com start/stop.
+
+## ADR-017 — Caso de uso ProcessWagerTransaction (T15)
+
+Pacotes `internal/app` (`process_wager.go`, `metadata.go`, portas em `ports.go`, erros em
+`errors.go`) e `internal/adapters/postgres/unit_of_work.go`. O mesmo caso de uso atende
+HTTP (T18) e SQS (T20), com as mesmas garantias de idempotência.
+
+- **Uma transação SQL por operação, sem aceite intermediário.** A operação é gravada já no
+  estado final (`PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`), junto com carteira,
+  ledger, outbox e inbox. O fluxo síncrono não deixa `PENDING` confirmado. A retomada de
+  `PENDING` órfão (T21) só se aplica a um eventual aceite assíncrono futuro.
+- **Ordem dentro da transação:**
+  1. `Inbox.Register` (só com `cmd.Inbox`, entrada SQS). Hash divergente → `409
+     MESSAGE_CONFLICT`. `COMPLETED` → replay do resultado gravado (lido por
+     `inbox.transaction_id`), sem tocar na carteira.
+  2. Leitura **sem lock** por `(provider, idempotencyKey)`. Se encontrar → replay ou
+     conflito. É o caminho rápido: replays não esperam o lock da carteira.
+  3. `Wallets.GetForUpdate`: lock pessimista por carteira (ADR-005). Carteira inexistente
+     segue sem lock e o domínio decide `WALLET_NOT_FOUND`.
+  4. Nova leitura por `(provider, key)` e por `(provider, externalId)`. Em `READ
+     COMMITTED`, cada comando vê os commits anteriores, então, depois do lock, a duplicata
+     confirmada por quem segurava o lock fica visível.
+  5. Referência por `(provider, referenceExternalTransactionId)` e reversões existentes
+     (`ListByProviderReference`, filtrada para `REFUND`/`ROLLBACK`, porque um `WIN` também
+     cita a `BET`). Em seguida, `DecideWager` + `ApplyWagerDecision` (ADR-009). Uma
+     referência válida está na mesma carteira, então o mesmo lock serializa as reversões
+     dela.
+  6. Escritas: `Wallets.Update` (só com movimento, condicional à versão),
+     `Transactions.Insert` (antes do ledger, por causa da FK), `Ledger.Append` (carteira
+     travada, contrato do ADR-014), `Outbox.Enqueue` e `Inbox.Complete`.
+- **Idempotência e conflitos** (`replayOrConflict`, aplicado à linha encontrada por chave,
+  externalId ou inbox):
+  - Outra chave para a mesma `(provider, externalId)` → `409
+    EXTERNAL_TRANSACTION_CONFLICT`, mesmo com conteúdo idêntico (README §9: não reaplicar
+    com outra chave).
+  - Mesma chave com outro hash → `409 IDEMPOTENCY_KEY_CONFLICT`.
+  - Mesma chave com o mesmo hash → replay: `idempotentReplay=true` e o resultado
+    persistido. O `balance` é o `balance_after` gravado no processamento original, não o
+    saldo atual. O mesmo vale para rejeições (`failureCode` + saldo observado) e para
+    `PENDING_REFERENCE` (estado atual, sem saldo).
+  - Chaves são escopadas pelo provedor: a mesma key de outro provedor é outra operação.
+    Um provedor nunca recebe replay de outro (isolamento no SQL, ADR-014).
+  - **Corrida sem lock comum** (carteira inexistente): os `UNIQUE` decidem. O perdedor
+    recebe `app.ErrDuplicateWagerTransaction`, que o adapter mapeia de
+    `provider_external_key`, `provider_idempotency_key` e `reversal_once_key`.
+    `TxOptions.RetryIf` repete o corpo; a nova tentativa lê a linha vencedora e devolve o
+    replay.
+  - Bug encontrado pelos testes e corrigido: o vencedor pode confirmar **entre** a leitura
+    por chave e a leitura por externalId. Por isso o acerto por externalId também passa
+    por `replayOrConflict`, que compara a chave em vez de presumir "outra chave".
+- **Corpo reexecutável e retry limitado.**
+  - Tudo é lido do tx e nada sai do banco. A cada tentativa, a transação nova é clonada do
+    modelo `PENDING` que foi validado antes da transação (`plan`).
+  - `Retry: true` aplica `DefaultRetryPolicy` (4 execuções) às falhas transitórias, mais o
+    `RetryIf` de duplicata.
+  - Commit de resultado desconhecido nunca é repetido: vira 503, e a nova chamada externa
+    cai no replay (ADR-013).
+  - Uma duplicata que persiste após as tentativas também vira `KindUnavailable`
+    (`TEMPORARILY_UNAVAILABLE`). Quando o chamador repetir, recebe o replay.
+- **Eventos do estado final** (em ordem de `seq`):
+  - `PROCESSED` → `WagerTransactionProcessed`, mais `WalletBalanceChanged` se houver
+    lançamento.
+  - `LOSS` não gera `WalletBalanceChanged`, ledger nem versão nova, e `Wallets.Update` não
+    executa SQL.
+  - `REJECTED` → `WagerTransactionRejected`.
+  - `PENDING_REFERENCE` → `WagerTransactionPendingReference`, só nesta transição
+    (`attempts = 1`, ADR-012).
+  - O `causationId` do comando (ex.: `messageId` SQS) vai para os eventos.
+- **Referência ausente ou pendente:** `PENDING_REFERENCE` com `attempts = 1` e
+  `next_attempt_at = now + WithReferenceRetryDelay` (padrão `DefaultReferenceRetryDelay`
+  = 2s). Backoff seguinte, limite/TTL e resolução ficam com a T21. O replay de uma operação
+  pendente devolve `PENDING_REFERENCE` sem reavaliar: só o worker transiciona a linha.
+- **Resultado (`WagerResult`):** `transactionId`, `walletId`, `kind`, `status`, `balance`,
+  `failureCode`, `referenceTransactionId` e `idempotentReplay`.
+  - `referenceTransactionId` só aparece em `PROCESSED`, porque numa rejeição poderia ser de
+    outra carteira (pendência T18/T20).
+  - `balance` é omitido em `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH` e
+    `CURRENCY_MISMATCH`, mesma regra do evento (ADR-012).
+- **Inbox:**
+  - O hash registrado é o hash canônico da operação (T08), calculado pelo caso de uso. A
+    borda informa só `consumerName`/`messageId` (1..255 bytes; senão `INVALID_MESSAGE`).
+  - Mesmo `messageId` com outro conteúdo → `MESSAGE_CONFLICT`. Mesmo `messageId` e mesmo
+    conteúdo com outra chave → `EXTERNAL_TRANSACTION_CONFLICT`.
+  - Mensagem nova para uma operação já processada (por HTTP ou por outra mensagem) é
+    replay; a mensagem é concluída apontando para a transação original.
+  - Em `PENDING_REFERENCE`, a mensagem é concluída no mesmo commit da pendência (README
+    §6.5); a continuidade é do worker.
+  - Conflitos e entradas inválidas fazem rollback e não deixam linha na inbox. Remover a
+    mensagem ou mandá-la à DLQ é decisão da T20.
+- **Entradas inválidas** (antes de abrir a transação, `KindInvalidInput`): nada é
+  persistido e nenhum evento é gerado (ADR-012). O `Code` é o `FailureCode` do domínio:
+  `INVALID_KIND` (inclusive `OPENING`), `INVALID_AMOUNT`, `REFERENCE_REQUIRED`,
+  `REFERENCE_NOT_ALLOWED` e `INVALID_REQUEST` (identificadores ou UTF-8 inválidos). Há
+  ainda `INVALID_CORRELATION_ID`, `INVALID_CAUSATION_ID` e `INVALID_MESSAGE`.
+- **Pendências resolvidas:**
+  - Contrato de lock do ledger e do Update (T14/T15/T21): `Ledger.Append` e
+    `Wallets.Update` só são chamados após `Wallets.GetForUpdate` na mesma transação, e a
+    transação nova entra por `Transactions.Insert`. O caso de uso não chama
+    `Transactions.Update`; a porta existe para a T21, com o contrato documentado (linha
+    lida sob lock).
+  - Validação de `correlationId`/`causationId`: `app.validateEventMetadata`, sobre o novo
+    método exportado `domain.EventMetadata.Validate`, roda sempre antes da transação,
+    inclusive em `OpenWallet` com saldo zero. `causationId` tem código próprio
+    (`INVALID_CAUSATION_ID`).
+- **Portas acrescentadas** (ADR-016):
+  - `WalletStore.GetForUpdate/Update`.
+  - `WagerTransactionStore.Update/GetByID/GetByProviderIdempotencyKey/
+    GetByProviderExternalID/ListByProviderReference`.
+  - `InboxStore.Register/Complete` (`Tx.Inbox()`) e `TxOptions.RetryIf`.
+  - Sentinelas: `ErrRecordNotFound` (casa com `ErrNotFound`), `ErrDuplicateWagerTransaction`
+    e `ErrInboxHashMismatch` (casam com `ErrConflict`). O adapter traduz preservando a
+    causa.
+  - `NewUnitOfWork` recebe o `*InboxRepository`, e `app.Module` provê
+    `*ProcessWagerTransaction`. O rótulo de operação é `process_transaction` (igual a
+    `metrics.OperationProcessTransaction`, verificado por teste).
+- **Fora do escopo:** métricas por resultado e de duplicatas (`app` não importa `platform`;
+  a borda T18/T20 as registra a partir de `WagerResult`), mapeamento HTTP/SQS dos códigos
+  e worker de referências.
+- **Testes unitários** (`process_wager_test.go`, UnitOfWork em memória com rollback e
+  retry): BET, replay com saldo original, conflitos, 14 entradas inválidas sem abrir
+  transação, retry por duplicata, classificação de indisponibilidade, `PENDING_REFERENCE`
+  com `next_attempt_at`, rejeição sem saldo, inbox (conclusão, reentrega, hash divergente,
+  outra chave, mensagem nova para operação já feita) e `fx.ValidateApp`.
+- **Testes de integração** (`process_wager_integration_test.go`, PostgreSQL real):
+  - Dez passos com BET, WIN com e sem referência, LOSS, REFUND e ROLLBACK de BET, WIN e
+    REFUND. Conferem saldo, versão, direção do lançamento, eventos e reconciliação (saldo =
+    soma do ledger, encadeamento before/after), além do mesmo `xmin` em carteira,
+    transação, ledger e outbox.
+  - LOSS sem ledger, sem versão e sem alterar `updated_at`.
+  - Replay após outras movimentações, inclusive de uma rejeição.
+  - Conflitos sem efeito e isolamento entre provedores.
+  - 50 duplicatas concorrentes, com carteira existente e inexistente (exatamente um
+    efeito); 10 keys diferentes para a mesma operação (um efeito, nove conflitos).
+  - Rejeições persistidas, cada uma com evento e sem `referenceTransactionId`:
+    `INSUFFICIENT_FUNDS`, `REFERENCE_MISMATCH`, `REVERSAL_INSUFFICIENT_FUNDS`,
+    `ALREADY_REVERSED`, `AMOUNT_MISMATCH`, `REFERENCE_NOT_REVERSIBLE`,
+    `WALLET_PLAYER_MISMATCH` e `WALLET_NOT_FOUND`.
+  - ROLLBACK antes da referência.
+  - 80+80 sobre 100 e 30 débitos concorrentes de 7.00 (nunca negativo, sem lost update).
+  - Rollback total com falha injetada após cada escrita, inclusive `Inbox.Complete`.
+  - 10 entregas concorrentes da mesma mensagem, com a inbox no mesmo commit (`xmin`).
+  - Composição Fx.
