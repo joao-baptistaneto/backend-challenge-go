@@ -40,8 +40,9 @@ Regras de dependência (direção única, de fora para dentro):
 - `domain` não importa nada de `app`, `adapters`, `platform`, Fx, pgx, SQS ou HTTP.
 - `app` depende apenas de `domain` e de interfaces que ele mesmo declara.
 - `adapters/*` implementam as portas de `app`; `platform/*` provê infraestrutura transversal.
-- Apenas `cmd/server` e os arquivos `module.go` de adapters/platform conhecem Fx
-  (`fx.Module`, `fx.Provide`, `fx.Invoke`).
+- Apenas `cmd/server` e os arquivos `module.go` de app/adapters/platform conhecem Fx
+  (`fx.Module`, `fx.Provide`, `fx.Invoke`). Em `app`, só `module.go` importa Fx; os casos
+  de uso em si não dependem dele (ADR-016).
 
 ## ADR-003 — Ferramentas de build e verificação (T01)
 
@@ -874,3 +875,80 @@ IDENTITY` (0005).
     drenando 300 eventos sem duplicar, SKIP LOCKED com claim não confirmado, lease
     expirado reassumido com `attempt=2`, fencing de owner antigo e de mesmo owner com
     token antigo, lease expirado não reassumido e backoff com teto).
+
+## ADR-016 — Portas da aplicação, UnitOfWork e caso de uso OpenWallet (T14)
+
+Pacotes `internal/app` (`ports.go`, `errors.go`, `open_wallet.go`, `module.go`) e
+`internal/adapters/postgres/unit_of_work.go`.
+
+- **Portas no lado da aplicação, sem pgx.** `app.UnitOfWork.WithinTx(ctx, TxOptions, fn
+  func(ctx, app.Tx) error)` abre uma transação e entrega um `app.Tx` com os stores
+  `Wallets()`, `Transactions()`, `Ledger()` e `Outbox()`, todos ligados ao **mesmo**
+  `pgx.Tx`. A fronteira transacional continua explícita e auditável, como no ADR-013: o
+  caso de uso só grava pelos stores do `Tx` recebido, e não há transação escondida no
+  `context`. Cada store expõe apenas o que algum caso de uso usa. T15, T16 e T21 acrescentam
+  métodos (`GetForUpdate`, consultas, inbox) conforme precisarem.
+- **Adapter (`postgres.UnitOfWork`).** Implementa `app.UnitOfWork` sobre `Transactor` e os
+  repositórios do ADR-014/015. `TxOptions.Retry` liga `WithRetry(DefaultRetryPolicy(
+  Operation))`. `Operation` usa os mesmos rótulos de `metrics.Operation*`, e um teste no
+  adapter garante essa igualdade, porque `app` não importa `platform`. O
+  `postgres.Module` provê `*UnitOfWork` como `app.UnitOfWork`, e o `app.Module` provê
+  `*OpenWallet` a partir dela, com `*slog.Logger` opcional. A composição em `cmd/server`
+  fica para a T23.
+- **Tradução de erros na borda do adapter (substitui a nota do ADR-014).** O caso de uso
+  não conhece as sentinelas do adapter. `WalletStore.Insert` embrulha
+  `postgres.ErrWalletAlreadyExists` (constraint `wallets_player_currency_key`) com
+  `app.ErrWalletAlreadyExists`. Colisão de PK não é tratada como conflito de negócio.
+  Falhas transitórias (`IsTransient`, inclusive `ErrCommitOutcomeUnknown`) saem de
+  `WithinTx` embrulhadas com `app.ErrUnavailable`. Em todos os casos a causa original
+  continua na cadeia de erros.
+- **Erros tipados da aplicação.** `*app.Error{Kind, Code, Op, Err}`. `Kind` casa por
+  `errors.Is` com `ErrInvalidInput` (400), `ErrConflict` (409), `ErrNotFound` (404) e
+  `ErrUnavailable` (503). `Code` é estável (`WALLET_ALREADY_EXISTS`,
+  `INVALID_PLAYER_ID`, `INVALID_INITIAL_BALANCE`, `INVALID_CORRELATION_ID`,
+  `TEMPORARILY_UNAVAILABLE`). Erros sem classe (falha permanente, bug) não viram
+  `*app.Error` e devem ser tratados como erro interno. O mapeamento HTTP é feito na T18.
+- **OpenWallet.**
+  - Tudo o que é puro é montado **antes** da transação e validado pelo domínio: ids
+    UUIDv7, `NewWallet` (versão 1), `NewOpeningWagerTransaction` (PROCESSED, INTERNAL),
+    o lançamento CREDIT 0 → saldo e os eventos `WagerTransactionProcessed` (agregado =
+    OPENING) e `WalletBalanceChanged` (agregado = carteira, `walletVersion` 1, construído
+    com a mesma instância de `Wallet`, ADR-012).
+  - O corpo da transação só grava, nesta ordem: carteira, OPENING, lançamento e outbox
+    (Processed e depois BalanceChanged, ordem de `seq`). A carteira é inserida antes do
+    `Ledger.Append`. Até o commit, essa linha é invisível e exclusiva da transação, o que
+    equivale a tê-la travada. Assim fica cumprido o contrato do ledger (`seq` em ordem de
+    commit, ADR-014).
+  - O corpo não tem efeitos externos e grava objetos já prontos. Por isso é reexecutável,
+    e o caso de uso liga `Retry` (`open_wallet`). Um retry reaproveita os mesmos ids e
+    eventos, o que é seguro porque a tentativa anterior foi desfeita.
+  - Saldo zero grava só a carteira, sem OPENING, ledger nem eventos (ADR-012).
+  - Quem decide o `(playerId, currency)` duplicado é o UNIQUE do banco, inclusive em
+    corrida entre instâncias. O perdedor espera no índice até o commit do vencedor e recebe
+    `*app.Error` `KindConflict`/`WALLET_ALREADY_EXISTS`, sem efeito colateral (rollback).
+  - Entradas inválidas (`playerId` nulo, `Money` não inicializado ou negativo,
+    `correlationId` ausente ou malformado) viram `KindInvalidInput` antes de abrir
+    transação. O `correlationId` malformado só é detectado quando há eventos (saldo > 0),
+    porque a validação de formato é do construtor de eventos. A borda (T18) sempre gera um
+    id válido.
+  - **Limitação:** o contrato `POST /wallets` não tem chave de idempotência. Se o commit
+    tiver resultado desconhecido (503) e o cliente repetir a chamada, ele recebe 409 e deve
+    consultar a carteira existente. Não há risco financeiro, porque o UNIQUE impede uma
+    segunda carteira e o índice `wager_transactions_opening_per_wallet_key` impede um
+    segundo crédito inicial.
+- **Testes:**
+  - Unitários (`internal/app`, fakes das portas): ordem das escritas (o fake de ledger
+    recusa `Append` sem a carteira inserida na mesma tx), eventos e metadados, saldo zero,
+    conflito, indisponibilidade, entradas inválidas sem abrir tx, ctx cancelado, falha do
+    gerador de ids, corpo reexecutável e `fx.ValidateApp` do `app.Module`.
+  - Adapter: tradução de erros, opção de retry e igualdade dos rótulos de operação.
+  - Integração (`-tags=integration`, banco novo por teste, mesmo harness do adapter):
+    - saldo positivo: carteira v1, OPENING PROCESSED sem metadados externos, um CREDIT e
+      dois eventos com payload conferido. O mesmo `xmin` em todas as linhas prova o
+      mesmo commit;
+    - saldo zero: só a carteira;
+    - conflito: sem efeitos colaterais, e outra moeda funciona;
+    - 10 aberturas concorrentes: uma vence e nove recebem conflito;
+    - rollback total com falha injetada depois de cada passo (carteira, OPENING, ledger,
+      outbox) e com falha real do PostgreSQL (trigger) no INSERT do 2º evento da outbox;
+    - composição Fx `postgres.Module` + `app.Module` com start/stop.

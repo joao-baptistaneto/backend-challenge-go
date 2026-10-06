@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 
+	"github.com/junglegaming/backend-challenge-go/internal/app"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 )
@@ -50,7 +51,9 @@ func newTxManagerFx(p TxManagerParams) *TxManager {
 //   - *TxManager e Transactor (interface consumida pelos casos de uso);
 //   - *WalletRepository, *LedgerRepository, *WagerTransactionRepository,
 //     *InboxRepository e *OutboxRepository
-//     (stateless; recebem o Querier/pgx.Tx em cada chamada).
+//     (stateless; recebem o Querier/pgx.Tx em cada chamada);
+//   - *UnitOfWork e app.UnitOfWork: liga as portas da aplicação aos
+//     repositórios, todos sobre o mesmo pgx.Tx (ADR-016).
 //
 // Depende de config.Config; *slog.Logger e *metrics.Metrics são opcionais.
 var Module = fx.Module("postgres",
@@ -63,5 +66,6 @@ var Module = fx.Module("postgres",
 		NewWagerTransactionRepository,
 		NewInboxRepository,
 		NewOutboxRepository,
+		fx.Annotate(NewUnitOfWork, fx.As(fx.Self()), fx.As(new(app.UnitOfWork))),
 	),
 )
