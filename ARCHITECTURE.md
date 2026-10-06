@@ -1274,7 +1274,7 @@ Config em `internal/platform/config` (variáveis `OIDC_*`).
   inteiro, ou seja, o padrão é exigir token. Só caminhos declarados com comparação exata
   de `r.URL.Path` (T18: `/health/live`, `/health/ready`) passam sem token. Variações
   (`/health/live/`, `..`) exigem token. Em rota pública, o cabeçalho é ignorado.
-  `/metrics` fica para T18 decidir (hoje exige token).
+  `/metrics` foi decidido na T18 (ADR-020): exige o serviço interno por padrão.
 - **Respostas** (`WriteError`, corpo `apierror.Body {code, message, correlationId?}`,
   `Cache-Control: no-store`): 401 `UNAUTHENTICATED` com `WWW-Authenticate: Bearer
   realm="wallet"` (+ `error="invalid_token"` e `error_description` genérica
@@ -1324,3 +1324,167 @@ Config em `internal/platform/config` (variáveis `OIDC_*`).
     Compose. O realm precisa ter: mapper de audiência `wallet-api` nos clients,
     hardcoded claim `provider_id` nos clients de provedor, papéis `wager-provider` e
     `wallet-internal`, e `iss` consistente com `OIDC_ISSUER_URL`.
+
+## ADR-020 — API HTTP (T18)
+
+Pacotes `internal/adapters/http` (`package httpadapter`: `api.go`, `middleware.go`,
+`request.go`, `handlers.go`, `health.go`, `dto.go`, `respond.go`, `module.go`) e
+`internal/adapters/strictjson` (decoder estrito, reaproveitável pelo consumidor SQS na
+T20).
+
+- **Roteamento.** Usamos `net/http` puro, com os padrões do `ServeMux` (método + curingas
+  `{walletId}`), sem roteador de terceiros. Os handlers dependem de interfaces estreitas
+  (`WalletOpener`, `WagerProcessor`, `WalletReconciler`, `QueryService`, `Authenticator`,
+  `Authorizer`), satisfeitas pelos casos de uso de `internal/app` e pelos tipos de
+  `internal/adapters/auth`. `NewHandler(Deps)` recusa dependências ausentes.
+- **Cadeia de middlewares** (de fora para dentro):
+  1. correlation-id;
+  2. observação: histograma `wallet_http_request_duration_seconds` com o rótulo = template
+     da rota (registrado em `AllowRoutes`; um path sem rota vira `other`) e log de acesso
+     com método, rota, status e duração (nunca cabeçalhos, query ou corpo);
+  3. recover: panic → 500 `INTERNAL_ERROR`;
+  4. `auth.Authenticator.Middleware("/health/live", "/health/ready")`, com rotas públicas
+     só por path exato;
+  5. `ServeMux`;
+  6. autorização por rota.
+
+  O template da rota casada é anotado num holder do contexto pelo wrapper de cada rota.
+  Isso é necessário porque o `r.Pattern` do mux fica na cópia da requisição criada pelo
+  middleware de autenticação.
+- **Correlation-id.** Usamos o cabeçalho `X-Correlation-ID` quando ele é válido: mesmas
+  regras do envelope de eventos (1..255 bytes, sem controle, sem espaço nas pontas). Na
+  ausência dele, geramos um UUIDv7. Valor inválido ou repetido → **400
+  `INVALID_CORRELATION_ID`**, sem ecoar o valor. O id volta no cabeçalho de toda resposta
+  e no `correlationId` de todo corpo de erro, inclusive 401. Ele também segue para os
+  casos de uso (eventos da outbox) e para os logs, pelo contexto.
+- **Autorização por rota** (modelo do ADR-019):
+  - `POST /wallets`, `GET /wallets/{id}`, `GET /wallets/{id}/ledger` e
+    `POST /wallets/{id}/reconciliation` exigem o serviço interno (`Internal`). Um provedor
+    ou uma identidade sem papel recebe 403 `FORBIDDEN`.
+  - As três rotas de transação exigem provedor com `providerId` (`Provider`) e usam
+    **sempre** o providerId da identidade. O serviço interno não acessa transações (403).
+  - No `POST /wagering/transactions`, o `providerId` do corpo precisa casar exatamente com
+    o da identidade (`MatchProvider`), senão 403 `PROVIDER_MISMATCH`. Essa verificação
+    vem antes de qualquer acesso a dados.
+- **Acesso cruzado (decisão 404 vs 403).** A resposta nunca depende da existência de
+  dados de outro provedor:
+  - quando a decisão depende só da identidade versus o que o próprio pedido nomeia
+    (`providerId` no corpo ou em `/providers/{providerId}/...`), a resposta é **403
+    `PROVIDER_MISMATCH`**, igual para um externalId existente ou não;
+  - quando o pedido não nomeia o provedor (`GET /wagering/transactions/{id}`), a transação
+    de outro provedor, ou interna como `OPENING`, responde **404 `TRANSACTION_NOT_FOUND`**
+    com corpo byte a byte igual ao de um id inexistente (testado);
+  - em `/providers/{seu-id}/...`, o externalId de outro provedor também é 404, porque o
+    filtro está no SQL.
+
+  Acessos negados não abrem unidade de trabalho e não produzem ledger, outbox nem
+  transação (testado contando as transações da UoW). Um replay com a chave e o corpo de
+  outro provedor é 403 e não devolve resultado nem saldo. O mesmo
+  `externalTransactionId`/chave no espaço de outro provedor é outra operação.
+- **Decoder estrito (sem float).** `strictjson.DecodeObject` lê cada campo como
+  `json.RawMessage` e nada é decodificado para `interface{}` ou tipo numérico. Rejeita:
+  - chave desconhecida;
+  - chave com outra caixa (o `encoding/json` padrão casaria);
+  - chave repetida (o padrão ficaria com a última);
+  - dado depois do objeto;
+  - corpo que não seja objeto.
+
+  Para `Money`, exige `{"amount":"<string>","currency":"<string>"}` com as mesmas regras
+  e faz o parse com `domain.ParseNonNegative`: rejeita amount numérico (`25.00` sem
+  aspas), `NaN`, `Infinity`, notação científica, escala > 2, negativos e overflow.
+  Resolve, na borda HTTP, a pendência "Money.UnmarshalJSON aceita outra caixa/chaves
+  duplicadas", porque o HTTP não usa aquele `UnmarshalJSON`. A forma equivalente `"25"`
+  é normalizada para `25.00` antes do hash (ADR-010) e o replay com `"25"` casa com
+  `"25.00"` (testado). UUIDs (`playerId`, `walletId`, ids no path) só na forma canônica
+  de 36 caracteres, não nulos. `kind` por `ParseExternalWagerKind` (`OPENING` e outra
+  caixa → `INVALID_KIND`). `referenceExternalTransactionId`, se presente, precisa ser
+  string não vazia (`null`/`""` → 400). Só então se monta o comando: o
+  `idempotency.RequestFields` sai de valores já parseados (pendência T18/T20 resolvida
+  no HTTP).
+- **Transporte.** `Content-Type` diferente de `application/json` (charset só `utf-8`) dá
+  415 `UNSUPPORTED_MEDIA_TYPE`. Corpo acima de 64 KiB dá 413 `PAYLOAD_TOO_LARGE`. UTF-8
+  inválido dá 400. Path sem rota dá 404 `ROUTE_NOT_FOUND`, mas só depois da
+  autenticação, para não revelar rotas sem token. Path conhecido com outro método dá 405
+  `METHOD_NOT_ALLOWED` com `Allow`. Toda resposta JSON leva `Cache-Control: no-store` e
+  `X-Content-Type-Options: nosniff`.
+- **Idempotency-Key.** O cabeçalho é obrigatório em `POST /wagering/transactions`:
+  - ausente ou vazio → 400 `IDEMPOTENCY_KEY_REQUIRED`;
+  - repetido, com mais de 255 bytes, com caracteres de controle ou com espaço nas pontas
+    → 400 `INVALID_IDEMPOTENCY_KEY`.
+
+  O valor é usado exatamente como recebido, nunca substituído por `{providerId}:{externalId}`.
+- **Contrato de respostas** (corpo de erro `apierror.Body {code, message, correlationId}`;
+  mensagens genéricas, a causa técnica fica só no log):
+
+  | Situação | HTTP | Corpo |
+  | --- | --- | --- |
+  | Carteira aberta | 201 + `Location` | `{id, playerId, balance, version, createdAt, updatedAt}` |
+  | Operação `PROCESSED` (nova ou replay) | 200 | `{transactionId, status, balance, idempotentReplay}` (+`referenceTransactionId` em reversões) |
+  | `PENDING_REFERENCE` (nova ou replay) | 202 + `Location: /wagering/transactions/{id}` | `{transactionId, status, idempotentReplay}` |
+  | Rejeição de negócio `REJECTED` ou falha permanente `FAILED` (nova ou replay) | 422 | `{transactionId, status, failureCode, failureCategory, balance?, idempotentReplay}` |
+  | Entrada inválida | 400 | `code` = `INVALID_REQUEST`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `INVALID_KIND`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `IDEMPOTENCY_KEY_REQUIRED`, `INVALID_IDEMPOTENCY_KEY`, `INVALID_PLAYER_ID`, `INVALID_INITIAL_BALANCE`, `INVALID_WALLET_ID`, `INVALID_TRANSACTION_ID`, `INVALID_PAGE_LIMIT`, `INVALID_CURSOR`, `INVALID_CORRELATION_ID` |
+  | Sem token / token inválido ou expirado | 401 + `WWW-Authenticate` | `UNAUTHENTICATED` |
+  | Sem papel / provedor divergente | 403 | `FORBIDDEN` / `PROVIDER_MISMATCH` |
+  | Inexistente (ou de outro provedor) | 404 | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` |
+  | Conflito | 409 | `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `WALLET_ALREADY_EXISTS` |
+  | Indisponibilidade transitória (banco, prazo, IdP) | 503 + `Retry-After` | `TEMPORARILY_UNAVAILABLE` |
+  | Erro inesperado / panic | 500 | `INTERNAL_ERROR` |
+
+  O 422 vale para os dois terminais sem sucesso porque ambos são resultados definitivos e
+  persistidos. O campo `status` os distingue, e `failureCategory` (`INPUT`, `BUSINESS`,
+  `INFRASTRUCTURE`) diz se a entrada é corrigível. O saldo do replay é o `balance_after`
+  gravado, e ele é omitido onde o ADR-017 o esconde (`WALLET_NOT_FOUND`...). Não é um
+  `Money` zero.
+- **Consultas.** `GET /wagering/transactions/{id}` e `/providers/{p}/wagering/transactions/{ext}`
+  devolvem `{transactionId, providerId, externalTransactionId, walletId, playerId, roundId,
+  gameId, kind, status, money, referenceExternalTransactionId?, referenceTransactionId?,
+  balance?, failureCode?, failureCategory?, attempts, nextAttemptAt?, createdAt, updatedAt,
+  completedAt?}`, sem chave de idempotência nem hash. O extrato
+  `GET /wallets/{id}/ledger?cursor=&limit=` devolve `{walletId, entries[], nextCursor?}`:
+  - `limit` só em dígitos decimais;
+  - `limit`/`cursor` repetidos → 400;
+  - lista vazia serializada como `[]`.
+
+  A reconciliação devolve `{walletId, storedBalance, calculatedBalance, difference,
+  consistent, checkedEntries, walletVersion}`, ignora qualquer corpo e não altera dados.
+- **Health e /metrics.**
+  - `GET /health/live`: 200 `{"status":"UP"}`, sem consultar dependências.
+  - `GET /health/ready`: roda as `ReadinessCheck` em paralelo, com 2s cada; um panic numa
+    verificação vira DOWN. Todas UP → 200; alguma DOWN → 503 + `Retry-After` com
+    `{"status":"DOWN","checks":{"postgres":"DOWN",...}}`. A causa vai só para o log WARN.
+  - As verificações entram pelo grupo Fx `readinessChecks`. **T23** deve contribuir
+    `postgres` (`db.Ping`) e `sqs`.
+  - **Decisão sobre `/metrics`:** por padrão exige o serviço interno
+    (`MetricsInternal`). As métricas não têm valores monetários nem ids (ADR-007), mas
+    expõem volume e taxas de negócio, e a API compartilha a porta com o tráfego externo.
+    `MetricsAccess = MetricsPublic` torna o path público (exato), para um scraper sem
+    OAuth em rede privada. A escolha fica para a composição (T23/T24), mantendo o padrão
+    seguro.
+- **Métricas de negócio do canal HTTP.**
+  - `TransactionResult(http, kind, status)` para operações novas.
+  - `Duplicate(http, idempotent_replay)` nos replays e `Duplicate(http,
+    idempotency_conflict)` nos 409.
+  - `ObserveProcessing(http, process_transaction, outcome)`.
+- **Fx.** `httpadapter.Module` provê o `http.Handler` nomeado `apiHandler`:
+  - **obrigatórias:** casos de uso (`app.Module`) e `*auth.Authenticator`/`*auth.Authorizer`;
+  - **opcionais:** `*metrics.Metrics`, `metricsHandler`, `MetricsAccess`, logger e o grupo
+    de readiness.
+
+  O servidor (listen/shutdown) é da T19.
+- **Testes** (`go test -race`, sem banco):
+  - **Contrato por `httptest`.** Rodam os casos de uso **reais** sobre uma `UnitOfWork`
+    em memória (`memstore_test.go`) e verificam status, código e formato de cada rota.
+  - **Replay.** Saldo original após outras movimentações, forma equivalente do valor,
+    409 nos dois conflitos e replays de 422 e 202.
+  - **Decoder estrito.** Float, notação científica, escala, chaves desconhecidas,
+    repetidas e com outra caixa.
+  - **Acesso cruzado.** 403/404 sem vazamento, corpos idênticos, nenhuma escrita e
+    nenhuma transação aberta.
+  - **Transversais.** Matriz 401/403 das rotas de carteira, mapeamento de erros
+    (503 + `Retry-After`, 500 sem detalhe), panic, correlation-id, health, `/metrics`,
+    405/404 e `fx.ValidateApp` + start/stop.
+  - **Autenticação real.** Um teste usa o `auth.Authenticator` real com JWKS em
+    `httptest`: expirado, assinatura de outra chave, token falso e providerId vindo da
+    claim.
+  - **Falsos.** Os tokens do autenticador falso montam o `Principal` com papéis
+    ordenados, porque `HasRole` usa busca binária.
