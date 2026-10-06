@@ -145,22 +145,22 @@ func TestDownSteps(t *testing.T) {
 	if _, err := m.Up(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
-	reverted, err := m.Down(ctx, conn, 2)
+	reverted, err := m.Down(ctx, conn, 3)
 	if err != nil {
-		t.Fatalf("Down(2): %v", err)
+		t.Fatalf("Down(3): %v", err)
 	}
-	if len(reverted) != 2 || reverted[0].Name != "create_outbox" || reverted[1].Name != "create_inbox" {
-		t.Fatalf("Down(2) reverted %+v", reverted)
+	if len(reverted) != 3 || reverted[0].Name != "add_wallet_ledger_entries_seq" || reverted[1].Name != "create_outbox" || reverted[2].Name != "create_inbox" {
+		t.Fatalf("Down(3) reverted %+v", reverted)
 	}
 	if got := appliedVersions(t, conn); len(got) != 3 {
-		t.Fatalf("applied after Down(2) = %v", got)
+		t.Fatalf("applied after Down(3) = %v", got)
 	}
 	if tableExists(t, conn, "outbox") || tableExists(t, conn, "inbox") || !tableExists(t, conn, "wallet_ledger_entries") {
-		t.Fatal("unexpected tables after Down(2)")
+		t.Fatal("unexpected tables after Down(3)")
 	}
 	applied, err := m.Up(ctx, conn)
-	if err != nil || len(applied) != 2 {
-		t.Fatalf("Up after Down(2): applied %d, err %v", len(applied), err)
+	if err != nil || len(applied) != 3 {
+		t.Fatalf("Up after Down(3): applied %d, err %v", len(applied), err)
 	}
 }
 

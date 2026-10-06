@@ -34,6 +34,9 @@ import (
 //     atualização confirmada nunca é descartada (lost update).
 //   - Atomicidade de falha: se Debit/Credit retornam erro, o agregado permanece
 //     exatamente no estado anterior.
+//   - A instância lembra, só em memória, o id do último lançamento que ela
+//     produziu. NewWalletBalanceChangedEvent usa isso para garantir que
+//     walletVersion = Version() é a versão resultante daquele lançamento.
 //   - Tempo: o relógio é injetado (parâmetro now), normalizado para UTC.
 //     UpdatedAt é monotônico (max(updatedAt, now)) para tolerar pequenas
 //     diferenças de relógio entre instâncias sem rejeitar a operação.
@@ -75,6 +78,12 @@ type Wallet struct {
 	persistedVersion int64
 	createdAt        time.Time
 	updatedAt        time.Time
+	// lastEntryID é o id do último lançamento produzido por ESTA instância
+	// (NewWallet ou Debit/Credit) e uuid.Nil após RehydrateWallet. Existe só em
+	// memória. NewWalletBalanceChangedEvent o usa para provar que Version() é a
+	// versão resultante daquele lançamento, o que detecta o caso A-B-A (a
+	// carteira é movimentada de novo e volta ao mesmo saldo).
+	lastEntryID uuid.UUID
 }
 
 // NewWalletParams agrupa os dados de abertura de carteira.
@@ -138,6 +147,7 @@ func NewWallet(p NewWalletParams) (*Wallet, *WalletLedgerEntry, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	w.lastEntryID = entry.ID()
 	return w, &entry, nil
 }
 
@@ -290,6 +300,7 @@ func (w *Wallet) apply(dir LedgerDirection, amount Money, transactionID uuid.UUI
 	// Mutação (só após todas as validações).
 	w.balance = after
 	w.version++
+	w.lastEntryID = entry.ID()
 	if now.After(w.updatedAt) {
 		w.updatedAt = now
 	}

@@ -739,6 +739,7 @@ func TestWorkerIndexes(t *testing.T) {
 		"wager_transactions_reversal_once_key":         "PROCESSED",
 		"outbox_unpublished_due_idx":                   "published_at IS NULL",
 		"wallet_ledger_entries_wallet_page_idx":        "created_at",
+		"wallet_ledger_entries_wallet_seq_key":         "(wallet_id, seq)",
 	}
 	for name, fragment := range want {
 		var def string

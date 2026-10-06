@@ -47,7 +47,9 @@ func newTxManagerFx(p TxManagerParams) *TxManager {
 //   - *DB (pool com OnStart = ping com retry/backoff e OnStop = Close; Ping
 //     para readiness);
 //   - *pgxpool.Pool (para repositórios que leem fora de transação);
-//   - *TxManager e Transactor (interface consumida pelos casos de uso).
+//   - *TxManager e Transactor (interface consumida pelos casos de uso);
+//   - *WalletRepository, *LedgerRepository e *WagerTransactionRepository
+//     (stateless; recebem o Querier/pgx.Tx em cada chamada).
 //
 // Depende de config.Config; *slog.Logger e *metrics.Metrics são opcionais.
 var Module = fx.Module("postgres",
@@ -55,5 +57,8 @@ var Module = fx.Module("postgres",
 		newDBWithLifecycle,
 		func(db *DB) *pgxpool.Pool { return db.Pool() },
 		fx.Annotate(newTxManagerFx, fx.As(fx.Self()), fx.As(new(Transactor))),
+		NewWalletRepository,
+		NewLedgerRepository,
+		NewWagerTransactionRepository,
 	),
 )

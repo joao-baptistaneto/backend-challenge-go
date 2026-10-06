@@ -670,3 +670,69 @@ func TestIntegrationEvents_InvalidInput(t *testing.T) {
 		t.Fatalf("zero-value MarshalJSON err = %v", err)
 	}
 }
+
+// TestWalletBalanceChanged_ABA cobre a pendência da T07: a carteira é
+// movimentada de novo e volta ao mesmo saldo (A-B-A). O saldo bate com o
+// balanceAfter do primeiro lançamento, mas a versão não. O construtor precisa
+// recusar, em vez de emitir a walletVersion errada.
+func TestWalletBalanceChanged_ABA(t *testing.T) {
+	w := walletWith(t, "100.00", "BRL", testPlayerID) // versão 3
+	first, err := w.Debit(brl(t, "10.00"), testWagerID, testEventNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := NewWalletBalanceChangedEvent(first, w, testEventMeta)
+	if err != nil {
+		t.Fatalf("event right after debit: %v", err)
+	}
+	if v := ev.Data().(WalletBalanceChangedData).WalletVersion; v != 4 {
+		t.Fatalf("walletVersion = %d, want 4", v)
+	}
+
+	// B: crédito e débito de 5.00 levam o saldo de volta a 90.00 (versão 6).
+	credit, err := w.Credit(brl(t, "5.00"), testRefWagerID, testEventNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := w.Debit(brl(t, "5.00"), testOpenTxID, testEventNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Balance() != first.BalanceAfter() || w.Version() != 6 {
+		t.Fatalf("setup: balance %s version %d", w.Balance(), w.Version())
+	}
+	for name, e := range map[string]WalletLedgerEntry{"first (A-B-A)": first, "intermediate": credit} {
+		ev, err := NewWalletBalanceChangedEvent(e, w, testEventMeta)
+		assertErrs(t, err, ErrInvalidIntegrationEvent)
+		if ev.IsInitialized() {
+			t.Fatalf("%s: event must be zero on error", name)
+		}
+	}
+	ev, err = NewWalletBalanceChangedEvent(last, w, testEventMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := ev.Data().(WalletBalanceChangedData).WalletVersion; v != 6 {
+		t.Fatalf("walletVersion = %d, want 6", v)
+	}
+
+	// Carteira reidratada no estado exato após o lançamento: a versão
+	// resultante não é provável, então também é recusada.
+	reloaded, err := RehydrateWallet(RehydrateWalletParams{
+		ID: w.ID(), PlayerID: w.PlayerID(), Balance: w.Balance(), Version: w.Version(),
+		CreatedAt: w.CreatedAt(), UpdatedAt: w.UpdatedAt(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewWalletBalanceChangedEvent(last, reloaded, testEventMeta)
+	assertErrs(t, err, ErrInvalidIntegrationEvent)
+
+	// Uma falha de Debit não altera o "último lançamento" da instância.
+	if _, err := w.Debit(brl(t, "1000.00"), testWagerID, testEventNow); !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("debit err = %v", err)
+	}
+	if _, err := NewWalletBalanceChangedEvent(last, w, testEventMeta); err != nil {
+		t.Fatalf("failed movement must not invalidate the last entry: %v", err)
+	}
+}

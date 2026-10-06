@@ -134,7 +134,7 @@ func TestModuleValidate(t *testing.T) {
 		fx.Supply(cfg),
 		metrics.Module,
 		Module,
-		fx.Invoke(func(Transactor, *TxManager, *DB) {}),
+		fx.Invoke(func(Transactor, *TxManager, *DB, *WalletRepository, *LedgerRepository, *WagerTransactionRepository) {}),
 	); err != nil {
 		t.Fatal(err)
 	}

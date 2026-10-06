@@ -227,7 +227,8 @@ type WalletBalanceChangedData struct {
 	Money         Money           `json:"money"`
 	BalanceBefore Money           `json:"balanceBefore"`
 	BalanceAfter  Money           `json:"balanceAfter"`
-	// WalletVersion é Wallet.Version() logo após o Debit/Credit (1 na abertura).
+	// WalletVersion é a versão resultante do lançamento: Wallet.Version() da
+	// instância que acabou de produzi-lo (1 na abertura).
 	WalletVersion int64 `json:"walletVersion"`
 }
 
@@ -457,11 +458,13 @@ func NewWagerTransactionPendingReferenceEvent(tx *WagerTransaction, meta EventMe
 }
 
 // NewWalletBalanceChangedEvent cria WalletBalanceChanged a partir do lançamento
-// devolvido por Wallet.Debit/Credit (ou NewWallet, na abertura) e da carteira
-// LOGO APÓS o movimento: walletVersion = wallet.Version(). Exige que o
-// lançamento seja da carteira e que o saldo atual da carteira seja o
-// balanceAfter do lançamento, o que detecta uso com carteira desatualizada ou
-// já movimentada de novo. occurredAt = CreatedAt do lançamento.
+// devolvido por Wallet.Debit/Credit (ou NewWallet, na abertura) e da MESMA
+// instância de carteira que o produziu, antes de qualquer outro movimento:
+// walletVersion = wallet.Version(). Exige que o lançamento seja o último
+// produzido por essa instância (id guardado em memória pelo agregado). Isso
+// rejeita carteira reidratada, desatualizada ou movimentada de novo, inclusive
+// no caso A-B-A em que outro movimento leva o saldo de volta ao balanceAfter do
+// lançamento e só a versão difere. occurredAt = CreatedAt do lançamento.
 func NewWalletBalanceChangedEvent(entry WalletLedgerEntry, wallet *Wallet, meta EventMetadata) (IntegrationEvent, error) {
 	const et = EventTypeWalletBalanceChanged
 	if !entry.IsInitialized() {
@@ -476,6 +479,10 @@ func NewWalletBalanceChangedEvent(entry WalletLedgerEntry, wallet *Wallet, meta 
 	if entry.BalanceAfter() != wallet.Balance() {
 		return IntegrationEvent{}, fmt.Errorf("%w: %s: wallet balance %s differs from entry balanceAfter %s (wallet must be read right after the movement)",
 			ErrInvalidIntegrationEvent, et, wallet.Balance(), entry.BalanceAfter())
+	}
+	if wallet.lastEntryID != entry.ID() {
+		return IntegrationEvent{}, fmt.Errorf("%w: %s: entry %s is not the last movement of this wallet instance (build the event right after Debit/Credit/NewWallet)",
+			ErrInvalidIntegrationEvent, et, entry.ID())
 	}
 	data := WalletBalanceChangedData{
 		WalletID:      entry.WalletID(),

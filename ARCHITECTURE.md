@@ -89,7 +89,8 @@ Regras de dependência (direção única, de fora para dentro):
   `ErrUninitializedMoney`. Erros de escala/overflow no parsing também satisfazem
   `errors.Is(err, ErrInvalidAmount)`.
 - **Persistência (T12):** `MinorUnits()` → `BIGINT`, `Currency()` → `CHAR(3)`;
-  reidratação via `FromMinorUnits`.
+  reidratação via `FromMinorUnits`. Os repositórios checam `IsValid()` antes de gravar
+  (ADR-014).
 
 ## ADR-005 — Agregado Wallet, versionamento e concorrência (T03)
 
@@ -121,7 +122,8 @@ Regras de dependência (direção única, de fora para dentro):
   lançamento registra o `now` recebido.
 - **Ledger:** todo lançamento devolvido pela Wallet é construído por `NewWalletLedgerEntry`
   (ver ADR-006). A versão da carteira após o movimento (exigida em `WalletBalanceChanged`,
-  T07) é lida de `Wallet.Version()` logo após o `Debit/Credit`.
+  T07) é lida de `Wallet.Version()` da mesma instância, logo após o `Debit/Credit`; o
+  construtor do evento confere isso pelo id do último lançamento (ADR-012).
 
 ## ADR-006 — WalletLedgerEntry imutável (T04)
 
@@ -522,7 +524,8 @@ conectados em `cmd/server` (T23); cada módulo tem teste de `fx.ValidateApp`.
 - **Índices dos workers:** `PENDING_REFERENCE` por `(next_attempt_at, id)`, `PENDING` por
   `(created_at, id)`, `(provider_id, reference_external_transaction_id)` para referências,
   outbox não publicada por `(next_attempt_at, seq)` e extrato por
-  `(wallet_id, created_at, id)`.
+  `(wallet_id, created_at, id)`. A paginação do extrato passou a usar
+  `(wallet_id, seq)` na migration 0006 (ADR-014).
 - **Erros para a T11:** CHECK → `23514`, UNIQUE → `23505`, FK → `23503`. As guardas de
   trigger usam `23001` (`restrict_violation`) com `CONSTRAINT` nomeado
   (`wallet_ledger_entries_append_only`, `wallets_version_increment`,
@@ -575,10 +578,17 @@ conectados em `cmd/server` (T23); cada módulo tem teste de `fx.ValidateApp`.
 - **Dinheiro:** sempre `{"amount":"25.00","currency":"BRL"}` (ADR-004). Os únicos números
   JSON do envelope são `version`, `walletVersion` e `attempts` (teste verifica).
 - **WalletBalanceChanged:** `walletId`, `transactionId`, `direction`, `money`,
-  `balanceBefore`, `balanceAfter`, `walletVersion`. `walletVersion = wallet.Version()`
-  lido logo após `Debit/Credit`. O construtor exige `entry.WalletID == wallet.ID` e
-  `wallet.Balance == entry.BalanceAfter`, o que recusa carteira desatualizada ou já
-  movimentada de novo.
+  `balanceBefore`, `balanceAfter`, `walletVersion`. O evento é construído com a **mesma
+  instância** de `Wallet` que produziu o lançamento, antes de qualquer outro movimento, e
+  `walletVersion = wallet.Version()`. A `Wallet` guarda só em memória o id do último
+  lançamento que produziu (`NewWallet`/`Debit`/`Credit`; `uuid.Nil` após `RehydrateWallet`),
+  e o construtor exige `entry.ID == esse id`, além de `entry.WalletID == wallet.ID` e
+  `wallet.Balance == entry.BalanceAfter`. Comparar só o saldo não bastava: no caso A-B-A
+  (outro movimento leva o saldo de volta ao mesmo valor) o saldo bate e a versão não, e o
+  evento sairia com `walletVersion` errada. Carteira reidratada, desatualizada ou
+  movimentada de novo é recusada (`TestWalletBalanceChanged_ABA`). Um `Debit/Credit` que
+  falha não altera o último lançamento. A versão não foi colocada no `WalletLedgerEntry`
+  porque ela não é persistida no ledger e a reidratação não conseguiria reproduzi-la.
 - **Dados sensíveis:** `idempotencyKey` e `requestHash` nunca entram nos eventos.
   `WagerTransactionRejected` nunca carrega `referenceTransactionId`: em
   `REFERENCE_MISMATCH` ele seria o id interno de uma transação de outra carteira/jogador
@@ -678,3 +688,99 @@ Pacote `internal/adapters/postgres` (`pool.go`, `tx.go`, `errors.go`, `module.go
   CHECK `23514`, FK `23503`, trigger `23001` com nome), retry em `40001` (SERIALIZABLE) e em
   `40P01` sem lost update, start fail-fast em `3D000` sem vazar a senha e o ciclo start/stop do
   módulo Fx sem goroutines vazadas.
+
+## ADR-014 — Repositórios de wallet, ledger e transação (T12)
+
+Pacote `internal/adapters/postgres` (`repository.go`, `wallet_repository.go`,
+`ledger_repository.go`, `wager_transaction_repository.go`) e migration
+`0006_add_wallet_ledger_entries_seq`.
+
+- **Forma:** SQL explícito com pgx, repositórios stateless (`WalletRepository`,
+  `LedgerRepository`, `WagerTransactionRepository`, providos pelo `postgres.Module`). Cada
+  método recebe o `Querier` da chamada. Dentro de `WithinTx` ele é o `pgx.Tx` do caso de
+  uso, então carteira, transação, ledger (e depois inbox/outbox) entram no mesmo commit
+  (ADR-013). Os métodos que travam linhas (`WalletRepository.GetForUpdate`,
+  `WagerTransactionRepository.GetByIDForUpdate` e `ClaimDuePendingReferences`) recusam um
+  `Querier` que não seja `pgx.Tx` (`ErrTxRequired`), porque `FOR UPDATE` em autocommit
+  solta o lock na hora.
+- **Money ↔ BIGINT + CHAR(3):** escrita por `MinorUnits()`/`Currency()` e leitura por
+  `domain.FromMinorUnits`. Todo Money passa por `IsValid()` antes de ser gravado
+  (`ErrInvalidAggregate` + `ErrUninitializedMoney`), porque os getters do zero-value não
+  devolvem erro. `balance_after` usa a moeda da operação e é `NULL` quando ausente.
+  Valores "vazios" do domínio (`""`, `uuid.Nil`, tempo zero) viram `NULL`.
+- **Leitura sempre reidrata pelo domínio** (`RehydrateWallet`,
+  `RehydrateWalletLedgerEntry`, `RehydrateWagerTransaction`), que revalida tudo: linha
+  inconsistente falha alto, sem virar dado errado.
+- **Concorrência por carteira (ADR-005):**
+  - `GetForUpdate`: `SELECT ... FROM wallets WHERE id = $1 FOR UPDATE`. Trava só a linha
+    da carteira; carteiras diferentes seguem em paralelo (teste com `lock_timeout`: a
+    mesma carteira dá `55P03`, outra carteira trava na hora). Vinte débitos concorrentes
+    terminam com saldo e versão exatos e um ledger encadeado.
+  - `Update`: `UPDATE wallets SET balance, version, updated_at WHERE id = $1 AND
+    version = $PersistedVersion`. 0 linhas ⇒ `ErrStaleWallet` (lost update detectado; nada
+    gravado; o caso de uso relê sob lock e decide de novo). Teste: dois escritores leem a
+    mesma versão sem lock; o segundo bloqueia no lock da linha, e após o commit do
+    primeiro o `WHERE version` reavaliado (READ COMMITTED) não casa.
+  - `Update` aceita exatamente **um** movimento por gravação (`Version() =
+    PersistedVersion() + 1`), espelhando o trigger `wallets_guard_update`. Sem movimento
+    (LOSS) não executa SQL. A instância não deve ser gravada duas vezes; para outro
+    movimento, releia a carteira.
+  - `Insert` só aceita carteira nova (`NewWallet`, versão 1, `PersistedVersion` 0).
+- **Ledger:** `Append` só insere; não há método de alteração (o schema também bloqueia).
+  `GetByTransaction` lê o lançamento de (carteira, transação).
+- **Paginação keyset com cursor opaco:** a ordem é a coluna `seq BIGINT GENERATED ALWAYS
+  AS IDENTITY` (migration 0006, índice único `(wallet_id, seq)`), não `(created_at, id)`.
+  `created_at` e o UUIDv7 vêm do relógio de cada instância. Com clock skew, um lançamento
+  confirmado depois de um cursor poderia ordenar antes dele e sumir da paginação. O
+  `seq` é atribuído no INSERT, e todo lançamento de uma carteira é inserido com a linha
+  dela travada até o commit. Logo, dentro da carteira, `seq` cresce na ordem de commit e
+  lançamento novo sempre aparece depois do cursor. A consulta é `WHERE wallet_id = $1 AND
+  seq > $cursor ORDER BY seq LIMIT n+1`, sem OFFSET. A linha extra decide se há
+  `NextCursor`, então a última página não devolve cursor. O cursor é base64url de
+  `[versão=1][walletId 16 bytes][seq 8 bytes]`. Ele fica preso à carteira (usado em
+  outra, dá `ErrInvalidCursor`) e não é assinado: adulterar o `seq` só desloca a leitura
+  dentro de uma carteira que o chamador já pode ler. Limites: `DefaultLedgerPageSize` =
+  50 (sugestão para o HTTP) e `MaxLedgerPageSize` = 200; fora de `[1, 200]` dá
+  `ErrInvalidPageLimit`. Teste: lançamentos com `created_at` uma ou duas horas no
+  passado, inseridos entre leituras de página, aparecem no fim, sem duplicar nem pular,
+  e a leitura paginada é igual à leitura completa.
+- **Transações:**
+  - Consultas por id, `(provider, externalTransactionId)`, `(provider,
+    idempotencyKey)` e `ListByProviderReference(provider, referenceExternalId)` (as
+    reversões existentes que o `DecideWager` recebe). Todas filtram pelo provedor, o que
+    garante o isolamento entre provedores no nível do SQL.
+  - `Insert` grava qualquer estado (PENDING, OPENING PROCESSED, rejeição já decidida).
+  - `Update` grava só as colunas de resultado e agendamento, com `WHERE id = $1 AND
+    status IN ('PENDING','PENDING_REFERENCE')`. Uma linha terminal devolve
+    `ErrTransactionFinalized` e uma inexistente devolve `ErrNotFound`. O trigger
+    `wager_transactions_guard_update` continua sendo a barreira final. Quem atualiza
+    precisa ter lido sob lock: o lock da carteira serializa as operações dela, e o
+    worker usa o lock da própria linha.
+  - `ClaimDuePendingReferences(now, limit)`: `status = 'PENDING_REFERENCE' AND
+    next_attempt_at <= now ORDER BY next_attempt_at, id LIMIT n FOR UPDATE SKIP LOCKED`,
+    com lote de 1 a 1000 (`MaxClaimBatch`). Instâncias concorrentes pegam lotes
+    disjuntos sem esperar umas pelas outras, e o lock vale até o commit, no qual o worker
+    grava o reagendamento ou a conclusão. Para a T21: a ordem de locks precisa ser
+    consistente. O worker deve travar a carteira (`GetForUpdate`) antes de mexer em
+    saldo, e um deadlock eventual (`40P01`) é retentável pelo TxManager.
+- **Erros:** as violações viram sentinelas pelo nome da constraint, preservando a causa
+  (`*ConstraintViolation`/`*pgconn.PgError` continuam na cadeia):
+  `wallets_player_currency_key` → `ErrWalletAlreadyExists`; `*_pkey` →
+  `ErrDuplicateKey`; `wager_transactions_provider_external_key` →
+  `ErrDuplicateExternalTransaction`; `wager_transactions_provider_idempotency_key` →
+  `ErrDuplicateIdempotencyKey`; `wager_transactions_opening_per_wallet_key` →
+  `ErrOpeningAlreadyExists`; `wager_transactions_reversal_once_key` →
+  `ErrReferenceAlreadyReversed`; `wager_transactions_terminal_immutable` →
+  `ErrTransactionFinalized`; `wallet_ledger_entries_wallet_transaction_key` →
+  `ErrLedgerEntryExists`. As demais passam por `Translate` (por exemplo, FK →
+  `ErrForeignKeyViolation`). `pgx.ErrNoRows` vira `ErrNotFound`. As sentinelas ficam no
+  adapter porque os casos de uso já dependem dele (`Transactor`/`pgx.Tx`, ADR-013); o
+  mapeamento para respostas HTTP e SQS é feito na T15/T18.
+- **Testes:**
+  - Unitários: cursor (round-trip e rejeições), validação antes do SQL (Money
+    zero-value, agregado não inicializado, um movimento por `Update`, `ErrTxRequired`,
+    limites) e mapeamento por nome de constraint.
+  - Integração (`-tags=integration`, banco novo por teste): CRUD de carteira e de
+    transação com round-trip exato, conflitos de unicidade, lock por carteira, lost
+    update, ledger append/duplicata/FK/atomicidade, cursor estável com clock skew e claim
+    `SKIP LOCKED` entre duas instâncias.
