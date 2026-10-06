@@ -48,6 +48,15 @@ func validEnv() map[string]string {
 		EnvSQSInboundQueueURL:          inboundURL,
 		EnvSQSInboundDLQURL:            dlqURL,
 		EnvSQSEventsQueueURL:           eventsURL,
+		EnvSQSConsumerName:             "wager-transactions-consumer",
+		EnvSQSConsumerConcurrency:      "4",
+		EnvSQSWaitTime:                 "20s",
+		EnvSQSVisibilityTimeout:        "30s",
+		EnvSQSProcessTimeout:           "15s",
+		EnvSQSRetryBaseDelay:           "1s",
+		EnvSQSRetryMaxDelay:            "5m",
+		EnvSQSDrainTimeout:             "10s",
+		EnvSQSMaxAttempts:              "3",
 		EnvOIDCIssuerURL:               issuerURL,
 		EnvOIDCAudience:                oidcAudienc,
 		EnvOIDCJWKSURL:                 jwksURL,
@@ -88,7 +97,10 @@ func TestLoadValidEnvExample(t *testing.T) {
 			Region: "us-east-1", AccessKeyID: "test", SecretAccessKey: Secret(awsSecret),
 			EndpointURL: "http://localhost:4566",
 		},
-		SQS: SQSConfig{InboundQueueURL: inboundURL, InboundDLQURL: dlqURL, EventsQueueURL: eventsURL},
+		SQS: SQSConfig{
+			InboundQueueURL: inboundURL, InboundDLQURL: dlqURL, EventsQueueURL: eventsURL,
+			Consumer: defaultSQSConsumer(),
+		},
 		OIDC: OIDCConfig{
 			IssuerURL: issuerURL, Audience: oidcAudienc, JWKSURL: jwksURL,
 			ProviderClaim: "provider_id", ProviderRole: "wager-provider", InternalRole: "wallet-internal",
@@ -119,7 +131,9 @@ func TestLoadDefaults(t *testing.T) {
 		EnvPendingReferenceMaxAttempts, EnvPendingReferenceTTL, EnvOIDCJWKSURL, EnvOIDCProviderClaim,
 		EnvOIDCProviderRole, EnvOIDCInternalRole, EnvOIDCRolesClient, EnvOIDCClockSkew,
 		EnvHTTPReadHeaderTimeout, EnvHTTPReadTimeout, EnvHTTPWriteTimeout, EnvHTTPIdleTimeout,
-		EnvHTTPDrainDelay,
+		EnvHTTPDrainDelay, EnvSQSConsumerName, EnvSQSConsumerConcurrency, EnvSQSWaitTime,
+		EnvSQSVisibilityTimeout, EnvSQSProcessTimeout, EnvSQSRetryBaseDelay, EnvSQSRetryMaxDelay,
+		EnvSQSDrainTimeout, EnvSQSMaxAttempts,
 	} {
 		delete(env, k)
 	}
@@ -152,6 +166,44 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.OIDC != wantOIDC {
 		t.Fatalf("defaults OIDC inesperados: %#v", c.OIDC)
+	}
+	if c.SQS.Consumer != defaultSQSConsumer() {
+		t.Fatalf("defaults do consumidor SQS inesperados: %#v", c.SQS.Consumer)
+	}
+}
+
+func defaultSQSConsumer() SQSConsumerConfig {
+	return SQSConsumerConfig{
+		Name: DefaultSQSConsumerName, Concurrency: DefaultSQSConsumerConcurrency,
+		WaitTime: DefaultSQSWaitTime, VisibilityTimeout: DefaultSQSVisibilityTimeout,
+		ProcessTimeout: DefaultSQSProcessTimeout, RetryBaseDelay: DefaultSQSRetryBaseDelay,
+		RetryMaxDelay: DefaultSQSRetryMaxDelay, DrainTimeout: DefaultSQSDrainTimeout,
+		MaxAttempts: DefaultSQSMaxAttempts,
+	}
+}
+
+func TestLoadSQSConsumerCustom(t *testing.T) {
+	env := validEnv()
+	env[EnvSQSConsumerName] = "consumer-b"
+	env[EnvSQSConsumerConcurrency] = "16"
+	env[EnvSQSWaitTime] = "0s"
+	env[EnvSQSVisibilityTimeout] = "2m"
+	env[EnvSQSProcessTimeout] = "90s"
+	env[EnvSQSRetryBaseDelay] = "2s"
+	env[EnvSQSRetryMaxDelay] = "2s"
+	env[EnvSQSDrainTimeout] = "500ms"
+	env[EnvSQSMaxAttempts] = "7"
+	c, err := Load(lookupFrom(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := SQSConsumerConfig{
+		Name: "consumer-b", Concurrency: 16, WaitTime: 0, VisibilityTimeout: 2 * time.Minute,
+		ProcessTimeout: 90 * time.Second, RetryBaseDelay: 2 * time.Second, RetryMaxDelay: 2 * time.Second,
+		DrainTimeout: 500 * time.Millisecond, MaxAttempts: 7,
+	}
+	if c.SQS.Consumer != want {
+		t.Fatalf("got %#v want %#v", c.SQS.Consumer, want)
 	}
 }
 
@@ -225,6 +277,26 @@ func TestLoadInvalid(t *testing.T) {
 		{"dlq igual inbound", func(e map[string]string) { e[EnvSQSInboundDLQURL] = inboundURL }, EnvSQSInboundDLQURL},
 		{"events ausente", func(e map[string]string) { delete(e, EnvSQSEventsQueueURL) }, EnvSQSEventsQueueURL},
 		{"events igual inbound", func(e map[string]string) { e[EnvSQSEventsQueueURL] = inboundURL }, EnvSQSEventsQueueURL},
+		{"sqs consumer name inválido", func(e map[string]string) { e[EnvSQSConsumerName] = "a b" }, EnvSQSConsumerName},
+		{"sqs concurrency zero", func(e map[string]string) { e[EnvSQSConsumerConcurrency] = "0" }, EnvSQSConsumerConcurrency},
+		{"sqs concurrency alta", func(e map[string]string) { e[EnvSQSConsumerConcurrency] = "101" }, EnvSQSConsumerConcurrency},
+		{"sqs wait acima de 20s", func(e map[string]string) { e[EnvSQSWaitTime] = "21s" }, EnvSQSWaitTime},
+		{"sqs wait fracionário", func(e map[string]string) { e[EnvSQSWaitTime] = "1500ms" }, EnvSQSWaitTime},
+		{"sqs visibility zero", func(e map[string]string) { e[EnvSQSVisibilityTimeout] = "0s" }, EnvSQSVisibilityTimeout},
+		{"sqs visibility acima de 12h", func(e map[string]string) { e[EnvSQSVisibilityTimeout] = "13h" }, EnvSQSVisibilityTimeout},
+		{"sqs visibility fracionária", func(e map[string]string) { e[EnvSQSVisibilityTimeout] = "30.5s" }, EnvSQSVisibilityTimeout},
+		{"sqs process zero", func(e map[string]string) { e[EnvSQSProcessTimeout] = "0s" }, EnvSQSProcessTimeout},
+		{"sqs process >= visibility", func(e map[string]string) { e[EnvSQSProcessTimeout] = "30s" }, EnvSQSProcessTimeout},
+		{"sqs retry base zero", func(e map[string]string) { e[EnvSQSRetryBaseDelay] = "0s" }, EnvSQSRetryBaseDelay},
+		{"sqs retry max < base", func(e map[string]string) {
+			e[EnvSQSRetryBaseDelay] = "10s"
+			e[EnvSQSRetryMaxDelay] = "5s"
+		}, EnvSQSRetryMaxDelay},
+		{"sqs retry max acima de 12h", func(e map[string]string) { e[EnvSQSRetryMaxDelay] = "24h" }, EnvSQSRetryMaxDelay},
+		{"sqs drain zero", func(e map[string]string) { e[EnvSQSDrainTimeout] = "0s" }, EnvSQSDrainTimeout},
+		{"sqs max attempts zero", func(e map[string]string) { e[EnvSQSMaxAttempts] = "0" }, EnvSQSMaxAttempts},
+		{"sqs max attempts acima de 999", func(e map[string]string) { e[EnvSQSMaxAttempts] = "1000" }, EnvSQSMaxAttempts},
+		{"sqs max attempts não numérico", func(e map[string]string) { e[EnvSQSMaxAttempts] = "três" }, EnvSQSMaxAttempts},
 		{"issuer ausente", func(e map[string]string) { delete(e, EnvOIDCIssuerURL) }, EnvOIDCIssuerURL},
 		{"issuer esquema", func(e map[string]string) { e[EnvOIDCIssuerURL] = "ftp://idp/realm" }, EnvOIDCIssuerURL},
 		{"issuer com credenciais", func(e map[string]string) {

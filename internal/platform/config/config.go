@@ -56,6 +56,16 @@ const (
 	EnvSQSInboundDLQURL   = "SQS_INBOUND_DLQ_URL"
 	EnvSQSEventsQueueURL  = "SQS_EVENTS_QUEUE_URL"
 
+	EnvSQSConsumerName        = "SQS_CONSUMER_NAME"
+	EnvSQSConsumerConcurrency = "SQS_CONSUMER_CONCURRENCY"
+	EnvSQSWaitTime            = "SQS_WAIT_TIME"
+	EnvSQSVisibilityTimeout   = "SQS_VISIBILITY_TIMEOUT"
+	EnvSQSProcessTimeout      = "SQS_PROCESS_TIMEOUT"
+	EnvSQSRetryBaseDelay      = "SQS_RETRY_BASE_DELAY"
+	EnvSQSRetryMaxDelay       = "SQS_RETRY_MAX_DELAY"
+	EnvSQSDrainTimeout        = "SQS_DRAIN_TIMEOUT"
+	EnvSQSMaxAttempts         = "SQS_MAX_ATTEMPTS"
+
 	EnvOIDCIssuerURL     = "OIDC_ISSUER_URL"
 	EnvOIDCAudience      = "OIDC_AUDIENCE"
 	EnvOIDCJWKSURL       = "OIDC_JWKS_URL"
@@ -101,6 +111,27 @@ const (
 	DefaultHTTPReadTimeout       = 30 * time.Second
 	DefaultHTTPWriteTimeout      = 30 * time.Second
 	DefaultHTTPIdleTimeout       = 120 * time.Second
+)
+
+// Defaults e limites do consumidor SQS (ARCHITECTURE.md, ADR-022). Os
+// limites de espera e visibilidade são os do próprio SQS.
+const (
+	DefaultSQSConsumerName        = "wager-transactions-consumer"
+	DefaultSQSConsumerConcurrency = 4
+	DefaultSQSWaitTime            = 20 * time.Second
+	DefaultSQSVisibilityTimeout   = 30 * time.Second
+	DefaultSQSProcessTimeout      = 15 * time.Second
+	DefaultSQSRetryBaseDelay      = time.Second
+	DefaultSQSRetryMaxDelay       = 5 * time.Minute
+	DefaultSQSDrainTimeout        = 10 * time.Second
+	DefaultSQSMaxAttempts         = 3
+
+	maxSQSConsumerConcurrency = 100
+	// maxSQSMaxAttempts: o maxReceiveCount do SQS vai até 1000, e o limite da
+	// aplicação precisa ser menor que ele (verificado no start do consumidor).
+	maxSQSMaxAttempts       = 999
+	maxSQSWaitTime          = 20 * time.Second
+	maxSQSVisibilityTimeout = 12 * time.Hour
 )
 
 // Defaults de autorização (ARCHITECTURE.md, ADR-019). Os nomes são os
@@ -186,10 +217,44 @@ func (c AWSConfig) HasStaticCredentials() bool {
 // adotado é o de .env.example.
 type SQSConfig struct {
 	InboundQueueURL string
-	// InboundDLQURL é opcional: o redrive para a DLQ é feito pelo próprio SQS
-	// (maxReceiveCount); a URL só é usada para observabilidade (profundidade).
+	// InboundDLQURL é opcional: o consumidor envia à DLQ da RedrivePolicy da
+	// fila de entrada (resolvida pelo ARN, ADR-022); esta URL
+	// só é usada para observabilidade (profundidade).
 	InboundDLQURL  string
 	EventsQueueURL string
+	// Consumer são os parâmetros do consumidor da fila de entrada.
+	Consumer SQSConsumerConfig
+}
+
+// SQSConsumerConfig agrupa os parâmetros do consumidor da fila de entrada
+// (ADR-022). Durações enviadas ao SQS (espera, visibilidade, backoff) são
+// segundos inteiros.
+type SQSConsumerConfig struct {
+	// Name identifica o consumidor na inbox (consumer_name).
+	Name string
+	// Concurrency é o número máximo de grupos de mensagens (MessageGroupId)
+	// processados em paralelo.
+	Concurrency int
+	// WaitTime é a espera do long polling (0s a 20s).
+	WaitTime time.Duration
+	// VisibilityTimeout é a visibilidade pedida no ReceiveMessage (1s a 12h).
+	VisibilityTimeout time.Duration
+	// ProcessTimeout limita o processamento de uma mensagem; menor que
+	// VisibilityTimeout, para que a mensagem não reapareça durante o
+	// processamento.
+	ProcessTimeout time.Duration
+	// RetryBaseDelay e RetryMaxDelay definem o backoff exponencial das falhas
+	// transitórias (ChangeMessageVisibility pelo ApproximateReceiveCount).
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+	// DrainTimeout é o prazo, no shutdown, para concluir as mensagens em
+	// processamento antes de liberá-las (visibilidade 0).
+	DrainTimeout time.Duration
+	// MaxAttempts limita as tentativas de uma mensagem com falha transitória;
+	// esgotado, o consumidor a envia à DLQ explicitamente. Precisa ser menor
+	// que o maxReceiveCount da RedrivePolicy (verificado no start do
+	// consumidor), que fica como rede de segurança.
+	MaxAttempts int
 }
 
 // OIDCConfig agrupa parâmetros do IdP (Keycloak) e do modelo de permissões
@@ -280,6 +345,8 @@ func Load(lookup LookupFunc) (Config, error) {
 	if c.SQS.InboundDLQURL != "" && c.SQS.InboundDLQURL == c.SQS.InboundQueueURL {
 		p.fail(EnvSQSInboundDLQURL, "deve ser diferente de "+EnvSQSInboundQueueURL)
 	}
+
+	c.SQS.Consumer = p.sqsConsumer()
 
 	c.OIDC.IssuerURL = p.httpURL(EnvOIDCIssuerURL, true)
 	c.OIDC.Audience = p.required(EnvOIDCAudience)
@@ -418,6 +485,52 @@ func (p *parser) durationRange(key string, def, minV, maxV time.Duration) time.D
 	}
 	if d < minV || d > maxV {
 		p.fail(key, fmt.Sprintf("deve estar entre %s e %s, recebido %q", minV, maxV, v))
+		return 0
+	}
+	return d
+}
+
+// sqsConsumer lê e valida os parâmetros do consumidor SQS.
+func (p *parser) sqsConsumer() SQSConsumerConfig {
+	var c SQSConsumerConfig
+	c.Name = p.optional(EnvSQSConsumerName)
+	if c.Name == "" {
+		c.Name = DefaultSQSConsumerName
+	} else if !IsSimpleName(c.Name) {
+		p.fail(EnvSQSConsumerName, fmt.Sprintf("nome %q inválido (1-128 caracteres [A-Za-z0-9_.:-])", c.Name))
+		c.Name = ""
+	}
+	c.Concurrency = p.intRange(EnvSQSConsumerConcurrency, DefaultSQSConsumerConcurrency, 1, maxSQSConsumerConcurrency)
+	c.WaitTime = p.wholeSeconds(EnvSQSWaitTime, DefaultSQSWaitTime, 0, maxSQSWaitTime)
+	c.VisibilityTimeout = p.wholeSeconds(EnvSQSVisibilityTimeout, DefaultSQSVisibilityTimeout, time.Second, maxSQSVisibilityTimeout)
+	c.ProcessTimeout = p.positiveDuration(EnvSQSProcessTimeout, DefaultSQSProcessTimeout)
+	c.RetryBaseDelay = p.wholeSeconds(EnvSQSRetryBaseDelay, DefaultSQSRetryBaseDelay, time.Second, maxSQSVisibilityTimeout)
+	c.RetryMaxDelay = p.wholeSeconds(EnvSQSRetryMaxDelay, DefaultSQSRetryMaxDelay, time.Second, maxSQSVisibilityTimeout)
+	c.DrainTimeout = p.positiveDuration(EnvSQSDrainTimeout, DefaultSQSDrainTimeout)
+	c.MaxAttempts = p.intRange(EnvSQSMaxAttempts, DefaultSQSMaxAttempts, 1, maxSQSMaxAttempts)
+	if c.ProcessTimeout > 0 && c.VisibilityTimeout > 0 && c.ProcessTimeout >= c.VisibilityTimeout {
+		p.fail(EnvSQSProcessTimeout, "deve ser menor que "+EnvSQSVisibilityTimeout)
+	}
+	if c.RetryBaseDelay > 0 && c.RetryMaxDelay > 0 && c.RetryMaxDelay < c.RetryBaseDelay {
+		p.fail(EnvSQSRetryMaxDelay, "não pode ser menor que "+EnvSQSRetryBaseDelay)
+	}
+	return c
+}
+
+// wholeSeconds aceita durações em segundos inteiros dentro de [minV, maxV]
+// (a API do SQS só aceita segundos inteiros).
+func (p *parser) wholeSeconds(key string, def, minV, maxV time.Duration) time.Duration {
+	v, ok := p.get(key)
+	if !ok {
+		return def
+	}
+	before := len(p.errs)
+	d := p.durationRange(key, def, minV, maxV)
+	if len(p.errs) != before {
+		return 0 // já reportado
+	}
+	if d%time.Second != 0 {
+		p.fail(key, fmt.Sprintf("deve ser um número inteiro de segundos, recebido %q", v))
 		return 0
 	}
 	return d

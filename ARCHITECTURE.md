@@ -1559,3 +1559,278 @@ T20).
   - falha do `Serve` → `Shutdown` com exit code 1;
   - `fx.ValidateApp`.
 - **Dependência nova:** `go.uber.org/goleak` (só em testes).
+
+## ADR-022 — Consumidor SQS com inbox (T20)
+
+Pacote `internal/adapters/sqs` (`envelope.go`, `consumer.go`, `client.go`, `module.go`).
+Usa `aws-sdk-go-v2/service/sqs` atrás de uma interface estreita `sqs.API`
+(`ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `GetQueueAttributes`,
+`GetQueueUrl`, `SendMessage`), que
+o `*awssqs.Client` satisfaz e os testes unitários substituem por uma fila FIFO em memória.
+
+- **Envelope** (`DecodeEnvelope`): `{messageId, type, occurredAt, data}` com
+  `type = "WagerTransactionRequested"`. Reaproveita `internal/adapters/strictjson`
+  (ADR-020), então as regras são as do corpo HTTP: chaves com caixa exata, sem chaves
+  desconhecidas ou repetidas, Money só como strings (`ParseNonNegative`), UUIDs canônicos e
+  nada depois do objeto. `data` tem os campos do HTTP mais `idempotencyKey` (usada como
+  recebida, nunca recalculada) e `providerId`. O `kind` passa por
+  `domain.ParseExternalWagerKind`, então **`OPENING` é inválido** (`INVALID_KIND`).
+  `messageId` e `idempotencyKey`: 1..255 bytes, UTF-8, sem controle e sem espaço nas pontas.
+  Corpo até 64 KiB. Os demais identificadores são validados pelo domínio no caso de uso,
+  com os mesmos códigos do HTTP. O hash de idempotência é o mesmo do HTTP (ADR-010): a
+  mesma operação por HTTP e por SQS é replay, não duplicata.
+- **Comando.** `CorrelationID = CausationID = messageId` do envelope (vai para os eventos
+  e logs) e `Inbox{ConsumerName: SQS_CONSUMER_NAME, MessageID: messageId}`. A identidade
+  durável é o `messageId` **do envelope**, não o `MessageId` do SQS (que muda a cada envio).
+  O `providerId` vem do envelope: o acesso à fila é controlado pelas credenciais e
+  políticas do broker (T24), e o domínio continua validando provedor, carteira, jogador e
+  referência.
+- **Inbox na mesma transação.** O consumidor só chama `ProcessWagerTransaction.Execute`.
+  Registro da inbox, efeitos financeiros, ledger, outbox e `Inbox.Complete` entram no
+  mesmo commit (ADR-017). Uma reentrega depois do commit encontra a inbox `COMPLETED` e
+  devolve o replay sem tocar na carteira. O mesmo `messageId` com outro conteúdo é
+  `MESSAGE_CONFLICT`.
+- **Destino de cada mensagem:**
+
+  | Situação | Ação | Resultado |
+  |---|---|---|
+  | `PROCESSED`, `REJECTED` (regra de negócio), `PENDING_REFERENCE`, replay | `DeleteMessage` **depois** do commit | Removida |
+  | Envelope inválido (JSON, tipo, `OPENING`, Money...) | `SendMessage` na DLQ e então `DeleteMessage` | DLQ explícita (`invalid_message`), 1ª entrega |
+  | `app.KindInvalidInput` / `app.KindConflict` (`MESSAGE_CONFLICT`, `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`) | `SendMessage` na DLQ e então `DeleteMessage` | DLQ explícita (`permanent_error`), 1ª tentativa |
+  | `app.KindUnavailable`, `ProcessTimeout` estourado, erro sem classe | `ChangeMessageVisibility(backoff)` | Retry; esgotado `SQS_MAX_ATTEMPTS`, DLQ explícita (`max_receives`) |
+  | Falha no `SendMessage` à DLQ | `ChangeMessageVisibility(backoff)`, não apaga | Retry do envio (transitório) |
+  | Shutdown (contexto do processamento cancelado) | visibilidade 0 | Reentrega imediata |
+
+  - **Rejeição de negócio é terminal e persistida** (estado + `failureCode` + evento):
+    a mensagem é apagada e não vai à DLQ. `PENDING_REFERENCE` também é apagada: a
+    pendência já está persistida e o worker de referências (T21) assume (README §6.5).
+  - **Inválidas, permanentes e transitórias esgotadas vão à DLQ por envio explícito.**
+    *Por quê (achado da avaliação):* a primeira versão deixava o redrive nativo mover a
+    mensagem (visibilidade 0 até passar de `maxReceiveCount`). Mas cada `ReceiveMessage`
+    na fila FIFO incrementa o `ApproximateReceiveCount` também das seguintes do mesmo
+    grupo que vieram no lote e foram devolvidas sem processar. A venenosa gastava
+    exatamente `maxReceiveCount` recebimentos, as seguintes subiam junto e o redrive as
+    movia também: uma mensagem **válida** ia para a DLQ sem ser processada (grupo
+    `["not json", válida]`, `maxReceiveCount=2` → DLQ = as duas). Folga no
+    `maxReceiveCount` não resolve, porque os contadores andam juntos.
+    *Como:* o consumidor copia a mensagem para a DLQ (`SendMessage`) e **só depois do
+    envio confirmado** a apaga da fila de entrada. Nenhum recebimento extra é gasto e o
+    grupo não fica bloqueado: as seguintes do mesmo lote são processadas em seguida, na
+    mesma goroutine e em ordem. A cópia preserva:
+    - o corpo original, byte a byte;
+    - o `MessageGroupId` (ou `dlq-ungrouped`, se não houver);
+    - um `MessageDeduplicationId` determinístico (`sha256(fila de origem, MessageId do
+      SQS)`), estável entre reentregas da mesma mensagem;
+    - `MessageAttributes` com `dlqReason` (`invalid_message`, `permanent_error`,
+      `max_receives`), `dlqCode`, `dlqField` (caminho do campo, nunca o nome de chave
+      desconhecida nem valores), `sourceQueue`, `sourceMessageId`, `envelopeMessageId`,
+      `receiveCount`, `attempts` e `consumerName`.
+
+    Nenhuma escrita acontece no banco (a validação ocorre antes da transação, e
+    conflitos fazem rollback, inclusive da inbox). Falhas:
+    - `SendMessage` falhou → transitório: a mensagem **não** é apagada, volta com
+      backoff e o envio é repetido; o grupo é interrompido.
+    - Envio confirmado mas `DeleteMessage` falhou → a original reaparece ao fim da
+      visibilidade e o reenvio é deduplicado pela DLQ FIFO (janela de 5 min; depois
+      dela, no pior caso, uma cópia duplicada na DLQ, inofensiva para reprocessamento
+      manual porque a inbox/idempotência absorvem). O grupo é interrompido para que as
+      seguintes não passem à frente dela.
+  - **Transitório:** backoff `SQS_RETRY_BASE_DELAY · 2^(tentativa−1)`, com teto
+    `SQS_RETRY_MAX_DELAY` (segundos inteiros, até 12h), aplicado via
+    `ChangeMessageVisibility`. Esgotadas `SQS_MAX_ATTEMPTS` tentativas (ou no último
+    recebimento antes do redrive nativo, `ApproximateReceiveCount >= maxReceiveCount`), a
+    mensagem vai à DLQ explicitamente, com o código (`TEMPORARILY_UNAVAILABLE`,
+    `PROCESS_TIMEOUT`, `UNCLASSIFIED_ERROR`...). Erro sem classe (bug, falha permanente de
+    infraestrutura) também é tratado como transitório: esgota as tentativas e chega à
+    DLQ, em vez de ser descartado.
+  - **Tentativa ≠ `ApproximateReceiveCount`.** A tentativa é o `ApproximateReceiveCount`
+    menos os recebimentos que a própria instância devolveu sem tentar processar
+    (seguintes de um grupo interrompido, shutdown, falha na renovação da visibilidade).
+    Esse desconto fica num mapa local por `MessageId` do SQS (`releaseTracker`,
+    limitado a 10 000 entradas, poda por idade de 1h, apagado no delete). Assim a
+    seguinte de uma transitória que esgotou não herda as tentativas dela: ainda tem
+    `SQS_MAX_ATTEMPTS` tentativas próprias (limitadas pelo redrive nativo, abaixo).
+    Depois de um reinício, ou em outra instância, o desconto se perde e vale a contagem
+    bruta. Isso é conservador: a mensagem pode ir à DLQ mais cedo, nunca ficar em retry
+    sem fim. Por isso o estado do retry continua sobrevivendo a reinícios e troca de
+    instância.
+  - **Delete que falha depois do commit** só gera log: a mensagem reaparece ao fim da
+    visibilidade, a inbox devolve o replay e então ela é apagada.
+- **RedrivePolicy obrigatória; o redrive nativo é só rede de segurança.** No `Start`, o
+  consumidor faz três coisas, com retry até o prazo do OnStart (fila inexistente é erro
+  imediato):
+  1. Lê a `RedrivePolicy` da fila e falha o start se ela não existir ou não tiver
+     `deadLetterTargetArn` (ARN de SQS) e `maxReceiveCount >= 1` (`ErrNoRedrivePolicy`).
+  2. Exige `SQS_MAX_ATTEMPTS < maxReceiveCount` (`ErrMaxAttemptsTooHigh`). Senão o redrive
+     nativo moveria a mensagem antes do envio explícito (sem motivo nos atributos).
+  3. Resolve a URL da DLQ com `GetQueueUrl` (nome e conta do ARN). Os envios vão para
+     essa DLQ, a da `RedrivePolicy`. Se `SQS_INBOUND_DLQ_URL` apontar para outra fila, um
+     aviso é logado; ela continua servindo só para a profundidade
+     (`wallet_dlq_depth_messages`, lida a cada 30s).
+
+  O redrive nativo continua configurado para o que a aplicação não cobre:
+  - crash ou kill repetido no meio do processamento;
+  - `SendMessage` à DLQ falhando por muito tempo;
+  - um envelope que derruba o processo.
+
+  `wallet_dlq_messages_total{reason}` conta os envios explícitos confirmados (os
+  movimentos do redrive nativo não são observáveis pela aplicação; a profundidade da DLQ
+  os inclui).
+- **Risco residual para seguintes (documentado).**
+  - Garantido: uma única mensagem venenosa (inválida, `OPENING`, permanente de negócio,
+    conflito) **nunca** leva uma válida do mesmo grupo à DLQ. Ela sai na primeira
+    tentativa e as seguintes nem são devolvidas.
+  - Transitória que esgota: as seguintes do lote são devolvidas a cada falha, então
+    chegam com até `SQS_MAX_ATTEMPTS` recebimentos. Isso fica abaixo de
+    `maxReceiveCount` (garantido no start), e o desconto local evita que herdem as
+    tentativas.
+  - O que ainda pode levar uma válida ao redrive nativo é acumular `maxReceiveCount`
+    recebimentos sem desconto. Exemplos: várias transitórias longas em sequência no mesmo
+    grupo com reinícios entre elas; shutdowns repetidos com a mensagem recebida e
+    liberada; falha prolongada da DLQ.
+  - Mitigação: `maxReceiveCount` com folga sobre `SQS_MAX_ATTEMPTS` (recomendado 5 para
+    o default 3; mais em ambientes com deploys frequentes).
+  - Mesmo nesses casos a mensagem não é perdida: fica na DLQ para reprocessamento, e a
+    inbox/idempotência tornam a reinjeção segura.
+- **Limites e visibilidade** (config, ADR-007; novos campos em `config.SQSConsumerConfig`):
+
+  | Variável | Default | Regra |
+  |---|---|---|
+  | `SQS_CONSUMER_NAME` | `wager-transactions-consumer` | nome simples; é o `consumer_name` da inbox |
+  | `SQS_CONSUMER_CONCURRENCY` | 4 | 1..100 grupos em paralelo por instância |
+  | `SQS_WAIT_TIME` | 20s | long polling, 0..20s |
+  | `SQS_VISIBILITY_TIMEOUT` | 30s | 1s..12h, pedido em cada `ReceiveMessage` |
+  | `SQS_PROCESS_TIMEOUT` | 15s | `< SQS_VISIBILITY_TIMEOUT` |
+  | `SQS_RETRY_BASE_DELAY` / `SQS_RETRY_MAX_DELAY` | 1s / 5m | `base <= max <= 12h` |
+  | `SQS_DRAIN_TIMEOUT` | 10s | prazo de drenagem no shutdown |
+  | `SQS_MAX_ATTEMPTS` | 3 | 1..999; tentativas de uma falha transitória antes da DLQ explícita; `< maxReceiveCount` (checado no start) |
+
+  O `maxReceiveCount` é da fila (provisionamento, T24); o valor recomendado é 5 (folga
+  de 2 sobre `SQS_MAX_ATTEMPTS`). O
+  processamento de uma mensagem nunca passa de `SQS_PROCESS_TIMEOUT`, que é menor que a
+  visibilidade. Antes de processar uma mensagem que esperou atrás de outras do mesmo grupo
+  no lote, o consumidor **renova a visibilidade** se o que resta não cobre um
+  processamento completo. Assim ela não reaparece para outra instância durante o
+  trabalho. Se reaparecer mesmo assim, a inbox serializa as duas entregas: uma processa e
+  a outra recebe o replay.
+- **Ordem FIFO e concorrência.** `MessageGroupId` recomendado = `walletId` (ordem por
+  carteira e paralelismo entre carteiras). `MessageDeduplicationId` recomendado =
+  `messageId` do envelope (deduplicação de 5 min do SQS). Nenhum dos dois é necessário
+  para a correção: a inbox, a idempotência por chave e o lock da carteira valem sem eles.
+  - Um laço de recebimento só pede mensagens quando há vaga (`MaxNumberOfMessages` =
+    vagas livres, até 10).
+  - O lote é agrupado por `MessageGroupId`, e cada grupo vai para **uma** goroutine que
+    processa em ordem. Grupos diferentes rodam em paralelo até
+    `SQS_CONSUMER_CONCURRENCY`.
+  - Uma mensagem enviada à DLQ (e apagada) conta como concluída: o grupo segue.
+  - Se uma mensagem do grupo não for concluída (retry transitório, falha no envio à
+    DLQ, shutdown), as seguintes do mesmo lote **não** são processadas e voltam com
+    visibilidade 0. Enquanto a anterior estiver em voo, o SQS FIFO não entrega o grupo,
+    e quando ela reaparece vem antes das outras.
+  - Essas devoluções incrementam o `ApproximateReceiveCount` das seguintes. Elas são
+    descontadas da tentativa (acima), e o efeito no redrive nativo está em "Risco
+    residual".
+  - Entre lotes não há bloqueio local: o próprio SQS segura o grupo enquanto houver
+    mensagem dele em voo. Como nenhum lock é global, outras carteiras seguem
+    normalmente.
+- **Shutdown (OnStop).**
+  1. Para de buscar: o contexto do long polling é cancelado, e a chamada em curso
+     retorna na hora.
+  2. As mensagens em processamento terminam (commit + delete) até `SQS_DRAIN_TIMEOUT`
+     ou o prazo do ctx do OnStop. As recebidas e ainda não iniciadas são liberadas com
+     `ChangeMessageVisibility(0)`.
+  3. Estourado o prazo, o contexto do processamento é cancelado (rollback). As mensagens
+     interrompidas também são liberadas com visibilidade 0, e o Stop devolve
+     `ErrDrainTimeout`.
+  4. O Stop sempre espera todas as goroutines do consumidor, salvo se o próprio ctx do
+     OnStop vencer.
+
+  Uma resposta de `ReceiveMessage` perdida pelo cancelamento só atrasa as mensagens até
+  o fim da visibilidade, sem risco: elas não foram processadas.
+- **Fx.**
+  - `ClientModule` provê `*sqs.Client` e `sqs.API`. O cliente tem transporte HTTP
+    próprio, e o OnStop fecha as conexões ociosas. Como é construído antes de quem o
+    usa, ele para depois deles. `BaseEndpoint = AWS_ENDPOINT_URL` (LocalStack).
+    Credenciais estáticas, quando configuradas, evitam qualquer chamada de rede na
+    construção.
+  - `ConsumerModule` provê o `*Consumer` (OnStart inicia o laço em goroutine, OnStop
+    drena) e contribui a verificação `sqs` (`GetQueueAttributes` na fila de entrada; DOWN
+    durante a parada) ao grupo `readinessChecks` (ADR-020).
+  - `sqs.Module` = os dois mais `*app.ProcessWagerTransaction` como `WagerProcessor`. O
+    consumidor depende do caso de uso, que depende do pool, logo para antes do pool.
+- **Logs e métricas sem payload.** Os logs JSON levam `sqsMessageId`, `messageId`,
+  `correlationId`, `providerId`, `walletId`, `transactionId`, `kind`, `status`,
+  `failureCode`, `receiveCount` e o código/campo do erro. **Nunca** levam o corpo, o valor
+  de um campo inválido ou o nome de uma chave desconhecida. As métricas usam os rótulos
+  fechados de `platform/metrics`:
+  - `wager_transactions_total{source="sqs"}`;
+  - `duplicates_total` (`inbox_redelivery` quando um replay chega em reentrega,
+    `idempotent_replay` na primeira entrega, `idempotency_conflict`);
+  - `retries_total{operation="sqs_consume"}`;
+  - `dlq_messages_total{reason}`;
+  - `dlq_depth_messages`;
+  - `processing_duration_seconds{source="sqs",operation="sqs_consume"}`.
+- **Testes.**
+  - **Unitários** (`go test -race`, `goleak.VerifyTestMain`, fila FIFO em memória com
+    visibilidade, `ApproximateReceiveCount`, bloqueio por grupo, redrive nativo,
+    `GetQueueUrl` e `SendMessage` na DLQ FIFO com deduplicação):
+    - envelope válido e 35 formas inválidas, sem ecoar valores;
+    - delete após o resultado (inclusive rejeição, pendência e replay), com o comando
+      montado com inbox, correlation e causation;
+    - inválidas (inclusive `OPENING`) vão à DLQ por envio explícito na 1ª entrega, sem
+      chegar ao caso de uso, com corpo, grupo e atributos (motivo, código, campo);
+    - conflitos e entrada inválida vão à DLQ na 1ª tentativa;
+    - backoff 1/2/4s com teto;
+    - transitórios esgotados (`SQS_MAX_ATTEMPTS`) vão à DLQ com o código (indisponível,
+      erro sem classe, prazo), antes do `maxReceiveCount`;
+    - **válidas atrás de venenosa no mesmo grupo** (JSON inválido, `OPENING`, permanente
+      de negócio, conflito; `maxReceiveCount=2`, o cenário do achado) são processadas em
+      ordem e apagadas, e só a venenosa vai à DLQ;
+    - válidas atrás de transitória que esgota são processadas, e a falha transitória de
+      uma delas é a tentativa 1 (não herda as devoluções);
+    - falha no envio à DLQ é transitória (não apaga; backoff; o grupo espera);
+    - delete falho após o envio: reenvio deduplicado, uma única cópia na DLQ;
+    - start exige `SQS_MAX_ATTEMPTS < maxReceiveCount` e resolve a DLQ pela
+      `RedrivePolicy` (retry; fila inexistente falha na hora);
+    - `releaseTracker` (contagem, esquecimento, poda e limite);
+    - ordem no grupo sob falha;
+    - paralelismo entre grupos (barreira) e sequência dentro do grupo;
+    - limite de concorrência;
+    - drenagem no shutdown, com liberação das seguintes do grupo e nenhum receive
+      depois do Stop;
+    - prazo de drenagem com liberação (visibilidade 0);
+    - cancelamento do long polling;
+    - delete que falha leva a replay;
+    - retry do receive;
+    - renovação de visibilidade;
+    - `RedrivePolicy` obrigatória;
+    - validação da configuração;
+    - `fx.ValidateApp` e ciclo Fx do módulo.
+  - **Integração** (`-tags=integration`, `consumer_integration_test.go`; LocalStack via
+    `SQS_ENDPOINT`/`AWS_ENDPOINT_URL` e PostgreSQL via `TEST_DATABASE_URL` ou
+    testcontainers; pulados sem LocalStack). Cada teste cria filas FIFO exclusivas com
+    redrive:
+    - processamento, com saldo, ledger, inbox e eventos com correlation/causation =
+      `messageId`;
+    - reentrega sem efeito: mesma mensagem duas vezes e outra mensagem com a mesma
+      chave. Mesmo `messageId` com outro conteúdo vai à DLQ;
+    - rejeição persistida e removida;
+    - inválidas na DLQ (JSON, `OPENING`, valor zero, tipo), sem transação nem inbox,
+      lidas da DLQ com grupo preservado e `dlqReason`/`dlqCode`/`receiveCount=1`;
+    - válidas atrás de venenosas no mesmo grupo (`maxReceiveCount=2`): processadas em
+      ordem, só as venenosas na DLQ;
+    - shutdown gracioso com a mensagem em voo concluída e apagada;
+    - prazo estourado: rollback, mensagem liberada e reprocessada uma única vez por
+      outra instância;
+    - composição Fx real (`postgres.Module` + `app.Module` + `sqs.Module`) sem
+      vazamento de goroutines (`goleak.VerifyNone` dentro do teste).
+
+    Vazamentos com a tag: o `TestMain` de integração roda todos os testes do pacote
+    (unitários e de integração) e, ao fim, falha se sobrar goroutine criada por eles
+    (`goleak.Find` com `IgnoreCurrent` tirado antes de `m.Run`, `runWithLeakCheck`).
+    Nesta máquina há PostgreSQL (`TEST_DATABASE_URL`), mas não há Docker nem
+    LocalStack. Os testes de integração do SQS compilam (`go vet -tags=integration`) e
+    são pulados. O comportamento está provado pelos testes unitários com `-race`.
+- **Para a T23:** compor `config.Module`, `postgres.Module`, `app.Module` e `sqs.Module`.
+  Usar `fx.StopTimeout` > `SHUTDOWN_TIMEOUT` (HTTP) + `SQS_DRAIN_TIMEOUT` + folga para os
+  releases (5s por chamada): o Fx não espera um OnStop além do seu prazo.
