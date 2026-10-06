@@ -37,6 +37,12 @@ const (
 	EnvLogLevel        = "LOG_LEVEL"
 	EnvShutdownTimeout = "SHUTDOWN_TIMEOUT"
 
+	EnvHTTPReadHeaderTimeout = "HTTP_READ_HEADER_TIMEOUT"
+	EnvHTTPReadTimeout       = "HTTP_READ_TIMEOUT"
+	EnvHTTPWriteTimeout      = "HTTP_WRITE_TIMEOUT"
+	EnvHTTPIdleTimeout       = "HTTP_IDLE_TIMEOUT"
+	EnvHTTPDrainDelay        = "HTTP_DRAIN_DELAY"
+
 	EnvDatabaseURL            = "DATABASE_URL"
 	EnvDatabaseMaxConns       = "DATABASE_MAX_CONNS"
 	EnvDatabaseConnectTimeout = "DATABASE_CONNECT_TIMEOUT"
@@ -84,6 +90,17 @@ const (
 	// exp/nbf/iat: uma tolerância grande estende a vida útil de tokens
 	// expirados.
 	maxOIDCClockSkew = 2 * time.Minute
+	// maxHTTPDrainDelay limita a espera entre readiness DOWN e o Shutdown do
+	// servidor HTTP (ADR-021).
+	maxHTTPDrainDelay = time.Minute
+)
+
+// Defaults do servidor HTTP (ARCHITECTURE.md, ADR-021).
+const (
+	DefaultHTTPReadHeaderTimeout = 5 * time.Second
+	DefaultHTTPReadTimeout       = 30 * time.Second
+	DefaultHTTPWriteTimeout      = 30 * time.Second
+	DefaultHTTPIdleTimeout       = 120 * time.Second
 )
 
 // Defaults de autorização (ARCHITECTURE.md, ADR-019). Os nomes são os
@@ -103,6 +120,7 @@ var ErrInvalidConfig = errors.New("configuração inválida")
 // devolvida por Load, é tratada como imutável (passada por valor).
 type Config struct {
 	App      AppConfig
+	HTTP     HTTPConfig
 	Database DatabaseConfig
 	AWS      AWSConfig
 	SQS      SQSConfig
@@ -116,6 +134,25 @@ type AppConfig struct {
 	HTTPAddr        string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
+}
+
+// HTTPConfig agrupa os timeouts do http.Server e a espera de drenagem
+// (ADR-021). O endereço fica em AppConfig.HTTPAddr e o prazo total de parada
+// em AppConfig.ShutdownTimeout.
+type HTTPConfig struct {
+	// ReadHeaderTimeout limita a leitura dos cabeçalhos (mitiga Slowloris).
+	ReadHeaderTimeout time.Duration
+	// ReadTimeout limita a leitura da requisição inteira (cabeçalhos + corpo).
+	ReadTimeout time.Duration
+	// WriteTimeout limita o tempo entre o fim da leitura dos cabeçalhos e o
+	// fim da escrita da resposta; precisa cobrir o handler mais lento.
+	WriteTimeout time.Duration
+	// IdleTimeout limita conexões keep-alive ociosas.
+	IdleTimeout time.Duration
+	// DrainDelay é a espera entre /health/ready passar a DOWN e o fechamento
+	// do listener, para o balanceador retirar a instância antes. 0 = sem
+	// espera. Consome o orçamento de SHUTDOWN_TIMEOUT.
+	DrainDelay time.Duration
 }
 
 // DatabaseConfig agrupa parâmetros do PostgreSQL. URL contém credenciais e por
@@ -207,6 +244,20 @@ func Load(lookup LookupFunc) (Config, error) {
 	c.App.HTTPAddr = p.listenAddr(EnvHTTPAddr, ":8080")
 	c.App.LogLevel = p.logLevel(EnvLogLevel, slog.LevelInfo)
 	c.App.ShutdownTimeout = p.positiveDuration(EnvShutdownTimeout, 15*time.Second)
+
+	c.HTTP.ReadHeaderTimeout = p.positiveDuration(EnvHTTPReadHeaderTimeout, DefaultHTTPReadHeaderTimeout)
+	c.HTTP.ReadTimeout = p.positiveDuration(EnvHTTPReadTimeout, DefaultHTTPReadTimeout)
+	c.HTTP.WriteTimeout = p.positiveDuration(EnvHTTPWriteTimeout, DefaultHTTPWriteTimeout)
+	c.HTTP.IdleTimeout = p.positiveDuration(EnvHTTPIdleTimeout, DefaultHTTPIdleTimeout)
+	c.HTTP.DrainDelay = p.durationRange(EnvHTTPDrainDelay, 0, 0, maxHTTPDrainDelay)
+	if c.HTTP.ReadHeaderTimeout > 0 && c.HTTP.ReadTimeout > 0 && c.HTTP.ReadHeaderTimeout > c.HTTP.ReadTimeout {
+		p.fail(EnvHTTPReadHeaderTimeout, "não pode ser maior que "+EnvHTTPReadTimeout)
+	}
+	// A espera de drenagem consome o prazo total de parada; sem folga, o
+	// Shutdown não teria tempo de drenar nada e cairia sempre no Close.
+	if c.HTTP.DrainDelay > 0 && c.App.ShutdownTimeout > 0 && c.HTTP.DrainDelay >= c.App.ShutdownTimeout {
+		p.fail(EnvHTTPDrainDelay, "deve ser menor que "+EnvShutdownTimeout)
+	}
 
 	c.Database.URL = p.postgresURL(EnvDatabaseURL)
 	c.Database.MaxConns = int32(p.intRange(EnvDatabaseMaxConns, 20, 1, maxDatabaseConns))

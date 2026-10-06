@@ -11,7 +11,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 )
 
-// HandlerName é o nome Fx do http.Handler da API (o servidor da T19 o
+// HandlerName é o nome Fx do http.Handler da API (o httpserver.Module o
 // recebe por este nome).
 const HandlerName = "apiHandler"
 
@@ -59,7 +59,7 @@ func NewHandlerFx(p Params) (http.Handler, error) {
 // Module provê o http.Handler nomeado "apiHandler". Depende dos casos de
 // uso (app.Module), de *auth.Authenticator e *auth.Authorizer (auth.Module);
 // métricas, logger, MetricsAccess e verificações de prontidão são opcionais.
-// O servidor e seu ciclo de vida são da T19.
+// O servidor e seu ciclo de vida ficam em httpserver.Module (T19, ADR-021).
 var Module = fx.Module("http",
 	fx.Provide(fx.Annotate(NewHandlerFx, fx.ResultTags(`name:"`+HandlerName+`"`))),
 )

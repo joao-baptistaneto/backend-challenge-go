@@ -1470,7 +1470,7 @@ T20).
   - **opcionais:** `*metrics.Metrics`, `metricsHandler`, `MetricsAccess`, logger e o grupo
     de readiness.
 
-  O servidor (listen/shutdown) é da T19.
+  O servidor (listen/shutdown) é o `httpserver.Module` da T19 (ADR-021).
 - **Testes** (`go test -race`, sem banco):
   - **Contrato por `httptest`.** Rodam os casos de uso **reais** sobre uma `UnitOfWork`
     em memória (`memstore_test.go`) e verificam status, código e formato de cada rota.
@@ -1488,3 +1488,74 @@ T20).
     claim.
   - **Falsos.** Os tokens do autenticador falso montam o `Principal` com papéis
     ordenados, porque `HasRole` usa busca binária.
+
+## ADR-021 — Servidor HTTP com fx.Lifecycle e parada graciosa (T19)
+
+- **Pacote.** `internal/adapters/http/server` (package `httpserver`). Ele fica separado de
+  `httpadapter` por dois motivos. Os testes de lifecycle usam `goleak.VerifyTestMain`
+  sem a carga dos testes de contrato da API. E os testes de handler não precisam de
+  `config.Config`. O pacote recebe o `http.Handler` nomeado `apiHandler` (ADR-020) e não
+  conhece rotas.
+- **Start (OnStart).** O listen é **síncrono** (`net.ListenConfig.Listen` com o ctx do
+  OnStart): uma porta ocupada faz o `app.Start` falhar com `listen HTTP em "<addr>"`, e
+  a instância não fica "de pé" sem servir. Só o `Serve` roda em goroutine. Se o `Serve`
+  terminar com erro que não seja `http.ErrServerClosed` (por exemplo, o listener morreu),
+  o servidor loga ERROR e chama `fx.Shutdowner.Shutdown(fx.ExitCode(1))`. Assim o
+  processo não continua vivo sem a API.
+- **Stop (OnStop)**, nesta ordem:
+  1. **Readiness DOWN.** `*Drain` é um sinal atômico compartilhado. O módulo contribui a
+     verificação `http-server` ao grupo `readinessChecks` (ADR-020). Depois de
+     `Drain.Begin()`, `/health/ready` responde 503 enquanto o listener ainda aceita
+     conexões.
+  2. **Espera `HTTP_DRAIN_DELAY`** (default `0s`, de 0 a 1m) para o balanceador retirar a
+     instância antes de o listener fechar. No compose local o valor 0 basta. Atrás de
+     um balanceador com health check, use alguns segundos.
+  3. **`http.Server.Shutdown(ctx)`.** Fecha o listener, de modo que novas conexões são
+     recusadas. Fecha também as conexões keep-alive ociosas e espera as requisições em
+     voo terminarem. A conexão de uma requisição em voo é fechada logo depois da
+     resposta.
+  4. **Prazo estourado → `Close` forçado.** O contexto-base das requisições
+     (`BaseContext`) é cancelado e `Close` derruba as conexões restantes. Handlers que
+     respeitam `r.Context()`, como os casos de uso via pgx, abortam e a transação faz
+     rollback. O Stop devolve um erro que envolve `ErrForcedClose`, e o Fx o loga.
+  5. Espera a goroutine do `Serve` terminar, para não deixar goroutine para trás
+     (goleak).
+- **Prazo.** `SHUTDOWN_TIMEOUT` (default 15s) é o orçamento **total** do Stop do
+  servidor, já com a espera de drenagem. Por isso `HTTP_DRAIN_DELAY < SHUTDOWN_TIMEOUT`,
+  validado na config. Vale o prazo que vencer antes: `SHUTDOWN_TIMEOUT` ou o deadline do
+  ctx do OnStop. **Nota para a T23:** quando o ctx do OnStop vence, o Fx devolve
+  `ctx.Err()` por conta própria e pode abandonar o hook. A composição deve então usar
+  `fx.StopTimeout` maior que `SHUTDOWN_TIMEOUT` mais o tempo de parada dos workers.
+- **Timeouts do `http.Server`** (config, ADR-007):
+
+  | Variável | Default |
+  |---|---|
+  | `HTTP_READ_HEADER_TIMEOUT` | 5s |
+  | `HTTP_READ_TIMEOUT` | 30s |
+  | `HTTP_WRITE_TIMEOUT` | 30s |
+  | `HTTP_IDLE_TIMEOUT` | 120s |
+
+  Todos precisam ser positivos, porque zero no net/http significa "sem limite". Também
+  se exige `READ_HEADER <= READ`. O `ReadHeaderTimeout` mitiga Slowloris. O
+  `WriteTimeout` precisa cobrir o handler mais lento: o pior caso hoje é o retry de
+  serialização do caso de uso somado ao readiness, de 2s por verificação. O `ErrorLog`
+  do servidor vai para o slog em WARN.
+- **Ordem de parada.** O Fx executa os OnStop na ordem inversa dos OnStart. O servidor
+  depende, via handler, dos casos de uso, e estes do pool e dos clients. Logo ele inicia
+  depois e para antes deles: as requisições em voo drenam com o banco ainda aberto.
+- **Fx.** `httpserver.Module` provê `*Drain`, a `ReadinessCheck` `http-server` (grupo) e
+  `*Server`. O `*Server` já tem o hook registrado e é forçado por `fx.Invoke`. O módulo
+  depende de `config.Config` e do `apiHandler`, e o logger é opcional.
+- **Testes** (`go test -race`, `goleak.VerifyTestMain` + `goleak.VerifyNone` por teste,
+  porta efêmera `127.0.0.1:0`, Fx real via `fxtest`):
+  - start/stop sem vazamento;
+  - porta ocupada falha o start;
+  - requisição em voo é **drenada** durante o stop, e o stop só termina após a resposta;
+  - conexões novas e keep-alive ociosas são **recusadas** após o início do stop;
+  - com `DrainDelay`, `/health/ready` passa a 503 com o servidor ainda atendendo;
+  - prazo estourado (por `SHUTDOWN_TIMEOUT` ou pelo ctx) → `ErrForcedClose`, contexto da
+    requisição cancelado;
+  - `ReadHeaderTimeout` efetivo contra cliente lento;
+  - falha do `Serve` → `Shutdown` com exit code 1;
+  - `fx.ValidateApp`.
+- **Dependência nova:** `go.uber.org/goleak` (só em testes).

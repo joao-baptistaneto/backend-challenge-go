@@ -33,6 +33,11 @@ func validEnv() map[string]string {
 		EnvHTTPAddr:                    ":8080",
 		EnvLogLevel:                    "info",
 		EnvShutdownTimeout:             "15s",
+		EnvHTTPReadHeaderTimeout:       "5s",
+		EnvHTTPReadTimeout:             "30s",
+		EnvHTTPWriteTimeout:            "30s",
+		EnvHTTPIdleTimeout:             "120s",
+		EnvHTTPDrainDelay:              "0s",
 		EnvDatabaseURL:                 validDBURL,
 		EnvDatabaseMaxConns:            "20",
 		EnvDatabaseConnectTimeout:      "30s",
@@ -72,6 +77,10 @@ func TestLoadValidEnvExample(t *testing.T) {
 	}
 	want := Config{
 		App: AppConfig{Env: "local", HTTPAddr: ":8080", LogLevel: slog.LevelInfo, ShutdownTimeout: 15 * time.Second},
+		HTTP: HTTPConfig{
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+			WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second,
+		},
 		Database: DatabaseConfig{
 			URL: Secret(validDBURL), MaxConns: 20, ConnectTimeout: 30 * time.Second,
 		},
@@ -109,6 +118,8 @@ func TestLoadDefaults(t *testing.T) {
 		EnvSQSInboundDLQURL, EnvOutboxPollInterval, EnvOutboxBatchSize, EnvOutboxLease,
 		EnvPendingReferenceMaxAttempts, EnvPendingReferenceTTL, EnvOIDCJWKSURL, EnvOIDCProviderClaim,
 		EnvOIDCProviderRole, EnvOIDCInternalRole, EnvOIDCRolesClient, EnvOIDCClockSkew,
+		EnvHTTPReadHeaderTimeout, EnvHTTPReadTimeout, EnvHTTPWriteTimeout, EnvHTTPIdleTimeout,
+		EnvHTTPDrainDelay,
 	} {
 		delete(env, k)
 	}
@@ -126,6 +137,13 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.AWS.HasStaticCredentials() || c.AWS.EndpointURL != "" || c.SQS.InboundDLQURL != "" {
 		t.Fatalf("opcionais deveriam estar vazios: %#v", c)
+	}
+	wantHTTP := HTTPConfig{
+		ReadHeaderTimeout: DefaultHTTPReadHeaderTimeout, ReadTimeout: DefaultHTTPReadTimeout,
+		WriteTimeout: DefaultHTTPWriteTimeout, IdleTimeout: DefaultHTTPIdleTimeout,
+	}
+	if c.HTTP != wantHTTP {
+		t.Fatalf("defaults HTTP inesperados: %#v", c.HTTP)
 	}
 	wantOIDC := OIDCConfig{
 		IssuerURL: issuerURL, Audience: oidcAudienc, ProviderClaim: DefaultOIDCProviderClaim,
@@ -169,6 +187,20 @@ func TestLoadInvalid(t *testing.T) {
 		{"shutdown malformado", func(e map[string]string) { e[EnvShutdownTimeout] = "15" }, EnvShutdownTimeout},
 		{"shutdown zero", func(e map[string]string) { e[EnvShutdownTimeout] = "0s" }, EnvShutdownTimeout},
 		{"shutdown negativo", func(e map[string]string) { e[EnvShutdownTimeout] = "-1s" }, EnvShutdownTimeout},
+		{"http read header malformado", func(e map[string]string) { e[EnvHTTPReadHeaderTimeout] = "5" }, EnvHTTPReadHeaderTimeout},
+		{"http read zero", func(e map[string]string) { e[EnvHTTPReadTimeout] = "0s" }, EnvHTTPReadTimeout},
+		{"http write negativo", func(e map[string]string) { e[EnvHTTPWriteTimeout] = "-1s" }, EnvHTTPWriteTimeout},
+		{"http idle zero", func(e map[string]string) { e[EnvHTTPIdleTimeout] = "0s" }, EnvHTTPIdleTimeout},
+		{"http header maior que read", func(e map[string]string) {
+			e[EnvHTTPReadHeaderTimeout] = "10s"
+			e[EnvHTTPReadTimeout] = "5s"
+		}, EnvHTTPReadHeaderTimeout},
+		{"http drain negativo", func(e map[string]string) { e[EnvHTTPDrainDelay] = "-1s" }, EnvHTTPDrainDelay},
+		{"http drain acima do máximo", func(e map[string]string) { e[EnvHTTPDrainDelay] = "2m" }, EnvHTTPDrainDelay},
+		{"http drain não menor que shutdown", func(e map[string]string) {
+			e[EnvHTTPDrainDelay] = "15s"
+			e[EnvShutdownTimeout] = "15s"
+		}, EnvHTTPDrainDelay},
 		{"db url ausente", func(e map[string]string) { delete(e, EnvDatabaseURL) }, EnvDatabaseURL},
 		{"db url esquema", func(e map[string]string) { e[EnvDatabaseURL] = "mysql://u:p@h/db" }, EnvDatabaseURL},
 		{"db url sem host", func(e map[string]string) { e[EnvDatabaseURL] = "postgres:///db" }, EnvDatabaseURL},
