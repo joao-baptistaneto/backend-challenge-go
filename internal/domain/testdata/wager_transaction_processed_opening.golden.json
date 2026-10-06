@@ -1,0 +1,24 @@
+{
+  "eventId": "0192f2b0-0000-7000-8000-000000000001",
+  "eventType": "WagerTransactionProcessed",
+  "aggregateId": "0192f298-0000-7e38-af88-e43f851a8190",
+  "correlationId": "corr-open-1",
+  "occurredAt": "2026-10-05T12:00:00Z",
+  "version": 1,
+  "data": {
+    "transactionId": "0192f298-0000-7e38-af88-e43f851a8190",
+    "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+    "kind": "OPENING",
+    "origin": "INTERNAL",
+    "status": "PROCESSED",
+    "money": {
+      "amount": "1000.00",
+      "currency": "BRL"
+    },
+    "balanceAfter": {
+      "amount": "1000.00",
+      "currency": "BRL"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+# Binários e artefatos de build
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Ambiente local (nunca versionar segredos)
+.env
+.env.*
+!.env.example
+
+# IDE / SO
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

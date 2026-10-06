@@ -1,0 +1,680 @@
+# ARCHITECTURE
+
+Registro das decisões arquiteturais do serviço de carteira (desafio Junglegaming).
+Cada decisão traz contexto, escolha e consequências. Atualizado a cada tarefa.
+
+## ADR-001 — Módulo, versão Go e dependências base (T01)
+
+- **Módulo:** `github.com/junglegaming/backend-challenge-go` (mesmo path do repositório).
+- **Versão Go:** diretiva `go 1.25.0` no `go.mod` (mínimo exigido pelas versões atuais de
+  `golang.org/x/*` puxadas pelas dependências). Toolchain local usada: go1.27.
+- **Dependências base** (versões fixadas em `go.mod`/`go.sum`, ambos versionados):
+  - `go.uber.org/fx` — composição/DI e ciclo de vida (OnStart/OnStop).
+  - `github.com/jackc/pgx/v5` (+ `pgxpool`) — PostgreSQL com SQL explícito.
+  - `github.com/aws/aws-sdk-go-v2/service/sqs` + `config` — SQS (LocalStack local).
+  - `github.com/google/uuid` — identidades internas.
+  - `github.com/coreos/go-oidc/v3` — validação de tokens OIDC do IdP externo (Keycloak).
+  - `github.com/prometheus/client_golang` — métricas.
+- **Fixação antes do uso:** `tools.go` (build tag `tools`, raiz do módulo) importa as
+  dependências com `_` para que `go mod tidy` não as remova enquanto ainda não são usadas
+  pelo código de produção. Não entra no binário. Cada import deve ser removido quando a
+  dependência passar a ser usada diretamente.
+
+## ADR-002 — Layout de pacotes (hexagonal / ports & adapters) (T01)
+
+```
+cmd/server/                 composição Fx (main) — único lugar que conhece todos os módulos
+internal/domain/            modelo puro: Money, Wallet, ledger, WagerTransaction, regras
+internal/app/               casos de uso + portas (interfaces de repositório, tx, publisher)
+internal/adapters/http/     handlers net/http (package httpadapter, evita colisão com net/http)
+internal/adapters/postgres/ repositórios pgx, gerenciador de transações
+internal/adapters/sqs/      consumidor de entrada e publisher da outbox
+internal/adapters/auth/     verificação OIDC e autorização
+internal/platform/config/   configuração por variáveis de ambiente
+internal/platform/logging/  slog JSON
+internal/platform/metrics/  registro Prometheus
+```
+
+Regras de dependência (direção única, de fora para dentro):
+
+- `domain` não importa nada de `app`, `adapters`, `platform`, Fx, pgx, SQS ou HTTP.
+- `app` depende apenas de `domain` e de interfaces que ele mesmo declara.
+- `adapters/*` implementam as portas de `app`; `platform/*` provê infraestrutura transversal.
+- Apenas `cmd/server` e os arquivos `module.go` de adapters/platform conhecem Fx
+  (`fx.Module`, `fx.Provide`, `fx.Invoke`).
+
+## ADR-003 — Ferramentas de build e verificação (T01)
+
+- `Makefile`: `build`, `run`, `test`, `test-race`, `test-integration` (build tag
+  `integration`, containers reais), `vet`, `fmt`, `fmt-check`, `tidy`, `check`
+  (`fmt-check` + `vet` + `test-race`).
+- `-race` exige cgo (gcc). Em máquinas Windows sem gcc, `make test-race-docker` executa
+  `go test -race` dentro de `golang:1.25`.
+- `cmd/server` expõe `appOptions()` para que testes validem o grafo com `fx.ValidateApp`
+  e exercitem Start/Stop sem bloquear em `Run()`.
+- `.env.example` lista as variáveis previstas (HTTP, PostgreSQL, SQS/LocalStack, OIDC,
+  workers) com valores locais de exemplo, sem segredos reais; `.env` é ignorado pelo git.
+  A validação dessas variáveis é responsabilidade de `platform/config` (T09).
+
+## ADR-004 — Representação de Money (T02)
+
+- **Escolha:** `int64` em unidades mínimas (centavos, escala fixa 2) + `Currency` (código
+  ISO 4217 alfabético). Sem biblioteca decimal e sem ponto flutuante: o parsing é feito
+  dígito a dígito sobre a string, e a formatação usa divisão/resto inteiros
+  (`internal/domain/money.go`).
+- **Limites:** `[-92233720368547758.08, 92233720368547758.07]` (`math.MinInt64` /
+  `math.MaxInt64` centavos). Parsing, `Add`, `Sub` e `Neg` detectam overflow e retornam
+  `ErrMoneyOverflow` (ex.: `Neg` de `MinInt64`), nunca fazem wrap-around.
+- **Moedas:** apenas códigos de três letras maiúsculas numa lista de moedas cujo expoente
+  ISO 4217 é 2 (BRL, USD, EUR, ...). JPY/KWD etc. são rejeitadas porque a escala é fixa.
+  Não há normalização de caixa (`"brl"` é inválido).
+- **Gramática do valor:** `["-"] ("0" | [1-9][0-9]*) ["." [0-9]{1,2}]`. Rejeita vazio,
+  `NaN`, `Infinity`, notação científica, `+`, espaços, zeros à esquerda, `.5`, `5.`,
+  separadores, `-0` e escala > 2 (sem arredondamento: `ErrAmountScale`).
+- **Normalização (relevante para o hash de idempotência, T08):** `"25"`, `"25.5"` e
+  `"25.50"` são aceitos e equivalentes; a forma canônica é `Amount()` com exatamente duas
+  casas (`"25.50"`). O hash deve usar a forma canônica, não a string recebida.
+- **Sinal:** `Parse` aceita negativos, pois Money também representa diferenças internas
+  (reconciliação). Entradas financeiras externas usam `ParseNonNegative`
+  (`ErrNegativeAmount`). A não negatividade do saldo é regra da Wallet e do schema.
+- **Imutabilidade e zero-value:** campos privados; operações devolvem novos valores. O
+  zero-value (`Money{}`, moeda vazia) é "não inicializado": `Add/Sub/Neg/Cmp/MarshalJSON`
+  retornam `ErrUninitializedMoney` e os predicados `IsZero/IsPositive/IsNegative` retornam
+  `false`. Aritmética/comparação entre moedas diferentes retorna `ErrCurrencyMismatch`.
+- **JSON:** contrato `{"amount":"25.00","currency":"BRL"}`. O unmarshal é estrito:
+  `amount` precisa ser string JSON (número é rejeitado, evitando que `encoding/json` o
+  interprete como ponto flutuante), campos desconhecidos/ausentes e `null` são rejeitados.
+- **Erros:** sentinelas compatíveis com `errors.Is`: `ErrInvalidAmount`, `ErrAmountScale`,
+  `ErrMoneyOverflow`, `ErrNegativeAmount`, `ErrInvalidCurrency`, `ErrCurrencyMismatch`,
+  `ErrUninitializedMoney`. Erros de escala/overflow no parsing também satisfazem
+  `errors.Is(err, ErrInvalidAmount)`.
+- **Persistência (T12):** `MinorUnits()` → `BIGINT`, `Currency()` → `CHAR(3)`;
+  reidratação via `FromMinorUnits`.
+
+## ADR-005 — Agregado Wallet, versionamento e concorrência (T03)
+
+- **Construção separada:** `NewWallet(NewWalletParams)` abre a carteira e `RehydrateWallet(RehydrateWalletParams)`
+  reconstrói a partir do banco validando invariantes (ids não nulos, saldo inicializado e
+  `>= 0`, versão `>= 1`, `createdAt <= updatedAt`) sem efeitos colaterais. `Wallet{}`/`nil`
+  é "não inicializada" (`ErrUninitializedWallet`). IDs de carteira, jogador, transação e
+  lançamento são `uuid.UUID` (UUIDv7 recomendado: ordenável no tempo, favorece keyset).
+- **Abertura:** a versão inicial é `1`. Com saldo inicial `> 0`, `NewWallet` exige o id da
+  transação `OPENING` e devolve o lançamento `CREDIT` de abertura (0 → saldo inicial) **sem**
+  incrementar a versão. Com saldo zero, nenhum lançamento é devolvido (sem OPENING/ledger/eventos).
+- **Movimentos:** `Debit/Credit(money, txID, now)` são o único caminho para alterar saldo;
+  validam carteira inicializada, Money inicializado (`ErrInvalidAmount`+`ErrUninitializedMoney`),
+  moeda (`ErrCurrencyMismatch`), valor `> 0` (`ErrInvalidAmount`; negativo também
+  `ErrNegativeAmount`), `txID` e instante (`ErrInvalidMovement`), saldo não negativo
+  (`ErrInsufficientFunds`) e overflow (`ErrMoneyOverflow`). Em sucesso, incrementam a versão
+  em exatamente 1 e devolvem o `WalletLedgerEntry`; em erro, o agregado fica intacto.
+  `LOSS` e rejeições não chamam o agregado, logo não alteram a versão. A distinção
+  `INSUFFICIENT_FUNDS` × `REVERSAL_INSUFFICIENT_FUNDS` é feita pela camada de regras (T06),
+  ambas a partir de `ErrInsufficientFunds`.
+- **Concorrência:** o agregado não é thread-safe; vive dentro de uma transação SQL. A
+  coordenação é por carteira, no banco (T12): `SELECT ... FOR UPDATE` da linha (pessimista)
+  e `UPDATE ... SET balance, version WHERE id = $1 AND version = PersistedVersion()`
+  (otimista, defesa em profundidade). 0 linhas afetadas ⇒ escrita concorrente ⇒ retry
+  limitado; nenhuma atualização confirmada é descartada. `PersistedVersion()` é a versão
+  lida em `RehydrateWallet` (0 para carteira criada por `NewWallet`, que é inserida).
+- **Tempo:** `now` é injetado e normalizado para UTC; `updatedAt` é monotônico
+  (`max(updatedAt, now)`) para tolerar pequenas diferenças de relógio entre instâncias; o
+  lançamento registra o `now` recebido.
+- **Ledger:** todo lançamento devolvido pela Wallet é construído por `NewWalletLedgerEntry`
+  (ver ADR-006). A versão da carteira após o movimento (exigida em `WalletBalanceChanged`,
+  T07) é lida de `Wallet.Version()` logo após o `Debit/Credit`.
+
+## ADR-006 — WalletLedgerEntry imutável (T04)
+
+- **Local:** `internal/domain/ledger_entry.go` (`LedgerDirection`, `WalletLedgerEntry`,
+  `ErrInvalidLedgerEntry`).
+- **Imutabilidade:** campos privados; apenas getters com receptor por valor
+  (`ID/WalletID/TransactionID/Direction/Amount/BalanceBefore/BalanceAfter/CreatedAt` e
+  `IsInitialized`). Sem setters; o tipo não contém ponteiros/slices, então cópias são
+  independentes. Um teste por reflexão fixa o conjunto de métodos. Correções exigem novos
+  lançamentos; a proibição de `UPDATE/DELETE` no banco é do schema (T10).
+- **Construção separada:** `NewWalletLedgerEntry(NewWalletLedgerEntryParams)` para movimentos
+  novos (usado por `Wallet.Debit/Credit` e pela abertura) e
+  `RehydrateWalletLedgerEntry(RehydrateWalletLedgerEntryParams)` para linhas lidas do banco.
+  Ambas aplicam as **mesmas** invariantes (função interna única): a reidratação não confia
+  no banco, e dados persistidos inconsistentes falham com erro marcado `rehydrate ledger
+  entry <id>`, em vez de alimentar reconciliação/paginação com valores errados.
+- **Invariantes (`ErrInvalidLedgerEntry`, mais o sentinela de Money aplicável):** ids de
+  lançamento/carteira/transação não nulos; direção exatamente `DEBIT|CREDIT` (sensível a
+  caixa); `amount`, `balanceBefore`, `balanceAfter` inicializados (`ErrUninitializedMoney`)
+  e na mesma moeda (`ErrCurrencyMismatch`); `amount > 0` (`ErrInvalidAmount`; negativo
+  também `ErrNegativeAmount`) — `LOSS` e rejeições não geram lançamento; saldos `>= 0`
+  (`ErrNegativeAmount`); `balanceAfter = balanceBefore + amount` (CREDIT) ou `- amount`
+  (DEBIT), com overflow detectado (`ErrMoneyOverflow`); `createdAt` não zero, normalizado
+  para UTC. Em erro, devolve o zero-value (`IsInitialized() == false`).
+
+## ADR-007 — Config, logging JSON e métricas (T09)
+
+Pacotes `internal/platform/{config,logging,metrics}`, cada um com um `fx.Module`. Ainda não
+conectados em `cmd/server` (T23); cada módulo tem teste de `fx.ValidateApp`.
+
+- **Config (`config.Module` → `config.Config`):** somente variáveis de ambiente, com os nomes
+  exatos de `.env.example`. `Load(lookup)` recebe a função de lookup (testável sem tocar no
+  ambiente) e `LoadFromEnv` usa `os.LookupEnv`. A validação roda no construtor, ou seja,
+  durante `fx.New`: config inválida impede o start antes de abrir qualquer conexão. Os erros
+  são agregados (`errors.Join`), prefixados pelo nome da variável e envolvem
+  `ErrInvalidConfig`. São obrigatórias as variáveis que identificam recursos externos
+  (`DATABASE_URL`, `AWS_REGION`, `SQS_INBOUND_QUEUE_URL`, `SQS_EVENTS_QUEUE_URL`,
+  `OIDC_ISSUER_URL`, `OIDC_AUDIENCE`), para que um deploy mal configurado nunca aponte
+  silenciosamente para localhost. As demais têm defaults iguais aos de `.env.example`. Regras:
+  filas precisam ser FIFO (`*.fifo`) e distintas entre si; durações > 0;
+  `OUTBOX_LEASE > OUTBOX_POLL_INTERVAL`; credenciais AWS estáticas são informadas juntas ou
+  omitidas (nesse caso vale a cadeia padrão do SDK); URLs que não são segredo não podem ter
+  userinfo.
+- **Segredos:** `config.Secret` (`DATABASE_URL`, `AWS_SECRET_ACCESS_KEY`) imprime
+  `[REDACTED]` em todo verbo válido do fmt (`fmt.Formatter`: `%v/%+v/%#v/%s/%q/%d/%x/...`,
+  com largura e flags, inclusive aninhado em `Config`/`*Config`), em slog (`LogValuer`) e em
+  JSON/texto. Exceção: `%p` e `%w` fora de `Errorf` são verbos inválidos que o fmt resolve
+  sem consultar métodos, e nesses casos o valor bruto sai. Só o `%w` é acusado pelo `go vet`
+  (printf). O `%p` aplicado direto a um `Secret` passa no vet, porque o analisador aceita
+  qualquer verbo para um tipo que implementa `fmt.Formatter`; esse uso fica a cargo da revisão.
+  Outro caso de borda: `Secret` como chave de map. O `encoding/json` usa o valor bruto de
+  chaves de tipo string sem consultar `MarshalText`, então `json.Marshal(map[Secret]T)` vaza.
+  No logger isso é coberto, porque a redação consulta `MarshalText` antes e a chave sai
+  mascarada. Fora do logger, não use `Secret` como chave.
+  O valor real só sai por `Reveal()`, então os pontos de uso podem ser auditados com grep.
+  Os erros de validação nunca ecoam o valor de uma variável sensível. Em URLs inválidas não
+  sensíveis, o erro ecoa só scheme+host+path: userinfo, query e fragment são descartados.
+- **Fila de eventos:** `.env.example` usa `wallet-events.fifo` e `task_plan.md` (T24) cita
+  `wager-events.fifo`. Fica valendo o nome de `.env.example`. O código só exige uma URL FIFO,
+  então a escolha está na configuração e no provisionamento (T24), não no código.
+- **Logging (`logging.Module` → `*slog.Logger`, depende de `config.Config`):** `log/slog`
+  com `JSONHandler` em stdout, nível vindo de `LOG_LEVEL` e atributos fixos `service`/`env`.
+  As chaves de rastreio são `correlationId`, `messageId`, `transactionId`, `walletId` e
+  `providerId`, fornecidas por helpers de atributo (`logging.WalletID(id)`, ...) ou propagadas
+  pelo `context` (`logging.WithCorrelationID(ctx, id)`, ...). O handler injeta esses IDs na
+  raiz do JSON em todo log `*Context(ctx, ...)`, mesmo quando o logger usa `WithGroup`.
+  Redação em profundidade (`logging/redact.go`) com estas garantias:
+  (1) chave sensível (senha, token, secret, authorization, cookie, dsn, credenciais,
+  signature, payload/body etc., normalizada e por sufixo) tem o valor inteiro trocado por
+  `[REDACTED]` em qualquer nível: atributo, grupo, chave de map, campo de struct (nome Go ou
+  tag json), membro de `LogValuer` em grupo e parâmetro de query/fragment de URL.
+  (2) Todo valor `KindAny` (map, slice/array, struct, ponteiro, `http.Header`, `url.URL`,
+  `error`, `json.Marshaler`, `TextMarshaler`, `LogValuer`) é percorrido recursivamente e
+  vira uma árvore já redigida. A recursão tem limite de profundidade (ciclos viram
+  `[TRUNCATED]`), e um panic de terceiros dá falha fechada (`[REDACTED]`). Números de
+  `json.Marshaler` são preservados exatos.
+  (3) Toda string, incluindo `msg` e o texto de erros, passa por limpeza textual: valor que é
+  inteiro um header `Bearer`/`Basic` (qualquer whitespace) vira `[REDACTED]`; `Bearer <token>`
+  e `Basic <credencial>` no meio do texto, senha/userinfo de URLs, query sensível e pares
+  `chave=valor`, `chave: valor`, `"chave":"valor"` e `\"chave\":\"valor\"` (JSON escapado
+  dentro de uma string) com chave sensível têm só o trecho trocado. Como efeito colateral
+  aceito, a palavra seguinte a "basic" em prosa também é trocada. `[]byte` com UTF-8 válido
+  sai como string limpa (não base64), e `[]byte` binário sai só como `[N bytes]`.
+  Limites: um segredo em texto livre, sem chave nem prefixo reconhecível, não é detectável.
+  JSON escapado em mais de um nível (`\\\"chave\\\"`) não é reconhecido.
+  Por isso `config.Secret` continua sendo a primeira barreira. Payloads completos não são
+  logados (README §12). O logger global não é alterado (nada de
+  `slog.SetDefault`). `logging.FxEventLogger()` envia os eventos do Fx para o mesmo logger e
+  deve ser usado no nível raiz em T23. `logging.WithOutput(w)` troca o destino em testes.
+- **Métricas (`metrics.Module` → `*Metrics`, `*prometheus.Registry` também como
+  `Registerer`/`Gatherer`, `http.Handler` nomeado `metricsHandler`):** usam um registry
+  próprio, nunca o global, com coletores de Go/processo registrados explicitamente. Assim
+  vários apps no mesmo processo (testes multi-instância) não colidem, e o registro devolve
+  erro em vez de panic. Namespace `wallet`, cobrindo cada item da T09/README §12:
+  `wager_transactions_total{source,type,status}`, `duplicates_total{source,kind}`,
+  `retries_total{operation}`, `dlq_messages_total{reason}`, `dlq_depth_messages{queue}`,
+  `concurrency_conflicts_total{kind}`, `outbox_pending_events`,
+  `outbox_oldest_pending_age_seconds`, `outbox_publish_delay_seconds`,
+  `processing_duration_seconds{source,operation,outcome}`,
+  `http_request_duration_seconds{method,route,code}`, `reconciliations_total{outcome}` e
+  `reconciliation_divergences_total{currency}`. A cardinalidade é limitada pelo próprio
+  código (`metrics/labels.go`), não pela disciplina de quem chama. Os métodos auxiliares
+  normalizam cada rótulo contra um conjunto fechado e mandam o desconhecido para `other`:
+  `source`, `kind`, `operation`, `outcome` e `reason` pelas constantes do pacote; `type`
+  (OPENING, BET, WIN, LOSS, REFUND, ROLLBACK), `status` (PENDING, PENDING_REFERENCE,
+  PROCESSED, REJECTED, FAILED) e `currency` (BRL, USD, EUR, GBP, CAD, AUD, CHF, MXN, ARS, COP,
+  PEN, UYU) por cópias locais das listas do domínio, porque platform não importa domain.
+  `method` aceita só os métodos padrão e o resto vira `OTHER`. `code` fica em 100–599 ou
+  `unknown`. `route` e `queue` são fechados por registro explícito (`AllowRoutes`, com os
+  templates do roteador, e `AllowQueues`), que o adapter faz na inicialização. A allowlist
+  tem teto de 256 entradas, e rota/fila não registrada (inclusive 404) vira `other`. IDs
+  (carteira, transação, mensagem) vão para os logs, nunca para rótulos. Os campos `*Vec`
+  continuam exportados, mas incrementá-los direto contorna a normalização, então adapters
+  devem usar os métodos auxiliares.
+- **Sem float monetário em métricas:** as amostras Prometheus são `float64`, então nenhum valor
+  monetário é exportado. A divergência de reconciliação é contada em ocorrências, e a diferença
+  exata (Money) fica na resposta da API e no log. `float64` aparece só em segundos e contagens.
+
+## ADR-008 — WagerTransaction e máquina de estados (T05)
+
+- **Local:** `internal/domain/wager_transaction.go` (`WagerKind`, `WagerOrigin`, `WagerStatus`,
+  `FailureCode`/`FailureCategory`, `WagerTransaction`). Só lógica pura: a decisão de débito,
+  crédito e reversão é da T06, a persistência da T10/T12 e a orquestração da T15/T21.
+- **Origem:** `OPENING` é a única operação `INTERNAL`. `BET/WIN/LOSS/REFUND/ROLLBACK` são
+  `EXTERNAL`. A origem é derivada do tipo (`WagerKind.Origin()`), e a reidratação rejeita
+  combinações divergentes. O schema (T10) deve persistir `origin` e usar CHECKs: em `INTERNAL`,
+  provedor, ID externo, chave, hash, rodada, jogo e referências ficam `NULL` e o tipo é
+  `OPENING`; em `EXTERNAL`, esses campos são `NOT NULL` (a referência é opcional).
+- **Construção:**
+  - `NewExternalWagerTransaction(NewExternalWagerTransactionParams)` cria a transação em
+    `PENDING`. `OPENING` é rejeitado com `ErrOpeningNotExternal`, que também é
+    `ErrInvalidWagerKind`, ou seja, `INVALID_KIND`. `ParseExternalWagerKind` aplica a mesma
+    regra ao campo `kind` de HTTP/SQS e é sensível a caixa.
+  - `NewOpeningWagerTransaction(NewOpeningWagerTransactionParams)` cria a transação já em
+    `PROCESSED`, com `balanceAfter = amount`, porque a abertura é confirmada no mesmo commit
+    da carteira e não tem estado intermediário observável. Seu ID é o
+    `OpeningTransactionID` passado a `NewWallet`. Com saldo zero nada é criado (o construtor
+    rejeita `0.00`).
+  - `RehydrateWagerTransaction(RehydrateWagerTransactionParams)` não transiciona nada e
+    revalida tudo. Dado persistido inconsistente devolve `ErrCorruptedWagerTransaction`,
+    que é erro interno e nunca código de entrada.
+  - Construtores, reidratação e transições usam a mesma função `validate()`, então as
+    invariantes nunca divergem.
+- **Máquina de estados** (`CanTransitionWagerStatus`):
+
+  | De \ Para | PENDING_REFERENCE | PROCESSED | REJECTED | FAILED |
+  | --- | --- | --- | --- | --- |
+  | `PENDING` | `MarkPendingReference` | `MarkProcessed` | `Reject` | `Fail` |
+  | `PENDING_REFERENCE` | `RescheduleReferenceRetry` | `MarkProcessed` | `Reject` | `Fail` |
+
+  `PROCESSED`, `REJECTED` e `FAILED` são terminais e não aceitam transição
+  (`ErrWagerTransactionTerminal`, que também é `ErrWagerTransitionNotAllowed`). Não existe
+  aresta de volta para `PENDING`: o worker resolve a referência a partir de
+  `PENDING_REFERENCE` na mesma transação SQL. Cada transição muta uma cópia, revalida e só
+  então substitui o receptor, de modo que um erro deixa a transação intacta. `updatedAt` é
+  monotônico e `completedAt` é igual a `updatedAt` na transição terminal.
+- **Transitório x permanente:** falha transitória (timeout, serialização, deadlock, conexão)
+  **não** vira estado. Ela faz rollback e é refeita por retry da aplicação, por reentrega SQS
+  ou pelo worker, de modo que o registro permanece `PENDING`/`PENDING_REFERENCE` ou nem é
+  criado. `FAILED` é reservado à falha permanente de infraestrutura que esgotou as tentativas
+  e exige código da categoria `INFRASTRUCTURE` (`PROCESSING_FAILED`, `RETRIES_EXHAUSTED`).
+  `REJECTED` exige código `INPUT` ou `BUSINESS`.
+- **Política de zero:** `LOSS` exige exatamente `0.00`. `BET/WIN/REFUND/ROLLBACK/OPENING`
+  exigem `> 0`. Negativo e Money não inicializado são sempre rejeitados (`ErrInvalidAmount`
+  junto com `ErrNegativeAmount`/`ErrUninitializedMoney`).
+- **Referências:** `REFUND/ROLLBACK` exigem `referenceExternalTransactionId`
+  (`ErrReferenceRequired`). `WIN` aceita a referência como opcional. `BET/LOSS` não aceitam
+  (`ErrReferenceNotAllowed`), e a autorreferência também é recusada.
+  `ReferenceTransactionID` (a referência interna resolvida) é obrigatório em `PROCESSED`
+  quando há referência externa, opcional em `REJECTED`/`PENDING_REFERENCE` e proibido sem
+  referência externa. `PENDING_REFERENCE` só é permitido com referência externa.
+- **Retomada durável:**
+  - `attempts` (`int32` → `INTEGER`) conta **somente** as buscas de referência sem sucesso.
+    `MarkPendingReference` registra a primeira (attempts = 1) e cada
+    `RescheduleReferenceRetry` soma 1. Consequências validadas no domínio (inclusive na
+    reidratação): `attempts > 0` exige `referenceExternalTransactionId` e é proibido em
+    `PENDING` (não há aresta de volta para `PENDING`). BET, LOSS, WIN sem referência e
+    OPENING têm sempre `attempts = 0`. O schema (T10) deve espelhar com
+    `CHECK (attempts = 0 OR (reference_external_transaction_id IS NOT NULL AND status <> 'PENDING'))`.
+  - `nextAttemptAt` é obrigatório em `PENDING_REFERENCE`, opcional em `PENDING` e é zerado em
+    estado terminal. `attempts` é mantido para auditoria. A retomada de `PENDING` órfão (T21)
+    usa apenas `nextAttemptAt`/lease e **não** consome `attempts`; se a T21 precisar limitar
+    retomadas de órfãos, usará um contador próprio, não este.
+  - O backoff e o limite de tentativas/TTL são política da aplicação (T21): ao esgotar, ela
+    chama `Reject(REFERENCE_NOT_FOUND)`.
+- **Resultado para replay:** `balanceAfter` é obrigatório em `PROCESSED` (em `LOSS`, é o
+  saldo inalterado), opcional em `REJECTED` (saldo observado) e proibido nos demais estados.
+  Precisa estar na moeda da operação e ser `>= 0`.
+- **Identificadores externos:** não são normalizados (sem trim nem mudança de caixa), porque
+  a mesma string entra no hash (T08) e nas chaves únicas. Precisam ser não vazios, ter no
+  máximo `MaxWagerIdentifierLength` = 255 bytes e não podem ter espaço nas bordas nem
+  caracteres de controle. `requestHash` tem exatamente 64 caracteres hex minúsculos
+  (SHA-256, T08).
+- **FailureCodes** (contrato público estável, `AllFailureCodes()`):
+
+  | Categoria | Códigos |
+  | --- | --- |
+  | `INPUT` (corrigível: o provedor corrige e envia uma nova operação) | `INVALID_REQUEST`, `INVALID_KIND`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH`, `CURRENCY_MISMATCH`, `REFERENCE_MISMATCH`, `AMOUNT_MISMATCH` |
+  | `BUSINESS` (definitivo) | `INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_REVERSIBLE`, `REFERENCE_NOT_PROCESSED`, `ALREADY_REVERSED` |
+  | `INFRASTRUCTURE` (só `FAILED`) | `PROCESSING_FAILED`, `RETRIES_EXHAUSTED` |
+
+  Restrições validadas pelo domínio:
+  - Códigos de referência (`REFERENCE_NOT_FOUND`, `REFERENCE_MISMATCH`,
+    `REFERENCE_NOT_REVERSIBLE`, `REFERENCE_NOT_PROCESSED`, `ALREADY_REVERSED`,
+    `AMOUNT_MISMATCH`) exigem referência externa.
+  - `INSUFFICIENT_FUNDS` só vale para `BET`.
+  - `REVERSAL_INSUFFICIENT_FUNDS` só vale para `ROLLBACK`, o único tipo de reversão que pode
+    debitar.
+  - `ALREADY_REVERSED` e `AMOUNT_MISMATCH` só valem para reversões.
+  - `REFERENCE_NOT_FOUND` não pode coexistir com `referenceTransactionId` resolvido (a
+    referência nunca foi encontrada). Os demais códigos de referência podem registrar a
+    referência resolvida.
+
+  `REFERENCE_MISMATCH` cobre divergência de provedor, jogador, carteira ou rodada.
+  `REFERENCE_NOT_PROCESSED` indica referência terminada sem sucesso (`REJECTED`/`FAILED`).
+  Referência ainda pendente não gera rejeição: a operação aguarda.
+  `ValidationFailureCode(err)` mapeia erros de construção/parsing para o código do corpo
+  HTTP/SQS.
+
+## ADR-009 — Regras de operação e reversão (T06)
+
+- **Local:** `internal/domain/wager_rules.go`. Serviço de domínio puro, sem I/O e sem relógio
+  global, em duas etapas:
+  - `DecideWager(WagerRuleInput) (WagerDecision, error)` só lê. A entrada traz a transação
+    nova (`PENDING`/`PENDING_REFERENCE`), o snapshot da carteira (`nil` = inexistente), a
+    referência resolvida por `(providerId, referenceExternalTransactionId)` (`nil` = ainda não
+    recebida) e as reversões já existentes dessa referência, em qualquer estado. A saída é
+    `APPLY_MOVEMENT` (`DEBIT`/`CREDIT` + valor + saldo projetado), `NO_MOVEMENT` (`LOSS`),
+    `AWAIT_REFERENCE` (motivo `REFERENCE_MISSING`/`REFERENCE_PENDING`) ou `REJECT`
+    (`FailureCode` + saldo observado).
+  - `ApplyWagerDecision(ApplyWagerDecisionParams) (WalletLedgerEntry, error)` aplica a decisão:
+    `Wallet.Debit/Credit` e `MarkProcessed`/`MarkPendingReference`/
+    `RescheduleReferenceRetry`/`Reject`. As mudanças são feitas em cópias e só publicadas se
+    tudo der certo, então um erro deixa carteira e transação intactas. Recebe `now` e
+    `nextAttemptAt` (backoff da T21).
+- **Rejeição é decisão, não erro.** O `error` é reservado a entrada inconsistente
+  (`ErrInvalidWagerRuleInput`: transação terminal ou não inicializada, carteira de outro id,
+  referência com outro ID externo, reversão listada que não aponta para a referência) e a
+  overflow de saldo em crédito (`ErrMoneyOverflow`). A aplicação trata os dois como falha
+  interna. Transação terminal nunca é reavaliada: replay lê o resultado persistido.
+- **Ordem de avaliação** (o primeiro critério que falha decide):
+  1. Carteira: inexistente → `WALLET_NOT_FOUND`; de outro jogador → `WALLET_PLAYER_MISMATCH`;
+     outra moeda → `CURRENCY_MISMATCH`. Essas três rejeições não carregam saldo, para não
+     expor a carteira de outro jogador.
+  2. Sem referência: `BET` debita (sem saldo → `INSUFFICIENT_FUNDS`), `LOSS` não movimenta
+     (`balanceAfter` = saldo atual, versão inalterada) e `WIN` credita.
+  3. Com referência (`WIN` opcional, `REFUND`/`ROLLBACK` obrigatória):
+     - referência ausente → `AWAIT_REFERENCE`;
+     - critérios estáticos: `OPENING` → `REFERENCE_NOT_REVERSIBLE`; provedor, jogador,
+       carteira ou rodada divergentes → `REFERENCE_MISMATCH`; moeda → `CURRENCY_MISMATCH`;
+       tipo não aceito → `REFERENCE_NOT_REVERSIBLE`; valor da reversão ≠ valor referenciado
+       → `AMOUNT_MISMATCH`;
+     - estado da referência: `PENDING`/`PENDING_REFERENCE` → `AWAIT_REFERENCE`;
+       `REJECTED`/`FAILED` → `REFERENCE_NOT_PROCESSED` (definitivo);
+     - reversão já existente → `ALREADY_REVERSED`;
+     - saldo: estorno que debitaria além do saldo → `REVERSAL_INSUFFICIENT_FUNDS`, distinto de
+       `INSUFFICIENT_FUNDS`.
+
+  A identidade é checada antes de tipo e estado para não revelar dados de uma transação de
+  outro jogador ou rodada. Os critérios estáticos vêm antes do estado para que o resultado
+  não dependa do momento em que a referência é processada: uma reversão com valor errado é
+  rejeitada já, sem esperar a referência terminar.
+- **Tipos aceitos como referência:** `WIN` → `BET`. `REFUND` → `BET`. `ROLLBACK` → `BET`, `WIN`
+  ou `REFUND`. `LOSS` (sem movimento), `ROLLBACK` (não se desfaz um desfazimento) e `OPENING`
+  são `REFERENCE_NOT_REVERSIBLE`.
+- **Movimento:** `REFUND(BET)` e `ROLLBACK(BET)` creditam. `ROLLBACK(WIN)` e
+  `ROLLBACK(REFUND)` debitam. O valor é sempre o da referência (reversão parcial não existe).
+  O `WIN` com referência credita o próprio valor: a `BET` serve só de vínculo de rodada.
+- **Política REFUND × ROLLBACK:** cada referência admite **no máximo uma reversão
+  bem-sucedida, de qualquer tipo**. Contam apenas reversões `PROCESSED`, e a própria
+  transação é ignorada se aparecer na lista. Isso cobre "não duas reversões do mesmo tipo" e
+  impede devolver duas vezes o mesmo débito:
+
+  | Já existe (PROCESSED) sobre a BET | Nova operação | Resultado |
+  | --- | --- | --- |
+  | `REFUND` | `REFUND` ou `ROLLBACK` da BET | `ALREADY_REVERSED` |
+  | `ROLLBACK` | `REFUND` ou `ROLLBACK` da BET | `ALREADY_REVERSED` |
+  | `REFUND` | `ROLLBACK` do **REFUND** | debita, desfazendo a devolução (uma única vez) |
+  | rejeitadas/pendentes/falhas | qualquer reversão | não contam |
+
+  Limitação consciente: uma `BET` cuja devolução foi desfeita (`REFUND` + `ROLLBACK(REFUND)`)
+  não pode ser devolvida de novo. Em troca, a regra cabe num único índice único parcial do
+  schema (T10), a defesa final contra corrida:
+  `UNIQUE (reference_transaction_id) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')`.
+- **Concorrência:** o caso de uso (T15/T21) chama decidir e aplicar dentro da transação SQL,
+  com a carteira travada (`SELECT ... FOR UPDATE`, ADR-005). Referência e reversões ficam na
+  **mesma** carteira (caso contrário, `REFERENCE_MISMATCH`), então esse lock também serializa
+  as reversões concorrentes de uma referência e o snapshot lido é atual. Para que um
+  snapshot antigo nunca seja aplicado, `ApplyWagerDecision` confere id, versão e saldo da
+  carteira contra os da decisão e devolve `ErrStaleWagerDecision` se divergirem. O caso de uso
+  deve então reler sob lock e decidir de novo. Sequencialmente, duas `BET` de 80.00 sobre
+  100.00 resultam em uma `PROCESSED`, uma `REJECTED INSUFFICIENT_FUNDS`, saldo 20.00 e um único
+  débito (teste `TestWagerRules_TwoBetsOf80On100`).
+- **Referência ausente/pendente:** o worker (T21) chama de novo `DecideWager` e
+  `ApplyWagerDecision`. A partir de `PENDING_REFERENCE`, um novo `AWAIT_REFERENCE` vira
+  `RescheduleReferenceRetry` (`attempts + 1`). Esgotado o limite, a aplicação chama
+  `Reject(REFERENCE_NOT_FOUND)` sem referência resolvida (ADR-008).
+
+## ADR-010 — Hash canônico de idempotência (T08)
+
+- **Local:** `internal/domain/idempotency` (`RequestFields`, `RequestHash`, `CanonicalJSON`,
+  `HashSchemaVersion`). É a única função de hash de requisição, usada pelo HTTP (T18) e
+  pelo consumidor SQS (T20) antes de chamar o caso de uso (T15); a inbox (T13) compara o
+  mesmo valor em reentregas.
+- **Campos:** `providerId` (da identidade autenticada), `externalTransactionId`, `playerId`,
+  `walletId`, `roundId`, `gameId`, `kind`, `money` (`amount` = `Money.Amount()` com duas casas
+  e `currency`), `referenceExternalTransactionId` e `v` (versão do esquema, hoje `1`).
+  Ficam de fora `idempotencyKey` e todo metadado de transporte (headers, `messageId`,
+  `eventId`, `correlationId`, `occurredAt`).
+- **Normalização:** a entrada é tipada (`domain.Money`, `domain.WagerKind`, `uuid.UUID`).
+  Por isso `"25"`/`"25.00"` e `"25.5"`/`"25.50"` são equivalentes (ADR-004) e UUIDs entram na
+  forma minúscula de `uuid.UUID.String()`. Strings de identificadores não são normalizadas
+  (ADR-008): caixa e espaços mudam o hash.
+- **Ausente x vazio:** todas as chaves estão sempre presentes. Referência vazia é serializada
+  como `null`. O transporte mapeia omissão, `null` e `""` para `""`, já que o domínio não
+  distingue esses casos. Os demais campos são sempre strings, mesmo vazias.
+- **Formato:** JSON compacto, chaves em ordem de bytes (inclusive em `money`) e escape no estilo
+  RFC 8785 (só `"`, `\` e controles `< 0x20`; o resto é UTF-8 literal). UTF-8 inválido e Money
+  não inicializado são rejeitados com `ErrInvalidHashInput`, porque encoders trocariam bytes
+  inválidos por U+FFFD e poderiam gerar colisões.
+- **Digest:** SHA-256 em 64 hex minúsculos (`domain.RequestHashLength`). Um vetor golden
+  (`TestGoldenVector`) fixa o algoritmo. Qualquer mudança intencional incrementa `v`; hashes
+  antigos deixam de casar e o resultado é conflito explícito, nunca colisão silenciosa.
+
+## ADR-011 — Migrations PostgreSQL e schema (T10)
+
+- **Local:** SQL versionado em `migrations/NNNN_nome.{up,down}.sql`, embutido por `migrations.FS`
+  (`embed.FS`). Runner em `internal/adapters/postgres/migrate` e CLI em `cmd/migrate`
+  (`up`, `down N`, `down -all`, `status`), que lê só `DATABASE_URL` (+ `MIGRATE_TIMEOUT`) e
+  pode rodar como job do Compose (T24) antes das réplicas. Makefile: `migrate-up`,
+  `migrate-down` (1 passo), `migrate-status`.
+- **Runner próprio em vez de golang-migrate:**
+  - É mínimo (cerca de 300 linhas), usa só o pgx/v5 e não acrescenta dependência.
+  - Cada migration roda numa transação junto com o `INSERT/DELETE` em `schema_migrations`,
+    aproveitando o DDL transacional do PostgreSQL. Não existe estado "dirty" que exija
+    `force` manual. Uma falha no meio desfaz a migration inteira (há teste).
+  - **Réplicas simultâneas:** `pg_advisory_lock(AdvisoryLockKey)` de sessão, adquirido antes
+    de criar/ler `schema_migrations`. As demais réplicas esperam, releem o estado e não
+    aplicam nada. Se um processo morrer, a sessão cai e o lock é liberado. Por isso a API
+    recebe um `*pgx.Conn` (uma sessão), nunca um pool. O teste com 3 conexões simultâneas
+    aplica cada versão exatamente uma vez.
+  - **Integridade do histórico:** `schema_migrations.checksum` guarda o SHA-256 do arquivo
+    up. Três situações abortam antes de qualquer DDL: arquivo aplicado alterado
+    (`ErrChecksumMismatch`), versão aplicada que o binário não conhece (`ErrUnknownVersion`,
+    banco à frente do código) e lacunas (`ErrInconsistentHistory`). As versões precisam
+    ser 1..N sem buracos, com pares up/down obrigatórios (validado em `Load` e em teste
+    unitário).
+  - **Limitação:** comandos que não rodam em transação (`CREATE INDEX CONCURRENTLY`) não
+    são suportados.
+- **Tabelas e invariantes no banco:**
+  - Money é sempre `BIGINT` (centavos) + `CHAR(3)` com `CHECK ~ '^[A-Z]{3}$'`. Não há
+    ponto flutuante no schema.
+  - `wallets`:
+    - `UNIQUE(player_id, currency)`, `balance >= 0`, `version >= 1`.
+    - `UNIQUE(id, currency)` é o alvo das FKs do ledger.
+    - Trigger `wallets_guard_update`: id, player, moeda e `created_at` são imutáveis. A
+      versão sobe **exatamente 1** quando o saldo muda e não muda sem mudança de saldo.
+      `updated_at` é monotônico.
+  - `wager_transactions`:
+    - `origin` e os CHECKs de coerência espelham `WagerTransaction.validate()`: INTERNAL
+      só para OPENING, sem metadados externos, `PROCESSED`, `balance_after = amount` e
+      `attempts = 0`. EXTERNAL exige provedor, ID externo, chave, hash, rodada e jogo.
+    - Política de zero, regras de referência e autorreferência.
+    - Status × `failure_code` (REJECTED: INPUT/BUSINESS; FAILED: INFRASTRUCTURE), mais a
+      aplicabilidade de cada código por tipo e por referência.
+    - Status × `balance_after`, status × `completed_at` e agendamento (`PENDING_REFERENCE`
+      exige `attempts >= 1` e `next_attempt_at`; terminal não fica agendado).
+    - `attempts > 0` exige referência e é proibido em `PENDING`.
+    - Identificadores são `TEXT` com 1..255 **bytes** (`octet_length`, igual ao domínio).
+      `request_hash` é `CHAR(64)` em hex minúsculo.
+    - Únicos: `(provider_id, external_transaction_id)`, `(provider_id, idempotency_key)`,
+      OPENING por carteira (parcial) e **uma reversão bem-sucedida por referência, de
+      qualquer tipo** (`UNIQUE(reference_transaction_id) WHERE status='PROCESSED' AND kind
+      IN ('REFUND','ROLLBACK')`, política do ADR-009). Esse índice implica o
+      "uma por (referência, tipo)" da T10.
+    - Trigger `wager_transactions_guard_update`: estados terminais são imutáveis, não há
+      `PENDING_REFERENCE → PENDING`, colunas de entrada são imutáveis e `attempts` nunca
+      diminui.
+    - **Sem FK de `wallet_id` para `wallets`:** rejeições `WALLET_NOT_FOUND`,
+      `WALLET_PLAYER_MISMATCH` e `CURRENCY_MISMATCH` precisam ser persistidas para o
+      replay. A integridade financeira vem das FKs compostas do ledger.
+  - `wallet_ledger_entries`:
+    - `UNIQUE(wallet_id, transaction_id)`, `amount > 0` e saldos `>= 0`.
+    - CHECK aritmético em `NUMERIC`: exato e sem overflow.
+    - FK `(wallet_id, currency) → wallets(id, currency)` e FK
+      `(transaction_id, wallet_id, currency) → wager_transactions(id, wallet_id, currency)`.
+    - Triggers bloqueiam `UPDATE`/`DELETE` (por linha) e `TRUNCATE`, inclusive o
+      `TRUNCATE ... CASCADE` vindo de `wallets`/`wager_transactions`.
+  - `inbox`: PK `(consumer_name, message_id)` (constraint `inbox_consumer_message_key`),
+    `request_hash CHAR(64)`, `transaction_id` opcional (FK), `received_at` e `completed_at`.
+  - `outbox`:
+    - `seq` IDENTITY (ordem) e `event_id UUID UNIQUE` (= `MessageDeduplicationId`).
+    - `payload JSON` (não JSONB), para guardar o snapshot byte a byte.
+    - Colunas `attempts`, `next_attempt_at`, `locked_until`/`locked_by` (sempre em par),
+      `last_error` e `published_at`.
+    - Trigger `outbox_guard`: o snapshot é imutável, evento publicado é imutável e evento
+      não publicado não pode ser apagado.
+- **Índices dos workers:** `PENDING_REFERENCE` por `(next_attempt_at, id)`, `PENDING` por
+  `(created_at, id)`, `(provider_id, reference_external_transaction_id)` para referências,
+  outbox não publicada por `(next_attempt_at, seq)` e extrato por
+  `(wallet_id, created_at, id)`.
+- **Erros para a T11:** CHECK → `23514`, UNIQUE → `23505`, FK → `23503`. As guardas de
+  trigger usam `23001` (`restrict_violation`) com `CONSTRAINT` nomeado
+  (`wallet_ledger_entries_append_only`, `wallets_version_increment`,
+  `wager_transactions_terminal_immutable`, `outbox_snapshot_immutable`...). Assim o
+  classificador decide pelo nome da constraint.
+- **Limitações:** o dono das tabelas ou um superusuário pode desabilitar triggers
+  (`DISABLE TRIGGER`, `session_replication_role`). Em produção a aplicação deve usar um
+  papel que não seja dono (T24). `down` destrói dados (DROP não dispara as guardas) e é
+  destinado a ambientes descartáveis.
+- **Testes:** os unitários (sem tag) cobrem pares up/down, convenção, validação de
+  histórico e o casamento dos enums do domínio com os CHECKs. Os de integração
+  (`-tags=integration`) usam testcontainers (`postgres:17-alpine`) ou `TEST_DATABASE_URL`
+  (precisa de `CREATE DATABASE`, um banco novo por teste) e cobrem up/down/up, down
+  parcial, concorrência entre 3 sessões, adulteração, atomicidade e cada
+  constraint/trigger.
+
+## ADR-012 — Eventos de integração tipados (T07)
+
+- **Local:** `internal/domain/events.go` (`IntegrationEvent`, `EventType`, `EventMetadata`,
+  `EventData` e os payloads `WagerTransactionProcessedData`, `WagerTransactionRejectedData`,
+  `WalletBalanceChangedData`, `WagerTransactionPendingReferenceData`). Testes golden em
+  `internal/domain/testdata/*.golden.json` (regravar com `go test ./internal/domain/ -run
+  TestIntegrationEvents_Golden -update`).
+- **Envelope:** `{eventId, eventType, aggregateId, correlationId, causationId?, occurredAt,
+  version, data}`. `causationId` é omitido quando ausente. `eventId` é UUIDv7 (gerador em
+  variável de pacote `newEventID`, substituída só nos testes).
+- **Construtores (únicos caminhos de criação):**
+  `NewWagerTransactionProcessedEvent(tx, meta)` (exige `PROCESSED`),
+  `NewWagerTransactionRejectedEvent(tx, meta)` (exige `REJECTED`),
+  `NewWagerTransactionPendingReferenceEvent(tx, meta)` (exige `PENDING_REFERENCE`) e
+  `NewWalletBalanceChangedEvent(entry, wallet, meta)`. Tipo e versão (`1` em todos) são
+  fixados pelo tipo do payload, uma interface selada; o chamador não os escolhe. Erros
+  satisfazem `ErrInvalidIntegrationEvent`.
+- **Snapshot imutável:** o construtor serializa o envelope uma vez e guarda os bytes.
+  `Payload()` e `MarshalJSON()` devolvem cópias, `Data()` devolve cópia profunda, não há
+  campos exportados nem setters (teste por reflexão fixa o conjunto de métodos). Mudanças
+  posteriores na transação/carteira não alteram o evento. A outbox (T13) persiste
+  `Payload()` e o publisher (T22) envia esses bytes sem reconstruir, preservando o
+  `eventId` em republicações.
+- **aggregateId e ordenação FIFO:** eventos de transação usam o id da transação (o ciclo
+  `PENDING_REFERENCE` → `PROCESSED`/`REJECTED` fica no mesmo `MessageGroupId`).
+  `WalletBalanceChanged` usa o id da carteira (mudanças de saldo da carteira em ordem).
+  Não há ordem garantida entre grupos; consumidores ordenam/deduplicam saldo por
+  `walletVersion`.
+- **occurredAt:** RFC 3339 em UTC (`Z`), truncado a microssegundos para coincidir com o
+  `timestamptz` da coluna da outbox. Conclusões (`Processed`/`Rejected`) usam `CompletedAt`
+  (ADR-008); `PendingReference` usa `UpdatedAt` (instante do registro da espera);
+  `WalletBalanceChanged` usa `CreatedAt` do lançamento. `nextAttemptAt` segue o mesmo
+  formato.
+- **Dinheiro:** sempre `{"amount":"25.00","currency":"BRL"}` (ADR-004). Os únicos números
+  JSON do envelope são `version`, `walletVersion` e `attempts` (teste verifica).
+- **WalletBalanceChanged:** `walletId`, `transactionId`, `direction`, `money`,
+  `balanceBefore`, `balanceAfter`, `walletVersion`. `walletVersion = wallet.Version()`
+  lido logo após `Debit/Credit`. O construtor exige `entry.WalletID == wallet.ID` e
+  `wallet.Balance == entry.BalanceAfter`, o que recusa carteira desatualizada ou já
+  movimentada de novo.
+- **Dados sensíveis:** `idempotencyKey` e `requestHash` nunca entram nos eventos.
+  `WagerTransactionRejected` nunca carrega `referenceTransactionId`: em
+  `REFERENCE_MISMATCH` ele seria o id interno de uma transação de outra carteira/jogador
+  (ressalva da T06); nos demais códigos a referência externa do próprio provedor
+  (`referenceExternalTransactionId`) basta. Rejeições `WALLET_NOT_FOUND`,
+  `WALLET_PLAYER_MISMATCH` e `CURRENCY_MISMATCH` nunca levam `balanceAfter`, mesmo que a
+  transação tenha um (defesa em profundidade sobre o ADR-009). `WagerTransactionProcessed`
+  pode levar `referenceTransactionId`, porque em `PROCESSED` a referência é da mesma
+  carteira.
+- **Rejeições:** todo `REJECTED` gera `WagerTransactionRejected`, com `failureCode` e
+  `failureCategory` (`INPUT` corrigível × `BUSINESS` definitivo). Erros de validação que
+  impedem criar a transação (ex.: `INVALID_AMOUNT` no parsing) não geram evento.
+- **OPENING:** abertura com saldo `> 0` gera `WagerTransactionProcessed` (`origin
+  INTERNAL`; provedor, IDs externos, rodada, jogo e referências são omitidos do JSON) e
+  `WalletBalanceChanged` (`CREDIT` 0 → saldo inicial, `walletVersion` 1), no mesmo commit
+  da carteira (T14). Saldo zero não gera eventos. OPENING nunca fica pendente nem é
+  rejeitado.
+- **FAILED:** não gera evento de integração (não é rejeição de negócio); fica visível em
+  métricas, logs e na consulta da transação.
+- **PendingReference:** a política (T15/T21) é emitir na transição `PENDING` →
+  `PENDING_REFERENCE` (`attempts = 1`); reagendamentos do worker não precisam emitir de
+  novo. O domínio não impõe isso; `attempts` vai no payload.
+- **Metadados:** `correlationId` obrigatório (request HTTP, envelope SQS ou contexto do
+  worker); `causationId` opcional (ex.: `messageId` SQS). Ambos: não vazios, ≤ 255 bytes,
+  sem espaço nas bordas, sem caracteres de controle e UTF-8 válido.
+
+## ADR-013 — Pool pgx, TxManager e classificação de erros (T11)
+
+Pacote `internal/adapters/postgres` (`pool.go`, `tx.go`, `errors.go`, `module.go`).
+
+- **Pool (`*postgres.DB`):** `pgxpool` montado a partir de `config.DatabaseConfig`
+  (`MaxConns`, `ConnectTimeout`, `application_name=wallet` se o DSN não definir outro). O DSN só
+  sai do `config.Secret` por um único `Reveal()`, direto para `pgxpool.ParseConfig`. Erro de parse
+  vira `ErrPoolConfig` sem o texto do pgx, porque `url.Error` cita a URL inteira. O construtor não
+  faz I/O. `OnStart` (`DB.Start`) faz ping com backoff exponencial (100ms→2s) até o prazo do ctx de
+  start, mas só repete falha transitória (conexão recusada, `57P03`, timeout). Falha permanente
+  (`28P01`, `3D000`) aborta na hora. `OnStop` (`DB.Stop`) faz `Close`, limitado pelo ctx de stop.
+  Como os dependentes param antes no Fx, as conexões já estão devolvidas. `DB.Ping(ctx)` é o
+  probe de readiness (T18); quem chama define o prazo.
+- **Fronteira transacional explícita:** o caso de uso chama
+  `Transactor.WithinTx(ctx, fn func(ctx, pgx.Tx) error, opts...)` e passa o `pgx.Tx` a cada
+  repositório. Os repositórios (T12/T13) recebem `postgres.Querier` (`Exec/Query/QueryRow`,
+  satisfeito por `pgx.Tx`, `*pgx.Conn` e `*pgxpool.Pool`). Não há tx escondida no `context`, então
+  dá para auditar que wallet, transação, ledger, outbox e inbox entram no mesmo commit.
+- **Isolamento:** o padrão é `READ COMMITTED`. A consistência por carteira vem de
+  `SELECT ... FOR UPDATE` + `UPDATE ... WHERE version = $old` (T12), não do nível de isolamento.
+  `WithIsolation(pgx.RepeatableRead|Serializable)` e `ReadOnly()` existem para a reconciliação
+  (T16) e para casos especiais.
+- **Rollback:** acontece quando `fn` devolve erro, entra em panic ou chama `runtime.Goexit`. O
+  `defer` não usa `recover`, então o panic original segue propagando. O ROLLBACK roda em
+  `context.WithoutCancel(ctx)` com prazo de 5s, para funcionar mesmo com o ctx da requisição já
+  cancelado. Uma falha de rollback só é logada: o pgx descarta a conexão e o servidor desfaz a
+  transação. O erro de `fn` volta **sem tradução**, para que erros de domínio passem intactos.
+- **Retry: mecanismo aqui, decisão no caso de uso.** Reexecutar exige refazer BEGIN..COMMIT
+  inteiro, e só o TxManager sabe se o COMMIT chegou a ser enviado. Por isso o loop mora aqui. Ele
+  é opt-in por chamada (`WithRetry(RetryPolicy)`), porque só o caso de uso (T14/T15/T21) sabe que
+  `fn` é reexecutável: não pode ter efeito fora do banco e precisa recalcular tudo a partir do
+  que lê no tx. Sem `WithRetry` há uma única tentativa. `DefaultRetryPolicy(op)` faz 4 execuções
+  com backoff de 10ms, dobrando até 250ms, com equal jitter. Só se repete o que é
+  `IsRetryable`: `40001`, `40P01`, `55P03`, `57014`, `08xxx`, `57P01-03` e `53300` vindos do
+  servidor (inclusive no COMMIT, porque se o servidor respondeu, não confirmou), além de falha de
+  conexão antes do COMMIT. `RetryPolicy.RetryIf` amplia isso. Uso previsto na T15: corrida no
+  UNIQUE de idempotência, em que a nova tentativa lê a linha vencedora e devolve o replay. Cada
+  nova tentativa incrementa `wallet_retries_total{operation}` e, nos conflitos,
+  `wallet_concurrency_conflicts_total{kind}` (serialization/deadlock/lock_timeout/unique), e
+  gera um log `warn` sem DSN.
+- **Commit ambíguo:** quando o COMMIT foi enviado e a resposta não voltou (conexão caiu, ctx
+  cancelado durante o commit), o erro sai com `ErrCommitOutcomeUnknown` e **nunca** é
+  reexecutado, nem com `RetryIf`. Ele é `IsTransient` (HTTP 503/Retry-After; no SQS a mensagem
+  não é removida), e a nova tentativa externa passa pela idempotência (replay), nunca por
+  reaplicação cega. `pgx.ErrTxCommitRollback` (fn engoliu um erro SQL) é falha definitiva.
+- **Classificação (sem importar `internal/domain`):**
+  - `IsTransient`/`TransientReasonOf`: as falhas listadas acima, mais timeouts
+    (`context.DeadlineExceeded`, `pgconn.Timeout`, `net.Error`), EOF, `ConnectError` e
+    `pgconn.SafeToRetry`. `context.Canceled` **nunca** é transitório, porque quem chamou
+    desistiu. Um `PgError` decide pelo SQLSTATE mesmo dentro de um `ConnectError`.
+  - `IsRetryable` = transitório sem `ErrCommitOutcomeUnknown`.
+  - Constraints (classe 23): `AsConstraintViolation(err)` devolve `*ConstraintViolation{Kind,
+    Constraint, Table, Column, SQLState}`. Os helpers `IsUniqueViolation/IsCheckViolation/
+    IsForeignKeyViolation/IsRestrictViolation(err, nome)` aceitam `""` como "qualquer". As guardas
+    de trigger (`23001`, ADR-011) são identificadas pelo nome (`wallets_version_increment`,
+    `wager_transactions_terminal_immutable`...). A mensagem não inclui o `Detail` do PostgreSQL,
+    que traz valores da linha.
+  - `Translate(err)` embrulha em `*ConstraintViolation` (que casa com `errors.Is` em
+    `ErrConstraintViolation` e na sentinela do tipo: `ErrUniqueViolation`, `ErrCheckViolation`,
+    `ErrForeignKeyViolation`, `ErrRestrictViolation`...) ou em `*TransientError`
+    (`ErrTransient`), preservando a cadeia e o `*pgconn.PgError`. É idempotente. Todos os helpers
+    funcionam também no erro cru. O mapeamento final para erros de domínio é feito nos
+    repositórios (T12/T13), pelo nome da constraint.
+- **Fx (`postgres.Module`):** provê `*DB` (com os hooks), `*pgxpool.Pool`, `*TxManager` e
+  `Transactor`. Depende de `config.Config`; `*slog.Logger` e `*metrics.Metrics` são opcionais.
+  Não registra coletor de estatísticas do pgxpool (fica para T23, se for necessário).
+- **Testes:** os unitários usam `*pgconn.PgError` sintéticos, erros de contexto/rede e um `pgx.Tx`
+  falso para commit, rollback (erro, panic, Goexit, ctx cancelado), commit ambíguo, retry, backoff
+  e métricas. Os de integração (`-tags=integration`, mesmo setup da T10) cobrem commit, rollback
+  por erro/panic, cancelamento e prazo durante um `pg_sleep`, classificação real (UNIQUE `23505`,
+  CHECK `23514`, FK `23503`, trigger `23001` com nome), retry em `40001` (SERIALIZABLE) e em
+  `40P01` sem lost update, start fail-fast em `3D000` sem vazar a senha e o ciclo start/stop do
+  módulo Fx sem goroutines vazadas.

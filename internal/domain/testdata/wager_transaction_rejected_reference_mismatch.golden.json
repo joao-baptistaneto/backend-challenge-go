@@ -1,0 +1,32 @@
+{
+  "eventId": "0192f2b0-0000-7000-8000-000000000001",
+  "eventType": "WagerTransactionRejected",
+  "aggregateId": "0192f298-345e-7e38-af88-e43f851a8200",
+  "correlationId": "corr-123",
+  "causationId": "msg-123",
+  "occurredAt": "2026-10-05T12:00:01.25Z",
+  "version": 1,
+  "data": {
+    "transactionId": "0192f298-345e-7e38-af88-e43f851a8200",
+    "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+    "kind": "REFUND",
+    "origin": "EXTERNAL",
+    "status": "REJECTED",
+    "money": {
+      "amount": "25.00",
+      "currency": "BRL"
+    },
+    "failureCode": "REFERENCE_MISMATCH",
+    "failureCategory": "INPUT",
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-123",
+    "roundId": "round-987",
+    "gameId": "fortune-chimp",
+    "referenceExternalTransactionId": "transaction-100",
+    "balanceAfter": {
+      "amount": "100.00",
+      "currency": "BRL"
+    }
+  }
+}
