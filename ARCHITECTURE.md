@@ -7,7 +7,7 @@ O documento tem duas partes:
 - **Parte I — Síntese (seções 1 a 18).** Uma seção por tema exigido no enunciado, com o estado
   **atual** do código, valores padrão e links para os ADRs detalhados. Quando um ADR antigo
   diverge da Parte I (valores revisados depois, pendências já resolvidas), vale a Parte I.
-- **Parte II — Registro de decisões (ADR-001 a ADR-032).** Histórico incremental, um ADR por
+- **Parte II — Registro de decisões (ADR-001 a ADR-033).** Histórico incremental, um ADR por
   tarefa, com contexto, alternativas, testes e notas de revisão.
 
 **Referências ao enunciado.** O enunciado do desafio está em [`docs/DESAFIO.md`](docs/DESAFIO.md)
@@ -39,7 +39,7 @@ da solução: execução, variáveis, filas, migrations, exemplos e testes.
 18. [Interpretações adotadas, limitações, trade-offs e trabalho não concluído](#18-interpretações-adotadas-limitações-trade-offs-e-trabalho-não-concluído)
 
 **Parte II — Registro de decisões:** [ADR-001](#adr-001--módulo-versão-go-e-dependências-base-t01)
-a [ADR-032](#adr-032--wake-up-de-pendências-quando-a-referência-chega-t31).
+a [ADR-033](#adr-033--moneyunmarshaljson-estrito-t32).
 
 **Mapa enunciado ([docs/DESAFIO.md](docs/DESAFIO.md)) → seção**
 
@@ -170,7 +170,7 @@ sequenceDiagram
 
 ## 3. Dinheiro (`Money`)
 
-Detalhes: ADR-004, ADR-011, ADR-014, ADR-020.
+Detalhes: ADR-004, ADR-011, ADR-014, ADR-020, ADR-033.
 
 - **Representação:** `int64` em centavos (escala fixa 2) + código ISO 4217 alfabético. Nenhum
   `float32`/`float64` no parsing, no cálculo, na serialização, na persistência nem nas métricas
@@ -187,7 +187,13 @@ Detalhes: ADR-004, ADR-011, ADR-014, ADR-020.
   normalizada (`"brl"` é inválido).
 - **Contrato externo:** `{"amount":"25.00","currency":"BRL"}`. No HTTP e no SQS o Money é lido
   por `strictjson` (amount precisa ser string JSON; chave desconhecida, repetida ou com outra
-  caixa é rejeitada). Aritmética e comparação entre moedas diferentes → `ErrCurrencyMismatch`;
+  caixa é rejeitada) e com `ParseNonNegative`. O `Money.UnmarshalJSON` do domínio (DTOs,
+  eventos, testes, consumidores Go do contrato) aplica as mesmas regras de objeto sem
+  importar o adapter (ADR-033): só `amount`/`currency` em caixa exata, sem repetição, sem
+  extras, ambos obrigatórios e strings JSON, nada além de um objeto (`null` é erro). Ele
+  aceita negativos, porque serializa diferenças (`difference` da reconciliação) e precisa de
+  round-trip com `MarshalJSON`; a não negatividade é responsabilidade do ponto de entrada.
+  Aritmética e comparação entre moedas diferentes → `ErrCurrencyMismatch`;
   `Money{}` não inicializado é rejeitado em toda operação.
 - **Persistência:** `BIGINT` (centavos) + `CHAR(3)` com `CHECK ~ '^[A-Z]{3}$'`; reidratação por
   `FromMinorUnits`. O CHECK aritmético do ledger roda em `NUMERIC` (exato, sem overflow). A soma
@@ -724,6 +730,11 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
   espera o backoff que já tinha (na mesma carteira isso não acontece: o lock da carteira
   serializa o worker e a referência); o `FAILED` gravado pelo caminho sem agregado (linha que
   não reidrata, ADR-031) não acorda dependentes — elas veem o `FAILED` no próprio backoff.
+- **`Money.UnmarshalJSON` estrito** (T32, ADR-033; resolvia a lacuna "`UnmarshalJSON`
+  permissivo"): rejeita chave com outra caixa, repetida ou desconhecida, campo ausente,
+  `null` e tipos errados, como o `strictjson`. Trade-off: as regras de objeto existem em dois
+  lugares (domínio e adapter), fixadas por casos espelhados nas duas suítes (ADR-033). O método
+  aceita negativos (round-trip de diferenças); só o `strictjson` exige não negativo.
 - **Revogação de token** só vale na expiração (validação local por JWKS).
 - **`POST /wallets` sem chave de idempotência:** um commit ambíguo (503) seguido de nova
   tentativa devolve 409 `WALLET_ALREADY_EXISTS`; o cliente consulta a carteira. Sem risco
@@ -753,12 +764,6 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
 
 **Pendências abertas no código (não resolvidas nesta entrega)**
 
-- **`Money.UnmarshalJSON` permissivo** (`internal/domain/money.go`): usa `encoding/json` sobre
-  uma struct, então aceita chaves com outra caixa (`{"AMOUNT":...}`) e chaves duplicadas (fica
-  a última), e aceita valores negativos (usa `Parse`, não `ParseNonNegative`). **Nenhuma
-  entrada externa usa esse método**: HTTP e SQS decodificam Money por `strictjson.Money`, que
-  rejeita esses casos e exige valor não negativo (ADR-020/022). O método só serve a usos
-  internos/testes.
 - **Índice sem uso** `wallet_ledger_entries_wallet_page_idx` (`0003`, em `(wallet_id,
   created_at, id)`): a paginação passou a usar `(wallet_id, seq)` na `0006`. Custo só de
   escrita; remover numa migration futura.
@@ -2174,7 +2179,8 @@ T20).
   e faz o parse com `domain.ParseNonNegative`: rejeita amount numérico (`25.00` sem
   aspas), `NaN`, `Infinity`, notação científica, escala > 2, negativos e overflow.
   Resolve, na borda HTTP, a pendência "Money.UnmarshalJSON aceita outra caixa/chaves
-  duplicadas", porque o HTTP não usa aquele `UnmarshalJSON`. A forma equivalente `"25"`
+  duplicadas", porque o HTTP não usa aquele `UnmarshalJSON` *(o próprio método ficou
+  estrito na T32, ADR-033)*. A forma equivalente `"25"`
   é normalizada para `25.00` antes do hash (ADR-010) e o replay com `"25"` casa com
   `"25.00"` (testado). UUIDs (`playerId`, `walletId`, ids no path) só na forma canônica
   de 36 caracteres, não nulos. `kind` por `ParseExternalWagerKind` (`OPENING` e outra
@@ -3804,3 +3810,62 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
     a `BET` não espera e a linha mantém o agendamento) e
     `TestIntegrationWake_PendingReferenceDoesNotWake`. Sem o wake-up, os dois primeiros
     falham (verificado removendo a chamada).
+
+## ADR-033 — `Money.UnmarshalJSON` estrito (T32)
+
+- **Contexto.** O `UnmarshalJSON` de `Money` decodificava com `encoding/json` sobre uma struct:
+  casava chaves sem diferenciar caixa (`{"AMOUNT":...}`), ficava com a última de chaves
+  repetidas e o comentário dizia "o decoder é estrito" (a §18 documentava o oposto, lacuna
+  L4). Nenhuma entrada externa usa o método (HTTP e SQS usam `strictjson.Money`, ADR-020/022),
+  mas ele é o caminho de qualquer `json.Unmarshal` de DTO/evento com `Money` (testes,
+  consumidores Go do contrato).
+- **Decisão.** O método passou a ler o objeto token a token (`json.Decoder.Token`), com as
+  mesmas regras de objeto do `strictjson`, implementadas no próprio domínio (o domínio não
+  importa adapters):
+  - um único objeto JSON, nada depois dele; `null`, lista, string ou número →
+    `ErrMalformedMoneyJSON`;
+  - só `amount` e `currency`, caixa exata, cada uma uma vez; desconhecida, outra caixa ou
+    repetida → `ErrMalformedMoneyJSON`;
+  - `amount`/`currency` obrigatórios e strings JSON (ausente, `null`, número, booleano,
+    objeto, lista → `ErrInvalidAmount` / `ErrInvalidCurrency`); amount nunca é número JSON
+    (nada passa por `float64`);
+  - valores por `Parse`: mesma gramática, escala ≤ 2, overflow, moeda suportada em caixa alta.
+    Whitespace JSON entre tokens e escapes `\uXXXX` nas strings são aceitos (é JSON válido;
+    o valor decodificado é que passa pela gramática).
+  - `ErrMalformedMoneyJSON` embrulha `ErrInvalidAmount`, então `ValidationFailureCode`
+    continua classificando como `INVALID_AMOUNT` (como antes para campo desconhecido/null).
+  - Em erro, o receptor não é alterado.
+- **Negativos: aceitos.** `Money` serializa diferenças internas (`difference` da
+  reconciliação, `ReconciliationResponse`) e `Marshal → Unmarshal` precisa fazer round-trip
+  de qualquer `Money` válido, inclusive `MinInt64`/`MaxInt64` centavos (testado). A não
+  negatividade das entradas financeiras externas é validada no ponto de entrada
+  (`strictjson.Money` → `ParseNonNegative`), único caminho de HTTP e SQS.
+- **Formato aceito.** O de `MarshalJSON` (`"25.00"`) e as formas equivalentes de `Parse`
+  (`"25"`, `"25.5"`), as mesmas aceitas pelo `strictjson`; a saída é sempre canônica.
+- **Alternativa descartada: extrair um pacote comum** que o `strictjson` reutilizasse. O
+  `strictjson` precisa de caminho de campo (`FieldError`), sentinelas próprias
+  (`ErrUnknownField`, `ErrDuplicateField`...) e serve objetos com chaves arbitrárias; o
+  domínio só precisa de duas chaves fixas. A duplicação é de ~50 linhas, e a equivalência
+  das regras de objeto é fixada por casos espelhados nas duas suítes
+  (`TestJSONUnmarshalStrict`/`TestJSONUnmarshalEscapes` no domínio,
+  `TestMoneyObjectRules` no `strictjson`): caixa (`AMOUNT`, `Amount`, `Currency`, também via
+  escape), repetição (inclusive mesmo valor, `null` seguido de valor e via escape), extras,
+  ausentes, tipos, escapes aceitos em chaves e valores e sobra após o objeto. Os sentinelas
+  diferem (`ErrMalformedMoneyJSON` no domínio; `ErrUnknownField`/`ErrDuplicateField`/
+  `ErrWrongType`/`ErrInvalidJSON` com caminho de campo no adapter), e o adapter rejeita
+  negativos (`ParseNonNegative`), que o domínio aceita.
+- **Testes** (`internal/domain/money_test.go`): `TestJSONUnmarshalStrict` (aceitos: negativo,
+  limites de `int64`, formas equivalentes, whitespace; rejeitados: `AMOUNT`/`Amount`/
+  `Currency`, duplicadas — inclusive mesmo valor e `null` seguido de valor —, campos extras,
+  `{}`/amount/currency ausentes, `null`/string/número/lista, amount número/booleano/objeto/
+  lista, currency `null`/booleano/minúscula/não suportada, espaços, `+`, `Infinity`, `-0.00`,
+  overflow negativo, entrada vazia, truncada, vírgula final, sobra; cada erro é classificável
+  e o receptor fica intacto), `TestJSONUnmarshalEscapes` (escapes unicode reais, montados
+  em tempo de execução com a barra `0x5c` e com guarda que falha se o escape não estiver
+  literal na entrada: chave `amount`/`currency` e valores de amount/currency escapados
+  aceitos; `AMOUNT`/`Currency` via escape, `amount` repetida via escape, moeda minúscula e
+  `+` via escape rejeitados), `TestJSONUnmarshalEmbeddedStrict` (`CURRENCY` dentro de um
+  objeto maior), `TestJSONUnmarshal`/`TestJSONMarshal` (contrato e round-trip, já existentes)
+  e `FuzzJSONRoundTrip` (todo valor aceito reserializa e volta igual; erro não altera o alvo);
+  `internal/adapters/strictjson/strictjson_test.go`: `TestMoneyObjectRules` (os casos
+  espelhados acima, com sentinela e caminho de campo do adapter).

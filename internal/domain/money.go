@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 )
@@ -362,33 +363,50 @@ func (m Money) MarshalJSON() ([]byte, error) {
 	return json.Marshal(moneyJSON{Amount: m.Amount(), Currency: string(m.currency)})
 }
 
-// UnmarshalJSON aceita apenas {"amount":"<decimal>","currency":"<ISO>"}.
+// ErrMalformedMoneyJSON indica um objeto JSON de Money estruturalmente
+// inválido: não é objeto (inclusive null), chave desconhecida ou com outra
+// caixa, chave repetida, JSON malformado ou dados depois do objeto. Também
+// satisfaz errors.Is(err, ErrInvalidAmount), para que a classificação
+// (ValidationFailureCode) continue sendo INVALID_AMOUNT.
+var ErrMalformedMoneyJSON = fmt.Errorf("%w: malformed money JSON", ErrInvalidAmount)
+
+// UnmarshalJSON aceita apenas {"amount":"<decimal>","currency":"<ISO>"}
+// (ARCHITECTURE.md §3, ADR-033).
 //
-// Decisão: o decoder é estrito — campos desconhecidos, campos ausentes, null e
-// amount numérico (ex.: 25.00 sem aspas) são rejeitados. Isso garante que o
-// valor nunca seja interpretado como número JSON (que o encoding/json
-// converteria para ponto flutuante). Negativos são aceitos aqui porque o tipo
-// também serializa diferenças; a fronteira externa valida o sinal.
+// Decisão: o decoder é estrito e aplica as mesmas regras de objeto que
+// internal/adapters/strictjson (sem importá-lo: o domínio não depende de
+// adapters):
+//
+//   - o valor é UM objeto JSON e nada mais (null, lista, string ou número →
+//     ErrMalformedMoneyJSON; dados depois do objeto também);
+//   - só as chaves "amount" e "currency", com caixa exata (o encoding/json
+//     padrão casaria "AMOUNT"), cada uma no máximo uma vez (o padrão ficaria
+//     com a última) → ErrMalformedMoneyJSON;
+//   - amount e currency são obrigatórios e strings JSON (null, número — que o
+//     encoding/json converteria para ponto flutuante —, booleano, objeto ou
+//     lista são rejeitados): problema em amount → ErrInvalidAmount, em
+//     currency → ErrInvalidCurrency;
+//   - os valores passam por Parse (gramática decimal estrita, escala ≤ 2,
+//     overflow, moeda suportada em caixa alta). Whitespace JSON entre tokens é
+//     aceito; dentro da string do amount, não.
+//
+// Negativos são aceitos aqui porque o tipo também serializa diferenças
+// internas (ex.: "difference" da reconciliação) e Marshal→Unmarshal precisa
+// fazer round-trip de qualquer Money válido. A não negatividade é validada
+// no ponto de entrada externo (strictjson.Money → ParseNonNegative), que é o
+// único caminho usado por HTTP e SQS. Em erro, o receptor não é alterado.
 func (m *Money) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Amount   json.RawMessage `json:"amount"`
-		Currency json.RawMessage `json:"currency"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&raw); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidAmount, err)
-	}
-	if dec.More() {
-		return fmt.Errorf("%w: trailing data", ErrInvalidAmount)
-	}
-	amount, err := jsonString(raw.Amount)
+	amountRaw, currencyRaw, err := decodeMoneyObject(data)
 	if err != nil {
-		return fmt.Errorf("%w: amount must be a JSON string", ErrInvalidAmount)
+		return err
 	}
-	currency, err := jsonString(raw.Currency)
+	amount, err := moneyJSONString("amount", amountRaw)
 	if err != nil {
-		return fmt.Errorf("%w: currency must be a JSON string", ErrInvalidCurrency)
+		return fmt.Errorf("%w: %w", ErrInvalidAmount, err)
+	}
+	currency, err := moneyJSONString("currency", currencyRaw)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidCurrency, err)
 	}
 	parsed, err := Parse(amount, currency)
 	if err != nil {
@@ -398,13 +416,67 @@ func (m *Money) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func jsonString(raw json.RawMessage) (string, error) {
+// decodeMoneyObject lê data como UM objeto JSON com no máximo as chaves
+// "amount" e "currency" (caixa exata, sem repetição) e devolve o valor cru de
+// cada uma (nil se ausente). Nenhum valor é decodificado para tipo numérico.
+func decodeMoneyObject(data []byte) (amount, currency json.RawMessage, err error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrMalformedMoneyJSON, err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, nil, fmt.Errorf("%w: expected an object", ErrMalformedMoneyJSON)
+	}
+	var seenAmount, seenCurrency bool
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", ErrMalformedMoneyJSON, err)
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, nil, fmt.Errorf("%w: expected a key", ErrMalformedMoneyJSON)
+		}
+		var dst *json.RawMessage
+		var seen *bool
+		switch key {
+		case "amount":
+			dst, seen = &amount, &seenAmount
+		case "currency":
+			dst, seen = &currency, &seenCurrency
+		default:
+			return nil, nil, fmt.Errorf("%w: unknown field %q", ErrMalformedMoneyJSON, key)
+		}
+		if *seen {
+			return nil, nil, fmt.Errorf("%w: duplicate field %q", ErrMalformedMoneyJSON, key)
+		}
+		*seen = true
+		if err := dec.Decode(dst); err != nil {
+			return nil, nil, fmt.Errorf("%w: %s: %v", ErrMalformedMoneyJSON, key, err)
+		}
+	}
+	if _, err := dec.Token(); err != nil { // '}'
+		return nil, nil, fmt.Errorf("%w: %v", ErrMalformedMoneyJSON, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, nil, fmt.Errorf("%w: trailing data after object", ErrMalformedMoneyJSON)
+	}
+	return amount, currency, nil
+}
+
+// moneyJSONString converte um valor cru numa string JSON. Ausente (nil),
+// null, número, booleano, objeto ou lista são erro.
+func moneyJSONString(field string, raw json.RawMessage) (string, error) {
+	if raw == nil {
+		return "", fmt.Errorf("missing field %q", field)
+	}
 	if len(raw) == 0 || raw[0] != '"' {
-		return "", errors.New("not a string")
+		return "", fmt.Errorf("field %q must be a JSON string", field)
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", err
+		return "", fmt.Errorf("field %q: %w", field, err)
 	}
 	return s, nil
 }

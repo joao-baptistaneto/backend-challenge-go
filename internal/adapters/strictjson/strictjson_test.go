@@ -3,6 +3,7 @@ package strictjson_test
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/junglegaming/backend-challenge-go/internal/adapters/strictjson"
@@ -121,5 +122,88 @@ func TestMoney(t *testing.T) {
 				t.Fatalf("field = %q, want %q", got, tc.field)
 			}
 		})
+	}
+}
+
+// jsonBackslash é a barra invertida montada por código (byte 0x5c), para que
+// os escapes unicode JSON (barra, "u", 4 dígitos hex) cheguem literais ao
+// decoder, sem serem decodificados antes (nem pelo compilador nem por
+// ferramentas de edição).
+const jsonBackslash = "\x5c"
+
+// esc devolve o escape unicode JSON literal (6 bytes) do código hex dado.
+func esc(hex string) string { return jsonBackslash + "u" + hex }
+
+// TestMoneyObjectRules fixa as regras de objeto equivalentes às de
+// domain.Money.UnmarshalJSON (T32, ADR-033; casos espelhados de
+// TestJSONUnmarshalStrict e TestJSONUnmarshalEscapes): caixa exata, sem
+// repetição (inclusive via escape), sem extras, ambos obrigatórios, escapes
+// aceitos. Diferença deliberada: aqui negativos são rejeitados
+// (ParseNonNegative), no domínio são aceitos.
+func TestMoneyObjectRules(t *testing.T) {
+	accepted := map[string]string{
+		"escaped key amount":     `{"` + esc("0061") + `mount":"1.00","currency":"BRL"}`,
+		"escaped key currency":   `{"amount":"1.00","` + esc("0063") + `urrency":"BRL"}`,
+		"escaped amount value":   `{"amount":"` + esc("0031") + `.00","currency":"BRL"}`,
+		"escaped currency value": `{"amount":"1.00","currency":"` + esc("0042") + `RL"}`,
+		"JSON whitespace":        " \n\t{ \"amount\" : \"1.00\" ,\r\n \"currency\" : \"BRL\" } \n",
+		"equivalent form":        `{"amount":"1","currency":"BRL"}`,
+	}
+	for name, raw := range accepted {
+		t.Run(name, func(t *testing.T) {
+			m, err := strictjson.Money("money", json.RawMessage(raw))
+			if err != nil {
+				t.Fatalf("money: %v", err)
+			}
+			if m.MinorUnits() != 100 || m.Currency() != "BRL" {
+				t.Fatalf("money = %s", m)
+			}
+		})
+	}
+
+	rejected := map[string]struct {
+		raw   string
+		want  error
+		field string
+	}{
+		"AMOUNT upper":               {`{"AMOUNT":"1.00","currency":"BRL"}`, strictjson.ErrUnknownField, "money.AMOUNT"},
+		"Amount title":               {`{"Amount":"1.00","currency":"BRL"}`, strictjson.ErrUnknownField, "money.Amount"},
+		"Currency title":             {`{"amount":"1.00","Currency":"BRL"}`, strictjson.ErrUnknownField, "money.Currency"},
+		"escaped key other case":     {`{"` + esc("0041") + `MOUNT":"1.00","currency":"BRL"}`, strictjson.ErrUnknownField, "money.AMOUNT"},
+		"escaped key Currency title": {`{"amount":"1.00","` + esc("0043") + `urrency":"BRL"}`, strictjson.ErrUnknownField, "money.Currency"},
+		"duplicate amount":           {`{"amount":"1.00","amount":"2.00","currency":"BRL"}`, strictjson.ErrDuplicateField, "money.amount"},
+		"duplicate currency":         {`{"amount":"1.00","currency":"BRL","currency":"USD"}`, strictjson.ErrDuplicateField, "money.currency"},
+		"duplicate same value":       {`{"amount":"1.00","currency":"BRL","amount":"1.00"}`, strictjson.ErrDuplicateField, "money.amount"},
+		"duplicate null then value":  {`{"amount":null,"amount":"1.00","currency":"BRL"}`, strictjson.ErrDuplicateField, "money.amount"},
+		"duplicate via escape":       {`{"amount":"1.00","currency":"BRL","` + esc("0061") + `mount":"2.00"}`, strictjson.ErrDuplicateField, "money.amount"},
+		"extra null field":           {`{"amount":"1.00","currency":"BRL","x":null}`, strictjson.ErrUnknownField, "money.x"},
+		"minor units field":          {`{"minorUnits":100,"currency":"BRL"}`, strictjson.ErrUnknownField, "money.minorUnits"},
+		"empty object":               {`{}`, domain.ErrInvalidAmount, "money.amount"},
+		"currency missing":           {`{"amount":"1.00"}`, domain.ErrInvalidCurrency, "money.currency"},
+		"null":                       {`null`, strictjson.ErrWrongType, "money"},
+		"array":                      {`["1.00","BRL"]`, strictjson.ErrWrongType, "money"},
+		"amount bool":                {`{"amount":true,"currency":"BRL"}`, domain.ErrInvalidAmount, "money.amount"},
+		"currency null":              {`{"amount":"1.00","currency":null}`, domain.ErrInvalidCurrency, "money.currency"},
+		"escaped lowercase currency": {`{"amount":"1.00","currency":"` + esc("0062") + `rl"}`, domain.ErrInvalidCurrency, "money.currency"},
+		"escaped plus sign":          {`{"amount":"` + esc("002b") + `1.00","currency":"BRL"}`, domain.ErrInvalidAmount, "money.amount"},
+		"trailing object":            {`{"amount":"1.00","currency":"BRL"}{}`, strictjson.ErrInvalidJSON, "money"},
+	}
+	for name, tc := range rejected {
+		t.Run(name, func(t *testing.T) {
+			_, err := strictjson.Money("money", json.RawMessage(tc.raw))
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if got := strictjson.Field(err); got != tc.field {
+				t.Fatalf("field = %q, want %q", got, tc.field)
+			}
+		})
+	}
+
+	// Guarda: os casos de escape só valem se o escape estiver literal.
+	for _, raw := range []string{accepted["escaped key amount"], rejected["duplicate via escape"].raw} {
+		if !strings.Contains(raw, jsonBackslash+"u") || !json.Valid([]byte(raw)) {
+			t.Fatalf("input %q lacks a literal unicode escape or is invalid JSON", raw)
+		}
 	}
 }

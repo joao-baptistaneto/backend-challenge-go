@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -449,6 +450,63 @@ func TestJSONUnmarshal(t *testing.T) {
 	}
 }
 
+// jsonBackslash é a barra invertida montada por código (byte 0x5c), para que
+// os escapes unicode JSON (barra, "u", 4 dígitos hex) dos casos abaixo cheguem
+// literais ao decoder, sem serem decodificados antes (nem pelo compilador nem
+// por ferramentas de edição).
+const jsonBackslash = "\x5c"
+
+// esc devolve o escape unicode JSON literal (6 bytes) do código hex dado.
+func esc(hex string) string { return jsonBackslash + "u" + hex }
+
+// TestJSONUnmarshalEscapes cobre escapes unicode reais em chaves e valores
+// (T32): caixa e repetição valem para a chave já decodificada.
+func TestJSONUnmarshalEscapes(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        string
+		wantMinor int64
+		wantCur   string
+		wantErr   error
+	}{
+		{name: "escaped key amount", in: `{"` + esc("0061") + `mount":"1.00","currency":"BRL"}`, wantMinor: 100, wantCur: "BRL"},
+		{name: "escaped key currency", in: `{"amount":"1.00","` + esc("0063") + `urrency":"BRL"}`, wantMinor: 100, wantCur: "BRL"},
+		{name: "escaped amount value", in: `{"amount":"` + esc("0031") + `.00","currency":"BRL"}`, wantMinor: 100, wantCur: "BRL"},
+		{name: "escaped currency value", in: `{"amount":"1.00","currency":"` + esc("0042") + `RL"}`, wantMinor: 100, wantCur: "BRL"},
+		{name: "escaped key other case", in: `{"` + esc("0041") + `MOUNT":"1.00","currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "escaped key Currency title", in: `{"amount":"1.00","` + esc("0043") + `urrency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "duplicate via escape", in: `{"amount":"1.00","currency":"BRL","` + esc("0061") + `mount":"2.00"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "escaped lowercase currency", in: `{"amount":"1.00","currency":"` + esc("0062") + `rl"}`, wantErr: ErrInvalidCurrency},
+		{name: "escaped plus sign", in: `{"amount":"` + esc("002b") + `1.00","currency":"BRL"}`, wantErr: ErrInvalidAmount},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Guarda: o caso só vale se o escape estiver literal na entrada.
+			if !strings.Contains(tt.in, jsonBackslash+"u") || !json.Valid([]byte(tt.in)) {
+				t.Fatalf("input %q lacks a literal unicode escape or is invalid JSON", tt.in)
+			}
+			m := mustParse(t, "7.00", "USD")
+			before := m
+			err := json.Unmarshal([]byte(tt.in), &m)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tt.wantErr)
+				}
+				if m != before {
+					t.Errorf("target modified on error: %#v", m)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if m.MinorUnits() != tt.wantMinor || string(m.Currency()) != tt.wantCur {
+				t.Errorf("got %#v", m)
+			}
+		})
+	}
+}
+
 func TestJSONUnmarshalEmbedded(t *testing.T) {
 	var req struct {
 		Money Money `json:"money"`
@@ -459,6 +517,146 @@ func TestJSONUnmarshalEmbedded(t *testing.T) {
 	if req.Money.String() != "25.00 BRL" {
 		t.Errorf("got %v", req.Money)
 	}
+}
+
+// TestJSONUnmarshalStrict cobre as regras de objeto estritas (T32, lacuna
+// L4): as mesmas do adapter strictjson, sem importá-lo.
+func TestJSONUnmarshalStrict(t *testing.T) {
+	accepted := []struct {
+		name      string
+		in        string
+		wantMinor int64
+		wantCur   string
+	}{
+		{name: "negative difference", in: `{"amount":"-0.10","currency":"BRL"}`, wantMinor: -10, wantCur: "BRL"},
+		{name: "min int64", in: `{"amount":"` + minAmount + `","currency":"BRL"}`, wantMinor: math.MinInt64, wantCur: "BRL"},
+		{name: "max int64", in: `{"amount":"` + maxAmount + `","currency":"BRL"}`, wantMinor: math.MaxInt64, wantCur: "BRL"},
+		{name: "equivalent forms", in: `{"amount":"25.5","currency":"EUR"}`, wantMinor: 2550, wantCur: "EUR"},
+		{name: "JSON whitespace", in: " \n\t{ \"amount\" : \"1.00\" ,\r\n \"currency\" : \"BRL\" } \n", wantMinor: 100, wantCur: "BRL"},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			var m Money
+			if err := json.Unmarshal([]byte(tt.in), &m); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if m.MinorUnits() != tt.wantMinor || string(m.Currency()) != tt.wantCur {
+				t.Errorf("got %#v", m)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name    string
+		in      string
+		wantErr error
+	}{
+		// Caixa das chaves (encoding/json padrão casaria sem diferenciar).
+		{name: "AMOUNT upper", in: `{"AMOUNT":"1.00","currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "Amount title", in: `{"Amount":"1.00","currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "Currency title", in: `{"amount":"1.00","Currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		// Chaves duplicadas (encoding/json padrão ficaria com a última).
+		{name: "duplicate amount", in: `{"amount":"1.00","amount":"2.00","currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "duplicate currency", in: `{"amount":"1.00","currency":"BRL","currency":"USD"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "duplicate same value", in: `{"amount":"1.00","currency":"BRL","amount":"1.00"}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "duplicate null then value", in: `{"amount":null,"amount":"1.00","currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		// Campos desconhecidos.
+		{name: "extra field", in: `{"amount":"1.00","currency":"BRL","x":1}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "extra null field", in: `{"amount":"1.00","currency":"BRL","x":null}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "minor units field", in: `{"minorUnits":100,"currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+		// Ausentes.
+		{name: "empty object", in: `{}`, wantErr: ErrInvalidAmount},
+		{name: "amount missing", in: `{"currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "currency missing", in: `{"amount":"1.00"}`, wantErr: ErrInvalidCurrency},
+		// Tipos errados e null.
+		{name: "null", in: `null`, wantErr: ErrMalformedMoneyJSON},
+		{name: "string", in: `"25.00 BRL"`, wantErr: ErrMalformedMoneyJSON},
+		{name: "number", in: `25`, wantErr: ErrMalformedMoneyJSON},
+		{name: "array", in: `["1.00","BRL"]`, wantErr: ErrMalformedMoneyJSON},
+		{name: "amount float", in: `{"amount":25.00,"currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "amount bool", in: `{"amount":true,"currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "amount object", in: `{"amount":{},"currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "amount array", in: `{"amount":["1.00"],"currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "currency null", in: `{"amount":"1.00","currency":null}`, wantErr: ErrInvalidCurrency},
+		{name: "currency bool", in: `{"amount":"1.00","currency":false}`, wantErr: ErrInvalidCurrency},
+		{name: "currency lower", in: `{"amount":"1.00","currency":"brl"}`, wantErr: ErrInvalidCurrency},
+		{name: "currency unsupported", in: `{"amount":"1.00","currency":"JPY"}`, wantErr: ErrInvalidCurrency},
+		// Valor: gramática estrita de Parse.
+		{name: "amount spaces", in: `{"amount":" 1.00","currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "amount plus", in: `{"amount":"+1.00","currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "amount Infinity", in: `{"amount":"Infinity","currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "negative zero", in: `{"amount":"-0.00","currency":"BRL"}`, wantErr: ErrInvalidAmount},
+		{name: "negative overflow", in: `{"amount":"-92233720368547758.09","currency":"BRL"}`, wantErr: ErrMoneyOverflow},
+		// JSON malformado ou com sobra.
+		{name: "empty input", in: ``, wantErr: ErrMalformedMoneyJSON},
+		{name: "truncated", in: `{"amount":"1.00","currency":"BRL"`, wantErr: ErrMalformedMoneyJSON},
+		{name: "trailing comma", in: `{"amount":"1.00","currency":"BRL",}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "trailing object", in: `{"amount":"1.00","currency":"BRL"}{}`, wantErr: ErrMalformedMoneyJSON},
+		{name: "trailing garbage", in: `{"amount":"1.00","currency":"BRL"}x`, wantErr: ErrMalformedMoneyJSON},
+		{name: "bad value", in: `{"amount":tru,"currency":"BRL"}`, wantErr: ErrMalformedMoneyJSON},
+	}
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			// Chamada direta: json.Unmarshal valida a sintaxe antes de chamar
+			// o método, então só a chamada direta exercita a sobra/truncamento.
+			m := mustParse(t, "7.00", "USD")
+			before := m
+			err := m.UnmarshalJSON([]byte(tt.in))
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+			if code, ok := ValidationFailureCode(err); !ok || code == "" {
+				t.Errorf("err %v is not classifiable", err)
+			}
+			if m != before {
+				t.Errorf("target modified on error: %#v", m)
+			}
+		})
+	}
+}
+
+// TestJSONUnmarshalEmbeddedStrict garante que a regra de caixa vale também
+// para o Money embutido: só as chaves de dentro do Money são do método.
+func TestJSONUnmarshalEmbeddedStrict(t *testing.T) {
+	var req struct {
+		Money Money `json:"money"`
+	}
+	err := json.Unmarshal([]byte(`{"money":{"amount":"1.00","CURRENCY":"BRL"}}`), &req)
+	if !errors.Is(err, ErrMalformedMoneyJSON) {
+		t.Fatalf("err = %v, want ErrMalformedMoneyJSON", err)
+	}
+}
+
+// FuzzJSONRoundTrip: todo Money aceito por UnmarshalJSON reserializa na forma
+// canônica e volta ao mesmo valor; nada entra em pânico.
+func FuzzJSONRoundTrip(f *testing.F) {
+	for _, s := range []string{
+		`{"amount":"25.00","currency":"BRL"}`,
+		`{"currency":"USD","amount":"-0.5"}`,
+		`{"AMOUNT":"1","currency":"BRL"}`,
+		`{"amount":"1","amount":"2","currency":"BRL"}`,
+		`{"amount":1e2,"currency":"BRL"}`,
+		`null`,
+	} {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var m Money
+		if err := m.UnmarshalJSON(data); err != nil {
+			if m != (Money{}) {
+				t.Fatalf("target modified on error: %#v", m)
+			}
+			return
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		var back Money
+		if err := json.Unmarshal(b, &back); err != nil || back != m {
+			t.Fatalf("round-trip %s: %#v, %v", b, back, err)
+		}
+	})
 }
 
 func TestParseCurrency(t *testing.T) {
