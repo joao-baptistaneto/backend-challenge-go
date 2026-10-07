@@ -737,7 +737,8 @@ func TestWorkerIndexes(t *testing.T) {
 		"wager_transactions_pending_idx":               "PENDING",
 		"wager_transactions_opening_per_wallet_key":    "OPENING",
 		"wager_transactions_reversal_once_key":         "PROCESSED",
-		"outbox_unpublished_due_idx":                   "published_at IS NULL",
+		"outbox_unpublished_seq_idx":                   "published_at IS NULL",
+		"outbox_unpublished_aggregate_seq_idx":         "(aggregate_id, seq)",
 		"wallet_ledger_entries_wallet_page_idx":        "created_at",
 		"wallet_ledger_entries_wallet_seq_key":         "(wallet_id, seq)",
 	}

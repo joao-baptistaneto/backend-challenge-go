@@ -135,7 +135,8 @@ type Metrics struct {
 	// OutboxOldestPendingAge é a idade, em segundos, do evento pendente mais
 	// antigo (atraso da outbox; 0 quando vazia).
 	OutboxOldestPendingAge prometheus.Gauge
-	// OutboxPublishDelay mede created_at → publicação efetiva no SQS.
+	// OutboxPublishDelay mede occurred_at do evento → publicação efetiva no
+	// SQS (atraso fim a fim da outbox, inclusive retries e backoff).
 	OutboxPublishDelay prometheus.Histogram
 	// ProcessingDuration mede a latência dos casos de uso por canal,
 	// operação e outcome.
@@ -214,7 +215,7 @@ func New(reg prometheus.Registerer) (*Metrics, error) {
 		}),
 		OutboxPublishDelay: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: Namespace, Name: "outbox_publish_delay_seconds",
-			Help:    "Atraso entre a criação do evento na outbox e sua publicação no SQS.",
+			Help:    "Atraso entre a ocorrência do evento (occurred_at) e sua publicação no SQS.",
 			Buckets: outboxDelayBuckets,
 		}),
 		ProcessingDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -306,9 +307,10 @@ func (m *Metrics) SetOutboxBacklog(pending int64, oldestAge time.Duration) {
 	m.OutboxOldestPendingAge.Set(oldestAge.Seconds())
 }
 
-// OutboxPublished registra a publicação de um evento criado em createdAt.
-func (m *Metrics) OutboxPublished(createdAt, publishedAt time.Time) {
-	d := publishedAt.Sub(createdAt)
+// OutboxPublished registra a publicação de um evento ocorrido em occurredAt
+// (now − occurred_at no instante da publicação).
+func (m *Metrics) OutboxPublished(occurredAt, publishedAt time.Time) {
+	d := publishedAt.Sub(occurredAt)
 	if d < 0 {
 		d = 0 // relógios distintos entre banco e aplicação
 	}

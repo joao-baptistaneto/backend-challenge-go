@@ -165,6 +165,7 @@ func TestInboxOutboxValidationBeforeSQL(t *testing.T) {
 		"published zero":      {outbox.MarkPublished(ctx, q, OutboxLease{}), ErrInvalidLease},
 		"failed zero lease":   {outbox.MarkFailed(ctx, q, OutboxLease{}, "x", DefaultOutboxBackoff()), ErrInvalidLease},
 		"failed bad backoff":  {outbox.MarkFailed(ctx, q, lease, "x", OutboxBackoff{}), ErrInvalidBackoff},
+		"release zero lease":  {outbox.Release(ctx, q, OutboxLease{}), ErrInvalidLease},
 	}
 	for name, c := range cases {
 		if !errors.Is(c.err, c.want) {
@@ -186,6 +187,25 @@ func TestOutboxConstraintMapping(t *testing.T) {
 		err := mapWriteError("op", &pgconn.PgError{Code: CodeUniqueViolation, ConstraintName: constraint})
 		if !errors.Is(err, want) || !errors.Is(err, ErrUniqueViolation) {
 			t.Fatalf("%s: %v", constraint, err)
+		}
+	}
+}
+
+func TestOutboxBacklogOldestAge(t *testing.T) {
+	t.Parallel()
+	now := unitT0
+	cases := map[string]struct {
+		b    OutboxBacklog
+		want time.Duration
+	}{
+		"empty":         {OutboxBacklog{Now: now}, 0},
+		"pending":       {OutboxBacklog{Pending: 2, OldestOccurredAt: now.Add(-3 * time.Second), Now: now}, 3 * time.Second},
+		"clock ahead":   {OutboxBacklog{Pending: 1, OldestOccurredAt: now.Add(time.Second), Now: now}, 0},
+		"zero occurred": {OutboxBacklog{Pending: 1, Now: now}, 0},
+	}
+	for name, c := range cases {
+		if got := c.b.OldestAge(); got != c.want {
+			t.Errorf("%s: OldestAge = %v, want %v", name, got, c.want)
 		}
 	}
 }

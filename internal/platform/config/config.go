@@ -78,6 +78,11 @@ const (
 	EnvOutboxPollInterval          = "OUTBOX_POLL_INTERVAL"
 	EnvOutboxBatchSize             = "OUTBOX_BATCH_SIZE"
 	EnvOutboxLease                 = "OUTBOX_LEASE"
+	EnvOutboxConcurrency           = "OUTBOX_CONCURRENCY"
+	EnvOutboxPublishTimeout        = "OUTBOX_PUBLISH_TIMEOUT"
+	EnvOutboxDrainTimeout          = "OUTBOX_DRAIN_TIMEOUT"
+	EnvOutboxRetryBaseDelay        = "OUTBOX_RETRY_BASE_DELAY"
+	EnvOutboxRetryMaxDelay         = "OUTBOX_RETRY_MAX_DELAY"
 	EnvPendingReferenceMaxAttempts = "PENDING_REFERENCE_MAX_ATTEMPTS"
 	EnvPendingReferenceTTL         = "PENDING_REFERENCE_TTL"
 
@@ -142,6 +147,23 @@ const (
 	maxSQSMaxAttempts       = 999
 	maxSQSWaitTime          = 20 * time.Second
 	maxSQSVisibilityTimeout = 12 * time.Hour
+)
+
+// Defaults e limites do publisher da outbox (ARCHITECTURE.md, ADR-024). O
+// lease máximo é o aceito por postgres.OutboxRepository.Claim (1h).
+const (
+	DefaultOutboxPollInterval   = time.Second
+	DefaultOutboxBatchSize      = 50
+	DefaultOutboxLease          = 30 * time.Second
+	DefaultOutboxConcurrency    = 4
+	DefaultOutboxPublishTimeout = 5 * time.Second
+	DefaultOutboxDrainTimeout   = 10 * time.Second
+	DefaultOutboxRetryBaseDelay = time.Second
+	DefaultOutboxRetryMaxDelay  = 5 * time.Minute
+
+	maxOutboxLease       = time.Hour
+	maxOutboxConcurrency = 100
+	maxOutboxDelay       = 24 * time.Hour
 )
 
 // Defaults e limites do worker de pendências (ARCHITECTURE.md, ADR-023).
@@ -239,10 +261,9 @@ func (c AWSConfig) HasStaticCredentials() bool {
 
 // SQSConfig agrupa as URLs das filas. Todas são FIFO.
 //
-// Nota: .env.example usa a fila de eventos "wallet-events.fifo", enquanto
-// task_plan.md (T24) cita "wager-events.fifo". O nome é configuração, não
-// código: este pacote só exige uma URL FIFO válida, e o valor de referência
-// adotado é o de .env.example.
+// A fila de eventos de saída padronizada é "wager-events.fifo" (T22,
+// ADR-024; antes .env.example citava "wallet-events.fifo"). O nome é
+// configuração, não código: este pacote só exige uma URL FIFO válida.
 type SQSConfig struct {
 	InboundQueueURL string
 	// InboundDLQURL é opcional: o consumidor envia à DLQ da RedrivePolicy da
@@ -311,9 +332,30 @@ type OIDCConfig struct {
 // WorkersConfig agrupa parâmetros dos workers de outbox e de referências
 // pendentes.
 type WorkersConfig struct {
+	// Publisher da outbox (ADR-024).
+	//
+	// OutboxPollInterval é a espera entre ciclos quando o último claim veio
+	// vazio. OutboxBatchSize é o tamanho máximo do lote reivindicado (no
+	// máximo um evento por agregado). OutboxLease é o lease persistido do
+	// lote (1s a 1h): um evento não marcado nesse prazo (crash) volta a ser
+	// elegível para outra instância.
 	OutboxPollInterval time.Duration
 	OutboxBatchSize    int
 	OutboxLease        time.Duration
+	// OutboxConcurrency é o número de eventos do lote publicados em
+	// paralelo (agregados distintos).
+	OutboxConcurrency int
+	// OutboxPublishTimeout limita cada chamada externa de um evento
+	// (SendMessage; MarkPublished/MarkFailed). Duas chamadas precisam caber no
+	// lease: 2·OutboxPublishTimeout < OutboxLease.
+	OutboxPublishTimeout time.Duration
+	// OutboxDrainTimeout é o prazo, no shutdown, para concluir as publicações
+	// em voo.
+	OutboxDrainTimeout time.Duration
+	// OutboxRetryBaseDelay/MaxDelay: backoff persistido após falha de
+	// publicação (base·2^(tentativa−1), com teto).
+	OutboxRetryBaseDelay time.Duration
+	OutboxRetryMaxDelay  time.Duration
 	// PendingReferenceMaxAttempts é o máximo de buscas da referência,
 	// contando a do aceite; PendingReferenceTTL é o prazo desde a criação.
 	// Esgotado qualquer um, a operação vira REJECTED REFERENCE_NOT_FOUND
@@ -423,9 +465,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	c.OIDC.ClockSkew = p.durationRange(EnvOIDCClockSkew, DefaultOIDCClockSkew, 0, maxOIDCClockSkew)
 
-	c.Workers.OutboxPollInterval = p.positiveDuration(EnvOutboxPollInterval, time.Second)
-	c.Workers.OutboxBatchSize = p.intRange(EnvOutboxBatchSize, 50, 1, maxOutboxBatchSize)
-	c.Workers.OutboxLease = p.positiveDuration(EnvOutboxLease, 30*time.Second)
+	p.outboxPublisher(&c.Workers)
 	c.Workers.PendingReferenceMaxAttempts = p.intRange(EnvPendingReferenceMaxAttempts, 10, 1, math.MaxInt32)
 	c.Workers.PendingReferenceTTL = p.positiveDuration(EnvPendingReferenceTTL, 10*time.Minute)
 	c.Workers.PendingReferenceRetryBaseDelay = p.durationRange(EnvPendingReferenceRetryBaseDelay,
@@ -436,13 +476,6 @@ func Load(lookup LookupFunc) (Config, error) {
 		p.fail(EnvPendingReferenceRetryMaxDelay, "não pode ser menor que "+EnvPendingReferenceRetryBaseDelay)
 	}
 	c.Workers.PendingWorker = p.pendingWorker()
-
-	// O lease precisa ser maior que o intervalo de polling; caso contrário um
-	// lote reivindicado expira antes do próximo ciclo e outro publisher o
-	// reassume, gerando publicações duplicadas desnecessárias.
-	if c.Workers.OutboxLease > 0 && c.Workers.OutboxPollInterval > 0 && c.Workers.OutboxLease <= c.Workers.OutboxPollInterval {
-		p.fail(EnvOutboxLease, "deve ser maior que "+EnvOutboxPollInterval)
-	}
 
 	if err := p.err(); err != nil {
 		return Config{}, err
@@ -583,6 +616,33 @@ func (p *parser) sqsConsumer() SQSConsumerConfig {
 		p.fail(EnvSQSRetryMaxDelay, "não pode ser menor que "+EnvSQSRetryBaseDelay)
 	}
 	return c
+}
+
+// outboxPublisher lê e valida os parâmetros do publisher da outbox.
+func (p *parser) outboxPublisher(w *WorkersConfig) {
+	w.OutboxPollInterval = p.durationRange(EnvOutboxPollInterval, DefaultOutboxPollInterval, time.Millisecond, maxOutboxDelay)
+	w.OutboxBatchSize = p.intRange(EnvOutboxBatchSize, DefaultOutboxBatchSize, 1, maxOutboxBatchSize)
+	w.OutboxLease = p.durationRange(EnvOutboxLease, DefaultOutboxLease, time.Second, maxOutboxLease)
+	w.OutboxConcurrency = p.intRange(EnvOutboxConcurrency, DefaultOutboxConcurrency, 1, maxOutboxConcurrency)
+	w.OutboxPublishTimeout = p.durationRange(EnvOutboxPublishTimeout, DefaultOutboxPublishTimeout, time.Millisecond, maxOutboxLease)
+	w.OutboxDrainTimeout = p.durationRange(EnvOutboxDrainTimeout, DefaultOutboxDrainTimeout, time.Millisecond, maxOutboxDelay)
+	w.OutboxRetryBaseDelay = p.durationRange(EnvOutboxRetryBaseDelay, DefaultOutboxRetryBaseDelay, time.Millisecond, maxOutboxDelay)
+	w.OutboxRetryMaxDelay = p.durationRange(EnvOutboxRetryMaxDelay, DefaultOutboxRetryMaxDelay, time.Millisecond, maxOutboxDelay)
+	// O lease precisa ser maior que o intervalo de polling; caso contrário um
+	// lote reivindicado expira antes do próximo ciclo e outro publisher o
+	// reassume, gerando publicações duplicadas desnecessárias.
+	if w.OutboxLease > 0 && w.OutboxPollInterval > 0 && w.OutboxLease <= w.OutboxPollInterval {
+		p.fail(EnvOutboxLease, "deve ser maior que "+EnvOutboxPollInterval)
+	}
+	// Envio e marcação de um evento precisam caber no lease; senão outro
+	// publisher reassume o evento no meio do trabalho (o fencing evita
+	// marcação errada, mas a publicação seria repetida).
+	if w.OutboxLease > 0 && w.OutboxPublishTimeout > 0 && 2*w.OutboxPublishTimeout >= w.OutboxLease {
+		p.fail(EnvOutboxPublishTimeout, "o dobro deve ser menor que "+EnvOutboxLease)
+	}
+	if b, m := w.OutboxRetryBaseDelay, w.OutboxRetryMaxDelay; b > 0 && m > 0 && m < b {
+		p.fail(EnvOutboxRetryMaxDelay, "não pode ser menor que "+EnvOutboxRetryBaseDelay)
+	}
 }
 
 // pendingWorker lê e valida os parâmetros do worker de pendências.

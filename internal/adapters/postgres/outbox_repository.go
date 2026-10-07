@@ -45,11 +45,16 @@ import (
 //     um crash entre claim e mark também conta tentativa e entra no backoff.
 //   - MarkFailed agenda next_attempt_at = agora + OutboxBackoff.Delay(attempts)
 //     (exponencial, com teto obrigatório e sem overflow) e solta o lease.
-//   - Limitação (para T22): a ordem global por seq não impede que, com um
-//     evento em backoff, eventos posteriores do mesmo MessageGroupId sejam
-//     publicados antes dele. Garantir ordem por grupo sob falha exige bloqueio
-//     head-of-line por grupo no claim, a decidir junto com a escolha do
-//     MessageGroupId (pendência da T22).
+//   - Ordem por agregado (T22, ADR-024): o MessageGroupId é o aggregateId e o
+//     claim só devolve o evento não publicado MAIS ANTIGO (menor seq) de cada
+//     agregado (head-of-line). Enquanto ele estiver em lease, em backoff ou
+//     ainda não marcado como publicado, os eventos seguintes do mesmo agregado
+//     não são elegíveis; os outros agregados seguem normalmente. A condição só
+//     depende de published_at, que só muda pelo MarkPublished do detentor do
+//     lease. Por isso é segura entre claimers concorrentes sem serializar os
+//     claims: um snapshot antigo só pode ser mais restritivo. Consequência: um
+//     lote tem no máximo um evento por agregado e pode ser publicado em
+//     paralelo sem quebrar a ordem.
 type OutboxRepository struct{}
 
 // NewOutboxRepository cria o repositório (stateless).
@@ -170,8 +175,10 @@ o.correlation_id, o.payload::text, o.occurred_at, o.created_at, o.attempts, o.lo
 o.locked_until, o.last_error`
 
 // Claim reivindica até limit eventos para owner, com lease de duração lease,
-// em ordem de seq. Cada evento reivindicado tem attempts incrementado. Aceita
-// qualquer Querier (ver decisões); o lease vale a partir do commit do claim.
+// em ordem de seq, no máximo um por agregado (o mais antigo não publicado;
+// ver decisões). Cada evento reivindicado tem attempts incrementado. Aceita
+// qualquer Querier; o publisher usa o pool (autocommit), para que o lease
+// conte do statement_timestamp() do próprio claim e valha já no retorno.
 func (OutboxRepository) Claim(ctx context.Context, q Querier, owner string, lease time.Duration, limit int) ([]OutboxMessage, error) {
 	const op = "postgres: reivindicar eventos da outbox"
 	if l := len(owner); l < 1 || l > maxLeaseOwnerLength {
@@ -184,13 +191,20 @@ func (OutboxRepository) Claim(ctx context.Context, q Querier, owner string, leas
 		return nil, fmt.Errorf("%s: %w: lote %d (1..%d)", op, ErrInvalidLease, limit, MaxOutboxClaimBatch)
 	}
 	rows, err := q.Query(ctx, `WITH due AS (
-    SELECT seq FROM outbox
-    WHERE published_at IS NULL
-      AND next_attempt_at <= statement_timestamp()
-      AND (locked_until IS NULL OR locked_until <= statement_timestamp())
-    ORDER BY seq
+    SELECT c.seq FROM outbox c
+    WHERE c.published_at IS NULL
+      AND c.next_attempt_at <= statement_timestamp()
+      AND (c.locked_until IS NULL OR c.locked_until <= statement_timestamp())
+      -- Head-of-line por agregado (MessageGroupId): só o evento não
+      -- publicado mais antigo de cada agregado é elegível.
+      AND NOT EXISTS (
+          SELECT 1 FROM outbox prev
+          WHERE prev.aggregate_id = c.aggregate_id
+            AND prev.seq < c.seq
+            AND prev.published_at IS NULL)
+    ORDER BY c.seq
     LIMIT $3
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF c SKIP LOCKED
 )
 UPDATE outbox o
 SET locked_by = $1,
@@ -274,6 +288,65 @@ WHERE `+leaseCondition, lease.Seq, lease.EventID, lease.Owner, lease.Attempt,
 		return fmt.Errorf("%s: evento %s: %w", op, lease.EventID, ErrOutboxLeaseLost)
 	}
 	return nil
+}
+
+// Release solta o lease sem registrar falha nem reagendar: o evento volta a
+// ser elegível imediatamente (next_attempt_at intocado). O publisher usa para
+// devolver itens reivindicados que não chegou a publicar (shutdown, lease
+// perto do fim). attempts não diminui, porque o trigger exige
+// monotonicidade. Só tem efeito para o lease vigente (ErrOutboxLeaseLost).
+func (OutboxRepository) Release(ctx context.Context, q Querier, lease OutboxLease) error {
+	const op = "postgres: soltar lease da outbox"
+	if err := validateLease(lease); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	tag, err := q.Exec(ctx, `UPDATE outbox SET locked_by = NULL, locked_until = NULL
+WHERE `+leaseCondition, lease.Seq, lease.EventID, lease.Owner, lease.Attempt)
+	if err != nil {
+		return mapWriteError(op, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%s: evento %s: %w", op, lease.EventID, ErrOutboxLeaseLost)
+	}
+	return nil
+}
+
+// OutboxBacklog resume os eventos ainda não publicados.
+type OutboxBacklog struct {
+	// Pending é o número de eventos não publicados.
+	Pending int64
+	// OldestOccurredAt é o occurred_at mais antigo entre eles (zero se
+	// Pending = 0).
+	OldestOccurredAt time.Time
+	// Now é o relógio do PostgreSQL no momento da consulta.
+	Now time.Time
+}
+
+// OldestAge devolve Now − OldestOccurredAt. Devolve 0 sem pendências ou
+// quando o relógio da instância que gravou o evento estava adiantado.
+func (b OutboxBacklog) OldestAge() time.Duration {
+	if b.Pending <= 0 || b.OldestOccurredAt.IsZero() {
+		return 0
+	}
+	return max(b.Now.Sub(b.OldestOccurredAt), 0)
+}
+
+// Backlog conta os eventos não publicados e devolve o occurred_at mais
+// antigo, para as métricas de pendentes e de atraso da outbox.
+func (OutboxRepository) Backlog(ctx context.Context, q Querier) (OutboxBacklog, error) {
+	const op = "postgres: medir pendências da outbox"
+	var (
+		b      OutboxBacklog
+		oldest pgtype.Timestamptz
+	)
+	err := q.QueryRow(ctx, `SELECT count(*), min(occurred_at), statement_timestamp()
+FROM outbox WHERE published_at IS NULL`).Scan(&b.Pending, &oldest, &b.Now)
+	if err != nil {
+		return OutboxBacklog{}, fmt.Errorf("%s: %w", op, Translate(err))
+	}
+	b.OldestOccurredAt = timeOrZero(oldest)
+	b.Now = b.Now.UTC()
+	return b, nil
 }
 
 func validateLease(l OutboxLease) error {

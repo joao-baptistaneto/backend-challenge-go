@@ -183,9 +183,9 @@ conectados em `cmd/server` (T23); cada módulo tem teste de `fx.ValidateApp`.
   O valor real só sai por `Reveal()`, então os pontos de uso podem ser auditados com grep.
   Os erros de validação nunca ecoam o valor de uma variável sensível. Em URLs inválidas não
   sensíveis, o erro ecoa só scheme+host+path: userinfo, query e fragment são descartados.
-- **Fila de eventos:** `.env.example` usa `wallet-events.fifo` e `task_plan.md` (T24) cita
-  `wager-events.fifo`. Fica valendo o nome de `.env.example`. O código só exige uma URL FIFO,
-  então a escolha está na configuração e no provisionamento (T24), não no código.
+- **Fila de eventos:** padronizada em `wager-events.fifo` na T22 (ADR-024). Antes, o
+  `.env.example` citava `wallet-events.fifo`. O código só exige uma URL FIFO, então o nome
+  está na configuração e no provisionamento (T24), não no código.
 - **Logging (`logging.Module` → `*slog.Logger`, depende de `config.Config`):** `log/slog`
   com `JSONHandler` em stdout, nível vindo de `LOG_LEVEL` e atributos fixos `service`/`env`.
   As chaves de rastreio são `correlationId`, `messageId`, `transactionId`, `walletId` e
@@ -857,12 +857,10 @@ IDENTITY` (0005).
   máximo cerca de 63 vezes. O comentário de `errors.go` foi corrigido: `WithinTx` não
   chama `Translate`. Ele devolve o erro de `fn` intacto e embrulha os de BEGIN/COMMIT só
   com `%w`. A forma tipada vem dos repositórios ou de quem chama `Translate`.
-- **Limitação para a T22:** a ordem global por `seq` não impede que eventos posteriores do
-  mesmo `MessageGroupId` sejam publicados enquanto um anterior está em backoff. Garantir a
-  ordem por grupo sob falha exige bloqueio head-of-line por grupo no claim, por exemplo um
-  `NOT EXISTS` de evento anterior não publicado do mesmo grupo, combinado com a
-  serialização dos claims. Isso será decidido junto com a escolha do `MessageGroupId`,
-  hoje `aggregateId`.
+- **Limitação para a T22 (resolvida no ADR-024):** a ordem global por `seq` não impedia que
+  eventos posteriores do mesmo `MessageGroupId` fossem publicados enquanto um anterior
+  estava em backoff. A T22 acrescentou ao claim o bloqueio head-of-line por agregado. Não
+  foi preciso serializar os claims.
 - **Testes:**
   - Unitários: `exponentialDelay` (teto, saturação, attempt enorme ou negativo),
     `RetryPolicy` sem `MaxDelay` nas tentativas 41, 64 e `MaxInt`, `OutboxBackoff`,
@@ -1987,7 +1985,7 @@ Pacotes `internal/app/resume_wager.go` (caso de uso `ResumeWagerTransaction` e
   - Integração do repositório: `ClaimDue` (ordem, carência, leases vigentes, claimer
     concorrente sem espera com `lock_timeout`, fencing, reassunção após expiração,
     `Update` solta o lease), 8 claimers × 60 linhas sem duplicidade, e `CHECK`s da
-    `0007`. A migration é testada em up/down/up (`Down(4)`).
+    `0007`. A migration é testada em up/down/up (`Down(4)`; `Down(5)` desde a `0008`).
   - Integração do worker (`pendingworker`, PostgreSQL real, pool próprio por instância,
     goleak ao fim):
     - **resolução após a chegada da referência**, com reagendamentos antes, um único
@@ -2009,3 +2007,164 @@ Pacotes `internal/app/resume_wager.go` (caso de uso `ResumeWagerTransaction` e
     `ProcessWagerTransaction`. Hoje `app.Module` usa o padrão de 2s, igual ao default da
     config.
   - O `fx.StopTimeout` precisa cobrir também `PENDING_WORKER_DRAIN_TIMEOUT`.
+
+## ADR-024 — Publisher da outbox (T22)
+
+Pacote `internal/adapters/outboxpublisher` (`publisher.go`, `store.go`, `module.go`).
+O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `Release` e
+`Backlog`. A migration `0008` troca os índices do claim.
+
+- **Ciclo (sem transação aberta durante I/O):**
+  1. `Claim` em autocommit, sobre o pool. O lease conta do `statement_timestamp()` do
+     próprio comando e já vale quando o lote volta.
+  2. Publicação no SQS, fora de transação.
+  3. `MarkPublished` ou `MarkFailed`, com fencing pelo lease `(seq, eventId, owner,
+     attempts)` (ADR-015).
+
+  Lote não vazio leva a um novo ciclo imediato, porque o próximo evento de cada agregado
+  acabou de ficar elegível. Lote vazio ou falha no claim leva a uma espera de
+  `OUTBOX_POLL_INTERVAL`. Não há estado em memória: qualquer instância retoma o trabalho de
+  outra depois que o lease expira.
+- **Roteamento (contrato da fila `wager-events.fifo`):**
+  - `MessageGroupId = aggregateId`: id da transação nos eventos de transação, id da
+    carteira em `WalletBalanceChanged` (ADR-012). Decisão mantida, e não `walletId` em
+    todos, por três motivos:
+    - o enunciado da T22 fixa `aggregateId`;
+    - o ciclo `PENDING_REFERENCE` → `PROCESSED`/`REJECTED` de uma transação fica ordenado;
+    - os saldos de uma carteira ficam em ordem total.
+
+    Não há ordem entre grupos. Um consumidor que precise relacionar transação e saldo usa
+    `walletVersion` (monotônica por carteira) e `transactionId` do `WalletBalanceChanged`.
+  - `MessageDeduplicationId = eventId` (UUIDv7 gerado no construtor do evento e persistido
+    na outbox).
+  - Corpo: o snapshot JSON gravado no `Enqueue`, byte a byte. A republicação manda o mesmo
+    corpo e o mesmo `eventId`.
+  - Atributos SQS para rotear sem abrir o corpo: `eventType` (String), `eventVersion`
+    (Number), `eventId` e `correlationId` (este quando presente).
+  - **Consumo:** entrega at-least-once. O SQS FIFO descarta duplicatas do mesmo `eventId`
+    dentro da janela de 5 minutos. Fora dela (lease expirado depois de muito tempo,
+    backoff longo), o consumidor precisa deduplicar por `eventId`.
+- **Ordem por agregado sob falha (pendência do ADR-015):**
+  - O claim só devolve o evento não publicado mais antigo de cada agregado. A condição é
+    `NOT EXISTS (SELECT 1 FROM outbox prev WHERE prev.aggregate_id = c.aggregate_id AND
+    prev.seq < c.seq AND prev.published_at IS NULL)`. Enquanto o evento N estiver em
+    lease, em backoff ou não marcado, N+1 do mesmo agregado não sai. Os outros agregados
+    seguem.
+  - A condição só depende de `published_at`, que só muda pelo `MarkPublished` do detentor
+    do lease. Um snapshot antigo só pode ser mais restritivo, então a condição é segura
+    entre claimers concorrentes sem serializar os claims (a T13 cogitava serializar). Por
+    isso não há lock global.
+  - Dentro de um agregado, `seq` é a ordem de commit: os eventos de uma carteira ou
+    transação são gravados com a carteira travada, então N sempre é confirmado antes de
+    N+1 (ADR-005/014).
+  - Consequência: um lote tem no máximo um evento por agregado. Os eventos do lote são
+    publicados em paralelo (`OUTBOX_CONCURRENCY`) sem quebrar a ordem.
+  - Custo: um agregado com fila longa avança um evento por ciclo. Como lote não vazio
+    dispara o ciclo seguinte na hora, isso dá cerca de um round-trip (claim + send + mark)
+    por evento do mesmo agregado.
+- **Falhas:**
+  - **Envio falhou:** `MarkFailed` grava `last_error` e `next_attempt_at = agora +
+    min(base·2^(attempt−1), teto)`, persistido (`OUTBOX_RETRY_BASE_DELAY` 1s,
+    `OUTBOX_RETRY_MAX_DELAY` 5min). Conta em `retries_total{operation="outbox_publish"}`.
+  - **Resposta sem `MessageId`:** tratada como falha.
+  - **Sem limite de tentativas nem DLQ:** descartar um evento confirmado violaria a
+    garantia de não perda (README §3). Um evento que falha sempre bloqueia só o seu
+    agregado, e isso aparece em `outbox_oldest_pending_age_seconds` e em `last_error`.
+    `attempts` (INTEGER) cresce cerca de uma vez por teto de backoff (5min), então não
+    estoura na prática.
+  - **Publicado, mas a marcação falhou:** se o lease foi perdido (`ErrOutboxLeaseLost`,
+    outcome `conflict`) ou o banco caiu (outcome `transient_error`), o evento continua não
+    publicado. O lease expira e outra instância (ou a mesma) republica com o mesmo
+    `eventId`. O fencing impede que a marcação atrasada sobrescreva a do novo detentor.
+- **Prazos:**
+  - `OUTBOX_PUBLISH_TIMEOUT` limita cada chamada de um evento (`SendMessage`; marcação).
+  - Um item só é iniciado se envio e marcação ainda couberem no lease
+    (`claimedAt + lease − 2·timeout`, medido no relógio local antes do claim, ou seja, de
+    forma conservadora). Os que não cabem voltam por `Release` (lease solto, sem backoff
+    e sem `last_error`).
+  - A config exige `2·OUTBOX_PUBLISH_TIMEOUT < OUTBOX_LEASE` e `OUTBOX_LEASE >
+    OUTBOX_POLL_INTERVAL`. O lease vai de 1s a 1h (limite do repositório).
+- **Shutdown (`fx.Lifecycle`):**
+  - `Stop` para de reivindicar e de iniciar itens, e devolve (`Release`) os itens
+    reivindicados ainda não iniciados.
+  - Os envios em voo terminam até `OUTBOX_DRAIN_TIMEOUT`. Estourado o prazo, o contexto
+    das publicações é cancelado e `Stop` devolve `ErrDrainTimeout`. O lease fica, expira, e
+    outra instância republica com o mesmo `eventId`.
+  - `Stop` sempre espera as goroutines, salvo se o próprio ctx do OnStop vencer.
+  - O publisher depende do pool e do cliente SQS, construídos antes dele, então o Fx o
+    para antes de fechar os dois.
+- **Owner:** `hostname-UUIDv7`, único por processo. Duas réplicas no mesmo host não se
+  confundem, e o `attempts` do lease já distingue claims do mesmo owner.
+- **Métricas:**
+  - `outbox_publish_delay_seconds`: `now − occurred_at` na publicação confirmada (atraso
+    fim a fim, com retries). A ajuda da métrica passou de "criação" para "ocorrência".
+  - `outbox_pending_events` e `outbox_oldest_pending_age_seconds`: vêm do
+    `OutboxRepository.Backlog` (`count(*)`, `min(occurred_at)` e relógio do banco), medido
+    no máximo uma vez por `OUTBOX_POLL_INTERVAL` por instância.
+  - `processing_duration_seconds{source="worker",operation="outbox_publish",outcome}`.
+- **Migration `0008`:** remove `outbox_unpublished_due_idx` (`next_attempt_at, seq`), que
+  não servia ao `ORDER BY seq` nem ao `NOT EXISTS`. Cria `outbox_unpublished_seq_idx
+  (seq)` e `outbox_unpublished_aggregate_seq_idx (aggregate_id, seq)`, ambos parciais em
+  `published_at IS NULL`. O down recria o índice antigo.
+- **Config** (`config.WorkersConfig`, validada no start, documentada em `.env.example`):
+  `OUTBOX_POLL_INTERVAL` (1ms–24h), `OUTBOX_BATCH_SIZE` (1–1000), `OUTBOX_LEASE` (1s–1h),
+  `OUTBOX_CONCURRENCY` (1–100), `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_DRAIN_TIMEOUT`,
+  `OUTBOX_RETRY_BASE_DELAY` e `OUTBOX_RETRY_MAX_DELAY` (1ms–24h, teto ≥ base).
+  `SQS_EVENTS_QUEUE_URL` aponta para `wager-events.fifo`.
+- **Fx:** `outboxpublisher.Module` provê:
+  - `*PostgresStore` como `Store`, sobre o `*pgxpool.Pool` e o `*OutboxRepository` do
+    `postgres.Module`, com o backoff da config;
+  - `Sender`, a partir de `sqs.API` (`sqs.ClientModule`);
+  - o `*Publisher`, com OnStart/OnStop e `fx.Invoke`.
+
+  Métricas e logger são opcionais. A interface `Sender` é estreita (só `SendMessage`) e
+  permite os testes com fila FIFO falsa.
+- **Logs:** `eventId`, `eventType`, `aggregateId`, `attempt`, `correlationId` (pelo
+  contexto) e `walletId` ou `transactionId`, conforme o tipo. Payloads nunca vão para o
+  log.
+- **Testes:**
+  - Unitários (`go test -race`, `goleak.VerifyTestMain`, `Store` e fila FIFO em memória):
+    - validação de config e owner;
+    - montagem da mensagem (grupo, deduplicação, corpo e atributos);
+    - publicação e marcação, falha de envio que vira `MarkFailed` + retry, resposta sem
+      `MessageId`, lease perdido depois do envio (sem `MarkFailed`, outcome `conflict`) e
+      erro de claim;
+    - itens perto do fim do lease devolvidos;
+    - laço Start/Stop com métricas de backlog, drenagem que conclui o envio em voo e
+      devolve o resto do lote, drenagem estourada (`ErrDrainTimeout`, nada marcado) e ctx
+      do OnStop vencido;
+    - `fx.ValidateApp` (`postgres.Module` + `sqs.ClientModule` + `Module`) e ciclo Fx.
+  - Integração do repositório: head-of-line (cabeças em lease ou em backoff retêm o
+    agregado e os outros seguem; `Release` sem backoff; `Backlog`), 6 claimers × 8
+    agregados × 6 eventos sem dois eventos do mesmo agregado em voo e em ordem de `seq`,
+    e índices da `0008` com `Down(5)`.
+  - Integração do publisher (PostgreSQL real, pool próprio por instância, fila FIFO falsa
+    com deduplicação, goleak ao fim):
+    - **dois publishers sem perda:** 96 eventos (12 carteiras × 8) com metade confirmada
+      durante a publicação e 20% dos envios falhando. Cada `eventId` entra na fila uma
+      vez, cada grupo sai na ordem de `seq`, os dois publishers publicam e tudo termina
+      marcado;
+    - **crash entre commit e publicação:** evento sem publisher vivo, e evento
+      reivindicado por uma instância que morreu antes de enviar. Outra instância publica,
+      o segundo só depois do lease (`attempts = 2`), com o mesmo `eventId` e corpo;
+    - **crash entre publicação e marcação:** a republicação, depois do lease, repete
+      `eventId` e corpo, a fila descarta a duplicata, o evento fica marcado pelo novo
+      detentor e a marcação tardia da instância morta é recusada. O 2º evento do agregado
+      só sai depois, em ordem;
+    - **lease perdido durante o envio:** o envio lento chega depois que outra instância
+      republicou e marcou. A marcação atrasada não altera nada;
+    - **ordem sob falha:** o 1º evento de X em backoff persistido (`last_error`,
+      `next_attempt_at`) retém o 2º, Y segue, e X sai em ordem quando o SQS volta;
+    - métricas de backlog e atraso; composição Fx real com `goleak.VerifyNone`.
+  - SQS real (LocalStack, pulado sem `SQS_ENDPOINT`): fila FIFO exclusiva, crash entre
+    publicação e marcação, e na fila exatamente dois eventos em ordem, com
+    `MessageGroupId`, `MessageDeduplicationId`, corpo e atributos conferidos. Não foi
+    executado nesta máquina (sem Docker/LocalStack).
+- **Para a T23:** compor `outboxpublisher.Module` com `config.Module`, `postgres.Module` e
+  `sqs.ClientModule` (já incluído em `sqs.Module`). Prover `*metrics.Metrics` e
+  `*slog.Logger`. O `fx.StopTimeout` precisa cobrir também `OUTBOX_DRAIN_TIMEOUT`.
+- **Para a T24:** provisionar `wager-events.fifo` (`FifoQueue=true`,
+  `ContentBasedDeduplication=false`; a deduplicação é por `eventId`). Dar à aplicação
+  permissão de `sqs:SendMessage` nessa fila e aos consumidores de eventos
+  `ReceiveMessage`/`DeleteMessage`. Rodar `TestIntegrationRealSQSPublishDedupAndRouting`
+  com `SQS_ENDPOINT`.

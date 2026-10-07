@@ -155,29 +155,29 @@ func TestDownSteps(t *testing.T) {
 	if _, err := m.Up(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
-	reverted, err := m.Down(ctx, conn, 4)
+	reverted, err := m.Down(ctx, conn, 5)
 	if err != nil {
-		t.Fatalf("Down(4): %v", err)
+		t.Fatalf("Down(5): %v", err)
 	}
-	if len(reverted) != 4 || reverted[0].Name != "add_wager_transactions_claim" ||
-		reverted[1].Name != "add_wallet_ledger_entries_seq" || reverted[2].Name != "create_outbox" ||
-		reverted[3].Name != "create_inbox" {
-		t.Fatalf("Down(4) reverted %+v", reverted)
+	if len(reverted) != 5 || reverted[0].Name != "add_outbox_claim_indexes" || reverted[1].Name != "add_wager_transactions_claim" ||
+		reverted[2].Name != "add_wallet_ledger_entries_seq" || reverted[3].Name != "create_outbox" ||
+		reverted[4].Name != "create_inbox" {
+		t.Fatalf("Down(5) reverted %+v", reverted)
 	}
 	if got := appliedVersions(t, conn); len(got) != 3 {
-		t.Fatalf("applied after Down(4) = %v", got)
+		t.Fatalf("applied after Down(5) = %v", got)
 	}
 	if tableExists(t, conn, "outbox") || tableExists(t, conn, "inbox") || !tableExists(t, conn, "wallet_ledger_entries") {
-		t.Fatal("unexpected tables after Down(4)")
+		t.Fatal("unexpected tables after Down(5)")
 	}
 	for _, col := range []string{"claimed_by", "claimed_until"} {
 		if columnExists(t, conn, "wager_transactions", col) {
-			t.Fatalf("column %s still exists after Down(4)", col)
+			t.Fatalf("column %s still exists after Down(5)", col)
 		}
 	}
 	applied, err := m.Up(ctx, conn)
-	if err != nil || len(applied) != 4 {
-		t.Fatalf("Up after Down(4): applied %d, err %v", len(applied), err)
+	if err != nil || len(applied) != 5 {
+		t.Fatalf("Up after Down(5): applied %d, err %v", len(applied), err)
 	}
 	for _, col := range []string{"claimed_by", "claimed_until"} {
 		if !columnExists(t, conn, "wager_transactions", col) {

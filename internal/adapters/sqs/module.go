@@ -58,8 +58,8 @@ func NewConsumerFx(p ConsumerParams) (*Consumer, error) {
 	return c, nil
 }
 
-// ClientModule provê *Client (com Close no OnStop) e API. Será reaproveitado
-// pelo publisher da outbox (T22). Depende de config.Config.
+// ClientModule provê *Client (com Close no OnStop) e API. Também é usado pelo
+// publisher da outbox (outboxpublisher.Module, T22). Depende de config.Config.
 var ClientModule = fx.Module("sqs-client",
 	fx.Provide(
 		NewClientFx,

@@ -19,7 +19,7 @@ const (
 	validDBURL  = "postgres://wallet:" + dbPassword + "@localhost:5432/wallet?sslmode=disable"
 	inboundURL  = "http://localhost:4566/000000000000/wager-transactions.fifo"
 	dlqURL      = "http://localhost:4566/000000000000/wager-transactions-dlq.fifo"
-	eventsURL   = "http://localhost:4566/000000000000/wallet-events.fifo"
+	eventsURL   = "http://localhost:4566/000000000000/wager-events.fifo"
 	issuerURL   = "http://localhost:8081/realms/junglegaming"
 	oidcAudienc = "wallet-api"
 	jwksURL     = "http://localhost:8081/realms/junglegaming/protocol/openid-connect/certs"
@@ -67,6 +67,11 @@ func validEnv() map[string]string {
 		EnvOutboxPollInterval:             "1s",
 		EnvOutboxBatchSize:                "50",
 		EnvOutboxLease:                    "30s",
+		EnvOutboxConcurrency:              "4",
+		EnvOutboxPublishTimeout:           "5s",
+		EnvOutboxDrainTimeout:             "10s",
+		EnvOutboxRetryBaseDelay:           "1s",
+		EnvOutboxRetryMaxDelay:            "5m",
 		EnvPendingReferenceMaxAttempts:    "10",
 		EnvPendingReferenceTTL:            "10m",
 		EnvPendingReferenceRetryBaseDelay: "2s",
@@ -117,6 +122,8 @@ func TestLoadValidEnvExample(t *testing.T) {
 		},
 		Workers: WorkersConfig{
 			OutboxPollInterval: time.Second, OutboxBatchSize: 50, OutboxLease: 30 * time.Second,
+			OutboxConcurrency: 4, OutboxPublishTimeout: 5 * time.Second, OutboxDrainTimeout: 10 * time.Second,
+			OutboxRetryBaseDelay: time.Second, OutboxRetryMaxDelay: 5 * time.Minute,
 			PendingReferenceMaxAttempts: 10, PendingReferenceTTL: 10 * time.Minute,
 			PendingReferenceRetryBaseDelay: 2 * time.Second, PendingReferenceRetryMaxDelay: time.Minute,
 			PendingWorker: defaultPendingWorker(),
@@ -147,6 +154,8 @@ func TestLoadDefaults(t *testing.T) {
 		EnvSQSDrainTimeout, EnvSQSMaxAttempts, EnvPendingReferenceRetryBaseDelay, EnvPendingReferenceRetryMaxDelay,
 		EnvPendingWorkerPollInterval, EnvPendingWorkerBatchSize, EnvPendingWorkerConcurrency, EnvPendingWorkerLease,
 		EnvPendingWorkerProcessTimeout, EnvPendingWorkerDrainTimeout, EnvPendingOrphanGrace,
+		EnvOutboxConcurrency, EnvOutboxPublishTimeout, EnvOutboxDrainTimeout, EnvOutboxRetryBaseDelay,
+		EnvOutboxRetryMaxDelay,
 	} {
 		delete(env, k)
 	}
@@ -162,7 +171,10 @@ func TestLoadDefaults(t *testing.T) {
 		c.Workers.PendingReferenceMaxAttempts != 10 || c.Workers.PendingReferenceTTL != 10*time.Minute ||
 		c.Workers.PendingReferenceRetryBaseDelay != DefaultPendingReferenceRetryBaseDelay ||
 		c.Workers.PendingReferenceRetryMaxDelay != DefaultPendingReferenceRetryMaxDelay ||
-		c.Workers.PendingWorker != defaultPendingWorker() {
+		c.Workers.PendingWorker != defaultPendingWorker() ||
+		c.Workers.OutboxConcurrency != DefaultOutboxConcurrency || c.Workers.OutboxPublishTimeout != DefaultOutboxPublishTimeout ||
+		c.Workers.OutboxDrainTimeout != DefaultOutboxDrainTimeout || c.Workers.OutboxRetryBaseDelay != DefaultOutboxRetryBaseDelay ||
+		c.Workers.OutboxRetryMaxDelay != DefaultOutboxRetryMaxDelay {
 		t.Fatalf("defaults inesperados: %#v", c)
 	}
 	if c.AWS.HasStaticCredentials() || c.AWS.EndpointURL != "" || c.SQS.InboundDLQURL != "" {
@@ -336,6 +348,17 @@ func TestLoadInvalid(t *testing.T) {
 		{"batch zero", func(e map[string]string) { e[EnvOutboxBatchSize] = "0" }, EnvOutboxBatchSize},
 		{"batch alto", func(e map[string]string) { e[EnvOutboxBatchSize] = "5000" }, EnvOutboxBatchSize},
 		{"lease <= poll", func(e map[string]string) { e[EnvOutboxLease] = "1s" }, EnvOutboxLease},
+		{"poll alto", func(e map[string]string) { e[EnvOutboxPollInterval] = "25h" }, EnvOutboxPollInterval},
+		{"lease curto", func(e map[string]string) { e[EnvOutboxLease] = "500ms" }, EnvOutboxLease},
+		{"lease acima de 1h", func(e map[string]string) { e[EnvOutboxLease] = "2h" }, EnvOutboxLease},
+		{"outbox concurrency zero", func(e map[string]string) { e[EnvOutboxConcurrency] = "0" }, EnvOutboxConcurrency},
+		{"outbox concurrency alta", func(e map[string]string) { e[EnvOutboxConcurrency] = "101" }, EnvOutboxConcurrency},
+		{"outbox publish zero", func(e map[string]string) { e[EnvOutboxPublishTimeout] = "0s" }, EnvOutboxPublishTimeout},
+		{"outbox publish x2 >= lease", func(e map[string]string) { e[EnvOutboxPublishTimeout] = "15s" }, EnvOutboxPublishTimeout},
+		{"outbox drain zero", func(e map[string]string) { e[EnvOutboxDrainTimeout] = "0s" }, EnvOutboxDrainTimeout},
+		{"outbox retry base zero", func(e map[string]string) { e[EnvOutboxRetryBaseDelay] = "0s" }, EnvOutboxRetryBaseDelay},
+		{"outbox retry max < base", func(e map[string]string) { e[EnvOutboxRetryMaxDelay] = "500ms" }, EnvOutboxRetryMaxDelay},
+		{"outbox retry max alto", func(e map[string]string) { e[EnvOutboxRetryMaxDelay] = "48h" }, EnvOutboxRetryMaxDelay},
 		{"max attempts", func(e map[string]string) { e[EnvPendingReferenceMaxAttempts] = "-1" }, EnvPendingReferenceMaxAttempts},
 		{"ttl", func(e map[string]string) { e[EnvPendingReferenceTTL] = "1d" }, EnvPendingReferenceTTL},
 		{"pending base zero", func(e map[string]string) { e[EnvPendingReferenceRetryBaseDelay] = "0s" }, EnvPendingReferenceRetryBaseDelay},
