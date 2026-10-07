@@ -401,7 +401,8 @@ func loadReference(ctx context.Context, txs WagerTransactionStore, t *domain.Wag
 // FKs e pelo contrato de lock (ADR-017): carteira (só com movimento; lida com
 // GetForUpdate nesta transação), a transação (save = Insert no caso de uso,
 // Update no worker), o lançamento (carteira travada; a transação já existe) e
-// os eventos na outbox.
+// os eventos na outbox; por fim, terminal, acorda as pendências que a citam
+// (wakeDependents, T31).
 func persistWagerOutcome(ctx context.Context, tx Tx, t *domain.WagerTransaction, wallet *domain.Wallet,
 	entry domain.WalletLedgerEntry, events []domain.IntegrationEvent,
 	save func(context.Context, *domain.WagerTransaction) error,
@@ -419,7 +420,26 @@ func persistWagerOutcome(ctx context.Context, tx Tx, t *domain.WagerTransaction,
 			return err
 		}
 	}
-	return tx.Outbox().Enqueue(ctx, events...)
+	if err := tx.Outbox().Enqueue(ctx, events...); err != nil {
+		return err
+	}
+	return wakeDependents(ctx, tx.Transactions(), t)
+}
+
+// wakeDependents acorda, na mesma transação, as PENDING_REFERENCE do mesmo
+// provedor que citam t (T31, ADR-032): sem isso elas só veriam a referência
+// no fim do backoff já agendado. Só quando t ficou terminal — qualquer
+// estado terminal resolve a dependente (PROCESSED aplica ou rejeita pelas
+// regras estáticas; REJECTED/FAILED levam a REFERENCE_NOT_PROCESSED). Uma
+// referência ainda pendente não resolve nada, então não acorda. O instante é
+// t.UpdatedAt(): o relógio da aplicação que gravou a transição, o mesmo que
+// agenda next_attempt_at e que o claim compara.
+func wakeDependents(ctx context.Context, txs WagerTransactionStore, t *domain.WagerTransaction) error {
+	if t.Origin() != domain.WagerOriginExternal || !t.IsTerminal() {
+		return nil
+	}
+	_, err := txs.WakePendingReferences(ctx, t.ProviderID(), t.ExternalTransactionID(), t.UpdatedAt())
+	return err
 }
 
 // wagerEvents monta os eventos do estado final, na ordem de publicação.

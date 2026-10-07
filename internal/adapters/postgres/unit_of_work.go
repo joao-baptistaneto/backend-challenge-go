@@ -214,6 +214,10 @@ func (s wagerStore) ListByProviderReference(ctx context.Context, providerID, ref
 	return s.u.wagers.ListByProviderReference(ctx, s.q, providerID, referenceExternalID)
 }
 
+func (s wagerStore) WakePendingReferences(ctx context.Context, providerID, externalTransactionID string, now time.Time) (int64, error) {
+	return s.u.wagers.WakePendingReferences(ctx, s.q, providerID, externalTransactionID, now)
+}
+
 type ledgerStore txStores
 
 func (s ledgerStore) Append(ctx context.Context, e domain.WalletLedgerEntry) error {

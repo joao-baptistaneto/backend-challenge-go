@@ -329,3 +329,9 @@ func (memWagers) RecordResumeFailure(context.Context, app.RecordResumeFailurePar
 func (memWagers) FailClaimedUnreadable(context.Context, app.FailClaimedParams) error {
 	return errors.New("mem: fail unreadable not used by the HTTP API")
 }
+
+// WakePendingReferences: os testes HTTP não têm worker; o agendamento das
+// pendências não é observado aqui (T31 é coberto em app e na integração).
+func (s memWagers) WakePendingReferences(context.Context, string, string, time.Time) (int64, error) {
+	return 0, nil
+}

@@ -459,3 +459,7 @@ func (fakeWagers) RecordResumeFailure(context.Context, app.RecordResumeFailurePa
 func (fakeWagers) FailClaimedUnreadable(context.Context, app.FailClaimedParams) error {
 	return errUnexpectedCall
 }
+
+func (fakeWagers) WakePendingReferences(context.Context, string, string, time.Time) (int64, error) {
+	return 0, errUnexpectedCall
+}

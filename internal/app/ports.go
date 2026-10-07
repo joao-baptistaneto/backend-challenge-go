@@ -175,6 +175,15 @@ type WagerTransactionStore interface {
 	// ListByProviderReference lista as operações do provedor que citam
 	// referenceExternalTransactionId, em qualquer estado e tipo.
 	ListByProviderReference(ctx context.Context, providerID, referenceExternalTransactionID string) ([]*domain.WagerTransaction, error)
+	// WakePendingReferences antecipa para now (nunca antes da criação) o
+	// nextAttemptAt das transações PENDING_REFERENCE do provedor providerID
+	// que citam externalTransactionID e ainda aguardam o backoff, para o
+	// worker resolvê-las no próximo ciclo (T31, ADR-032). Só o agendamento
+	// muda: attempts, lease e contador de falhas ficam intactos. Linhas
+	// travadas por outra transação são puladas (nunca espera). Devolve
+	// quantas foram acordadas. Contrato: na mesma transação que grava a
+	// referência num estado terminal.
+	WakePendingReferences(ctx context.Context, providerID, externalTransactionID string, now time.Time) (int64, error)
 }
 
 // ClaimDueParams são os parâmetros de WagerTransactionStore.ClaimDue.

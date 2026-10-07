@@ -471,6 +471,10 @@ func (uc *ResumeWagerTransaction) failExhausted(ctx context.Context, id, token u
 			}
 			return viaAggregateFailure(ctx, err)
 		}
+		// FAILED também resolve as dependentes (REFERENCE_NOT_PROCESSED).
+		if err := wakeDependents(ctx, txs, t); err != nil {
+			return viaAggregateFailure(ctx, err)
+		}
 		res = resumeResultOf(t, ResumeFailed)
 		res.PreviousStatus = previous
 		return nil

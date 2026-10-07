@@ -61,6 +61,12 @@ type memState struct {
 	claims map[uuid.UUID]memClaim
 	// failures é resume_failures (T30) por transação.
 	failures map[uuid.UUID]int32
+	// woken é o next_attempt_at antecipado por WakePendingReferences (T31);
+	// ClaimDue usa o menor entre ele e o do agregado, e Update o descarta.
+	woken map[uuid.UUID]time.Time
+	// wakeCalls registra as chamadas confirmadas de WakePendingReferences
+	// ("provider/externalId").
+	wakeCalls []string
 }
 
 func cloneWallet(w *domain.Wallet) *domain.Wallet {
@@ -80,10 +86,14 @@ func cloneWager(t *domain.WagerTransaction) *domain.WagerTransaction {
 }
 
 func (s memState) clone() memState {
-	c := memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}, failures: map[uuid.UUID]int32{}}
+	c := memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}, failures: map[uuid.UUID]int32{}, woken: map[uuid.UUID]time.Time{}}
 	for k, v := range s.failures {
 		c.failures[k] = v
 	}
+	for k, v := range s.woken {
+		c.woken[k] = v
+	}
+	c.wakeCalls = append(c.wakeCalls, s.wakeCalls...)
 	for k, v := range s.claims {
 		c.claims[k] = v
 	}
@@ -103,7 +113,7 @@ func (s memState) clone() memState {
 
 func newMemUoW() *memUoW {
 	return &memUoW{
-		state:  memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}, failures: map[uuid.UUID]int32{}},
+		state:  memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}, failures: map[uuid.UUID]int32{}, woken: map[uuid.UUID]time.Time{}},
 		poison: map[uuid.UUID]error{},
 	}
 }
@@ -209,6 +219,7 @@ func (s memWagers) Update(_ context.Context, t *domain.WagerTransaction) error {
 		}
 		s.s.wagers[i] = cloneWager(t)
 		delete(s.s.claims, t.ID())
+		delete(s.s.woken, t.ID())
 		if t.Status() != domain.WagerStatusFailed {
 			delete(s.s.failures, t.ID()) // falhas consecutivas zeradas
 		}
@@ -237,6 +248,9 @@ func (s memWagers) ClaimDue(_ context.Context, p app.ClaimDueParams) ([]app.Clai
 			due := w.NextAttemptAt()
 			if due.IsZero() {
 				due = w.CreatedAt().Add(p.OrphanGrace)
+			}
+			if woke, ok := s.s.woken[w.ID()]; ok && woke.Before(due) {
+				due = woke
 			}
 			if due.After(p.Now) {
 				continue
@@ -345,6 +359,32 @@ func (s memWagers) ListByProviderReference(_ context.Context, p, ref string) ([]
 		}
 	}
 	return out, nil
+}
+
+// WakePendingReferences espelha o adapter: PENDING_REFERENCE do provedor que
+// cita a referência e ainda está no futuro passa a vencer em max(now,
+// criação); attempts e lease intactos.
+func (s memWagers) WakePendingReferences(_ context.Context, p, ext string, now time.Time) (int64, error) {
+	s.s.wakeCalls = append(s.s.wakeCalls, p+"/"+ext)
+	var n int64
+	for _, w := range s.s.wagers {
+		if w.Status() != domain.WagerStatusPendingReference || w.ProviderID() != p || w.ReferenceExternalTransactionID() != ext {
+			continue
+		}
+		due := w.NextAttemptAt()
+		if woke, ok := s.s.woken[w.ID()]; ok && woke.Before(due) {
+			due = woke
+		}
+		at := now
+		if at.Before(w.CreatedAt()) {
+			at = w.CreatedAt()
+		}
+		if due.After(at) {
+			s.s.woken[w.ID()] = at
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (s memLedger) Append(_ context.Context, e domain.WalletLedgerEntry) error {

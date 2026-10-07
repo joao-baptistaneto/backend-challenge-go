@@ -7,7 +7,7 @@ O documento tem duas partes:
 - **Parte I — Síntese (seções 1 a 18).** Uma seção por tema exigido no enunciado, com o estado
   **atual** do código, valores padrão e links para os ADRs detalhados. Quando um ADR antigo
   diverge da Parte I (valores revisados depois, pendências já resolvidas), vale a Parte I.
-- **Parte II — Registro de decisões (ADR-001 a ADR-031).** Histórico incremental, um ADR por
+- **Parte II — Registro de decisões (ADR-001 a ADR-032).** Histórico incremental, um ADR por
   tarefa, com contexto, alternativas, testes e notas de revisão.
 
 **Referências ao enunciado.** O enunciado do desafio está em [`docs/DESAFIO.md`](docs/DESAFIO.md)
@@ -39,7 +39,7 @@ da solução: execução, variáveis, filas, migrations, exemplos e testes.
 18. [Interpretações adotadas, limitações, trade-offs e trabalho não concluído](#18-interpretações-adotadas-limitações-trade-offs-e-trabalho-não-concluído)
 
 **Parte II — Registro de decisões:** [ADR-001](#adr-001--módulo-versão-go-e-dependências-base-t01)
-a [ADR-031](#adr-031--failed-por-esgotamento-no-worker-de-pendências-t30).
+a [ADR-032](#adr-032--wake-up-de-pendências-quando-a-referência-chega-t31).
 
 **Mapa enunciado ([docs/DESAFIO.md](docs/DESAFIO.md)) → seção**
 
@@ -53,7 +53,7 @@ a [ADR-031](#adr-031--failed-por-esgotamento-no-worker-de-pendências-t30).
 | §6.2 estratégia de controle de concorrência | 6 | 005, 014, 017 |
 | §6.3 máquina de estados, transitório × permanente | 7 | 008, 013, 017, 031 |
 | §7 combinações `REFUND`/`ROLLBACK` | 9 | 009, 011 |
-| §7 tentativas/TTL, referência pendente ou terminada sem sucesso | 8 | 009, 023, 031 |
+| §7 tentativas/TTL, referência pendente ou terminada sem sucesso | 8 | 009, 023, 031, 032 |
 | §7 `failureCode` estável, corrigível × definitivo | 10 | 008, 009 |
 | §9 algoritmo, campos e normalizações do hash; equivalência HTTP × SQS | 5 | 010, 020, 022 |
 | §9 códigos HTTP e corpos (inválido, conflito, rejeição, pendente, indisponível) | 16 | 020 |
@@ -260,7 +260,7 @@ Detalhes: ADR-010, ADR-015, ADR-017, ADR-020, ADR-022.
 
 ## 6. Concorrência e locks
 
-Detalhes: ADR-005, ADR-009, ADR-014, ADR-017, ADR-023, ADR-027, ADR-028.
+Detalhes: ADR-005, ADR-009, ADR-014, ADR-017, ADR-023, ADR-027, ADR-028, ADR-032.
 
 - **Coordenação por carteira, combinando pessimista e otimista:**
   `SELECT ... FROM wallets WHERE id = $1 FOR UPDATE` serializa as operações **da mesma
@@ -279,6 +279,10 @@ Detalhes: ADR-005, ADR-009, ADR-014, ADR-017, ADR-023, ADR-027, ADR-028.
 - **Workers:** outbox e pendências usam lease persistido (`locked_until`/`claimed_until`) com
   `SKIP LOCKED` e fencing por token/tentativa; a ordem de locks do worker de pendências é a
   mesma das entradas (carteira → linha), sem deadlock.
+- **Wake-up de pendências** (ADR-032): a gravação terminal de uma operação toca, na mesma
+  transação, linhas `PENDING_REFERENCE` que a citam (possivelmente de outra carteira) só com
+  `FOR NO KEY UPDATE SKIP LOCKED`: nunca espera lock, então não cria ciclo com quem segura
+  carteiras nem com o worker, e não conflita com o `KEY SHARE` da FK.
 - **Demonstração exigida:** 100.00 BRL e duas apostas simultâneas de 80.00 → uma `PROCESSED`,
   uma `REJECTED INSUFFICIENT_FUNDS`, saldo 20.00, um débito; reenvios não mudam o resultado.
   Coberto no caso de uso, na aplicação completa e com 3 processos independentes
@@ -349,7 +353,7 @@ Detalhes: ADR-008, ADR-013, ADR-017, ADR-031.
 
 ## 8. Referências pendentes: tentativas, backoff e TTL
 
-Detalhes: ADR-009, ADR-017, ADR-023, ADR-031.
+Detalhes: ADR-009, ADR-017, ADR-023, ADR-031, ADR-032.
 
 - Referência ausente → a operação é gravada `PENDING_REFERENCE` (`attempts = 1`,
   `next_attempt_at = agora + PENDING_REFERENCE_RETRY_BASE_DELAY`) com o evento
@@ -368,6 +372,18 @@ Detalhes: ADR-009, ADR-017, ADR-023, ADR-031.
   aguardando; se o prazo esgotar, `REFERENCE_NOT_FOUND` ("não ficou disponível a tempo").
 - **Referência terminada sem sucesso** (`REJECTED`/`FAILED`): rejeição imediata com
   `REFERENCE_NOT_PROCESSED`, sem esperar.
+- **Wake-up quando a referência chega** (T31, ADR-032): toda transação que grava uma operação
+  externa num estado **terminal** (`PROCESSED`, `REJECTED` ou `FAILED`, pelo fluxo síncrono ou
+  pelo worker) executa, no mesmo commit, `WakePendingReferences`: as `PENDING_REFERENCE` **do
+  mesmo provedor** que citam o seu `externalTransactionId` e têm `next_attempt_at` no futuro
+  passam a vencer agora (nunca antes de `created_at`). Só `next_attempt_at` muda: `attempts`,
+  `updated_at`, lease (`claimed_*`) e `resume_failures` ficam intactos, então um item
+  reivindicado continua do seu worker e um item retido pelo backoff de falhas continua retido.
+  A resolução passa a sair no próximo ciclo do worker (`PENDING_WORKER_POLL_INTERVAL`, 1s), não
+  no fim do backoff. Uma referência ainda pendente não acorda nada (não resolveria); quando ela
+  própria é resolvida, acorda as suas dependentes. Linhas travadas por outra transação são
+  puladas (`SKIP LOCKED`) e ficam com o backoff que já tinham. Usa o índice parcial
+  `wager_transactions_reference_external_idx` (`0002`).
 - Defaults: base 2s, teto 1m, 10 buscas, TTL 10m (a última busca acontece ~5 min após o
   aceite); poll 1s, lote 20, concorrência 4, lease 30s, prazo por item 5s,
   5 falhas consecutivas não transitórias da retomada antes de `FAILED`.
@@ -698,8 +714,16 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
   prazo da operação já acabou; sem a falha ela teria virado `REJECTED REFERENCE_NOT_FOUND`).
 - **`FAILED` sem evento** (seção 13): consumidores da fila de eventos não ficam sabendo do
   encerramento; operação acompanha pelo log ERROR e pela métrica.
-- **Pendências não são "acordadas"** quando a referência chega: a resolução espera o próximo
-  `next_attempt_at` (no máximo `PENDING_REFERENCE_RETRY_MAX_DELAY`, 1m).
+- **Wake-up de pendências** (T31, ADR-032; resolvia a lacuna "pendências não são acordadas"):
+  a chegada da referência antecipa `next_attempt_at` no mesmo commit, e a resolução sai no
+  próximo poll do worker (até `PENDING_WORKER_POLL_INTERVAL`, 1s; não há notificação
+  in-process — o wake-up é por linha no banco, então vale para qualquer réplica). Custos e
+  limites: um `UPDATE` a mais (sonda de índice, normalmente 0 linhas) por operação terminal,
+  medido em ~0,6 ms por operação sequencial no Docker local (essencialmente um round-trip);
+  uma dependente travada por outra transação no instante do commit é pulada e, no pior caso,
+  espera o backoff que já tinha (na mesma carteira isso não acontece: o lock da carteira
+  serializa o worker e a referência); o `FAILED` gravado pelo caminho sem agregado (linha que
+  não reidrata, ADR-031) não acorda dependentes — elas veem o `FAILED` no próprio backoff.
 - **Revogação de token** só vale na expiração (validação local por JWKS).
 - **`POST /wallets` sem chave de idempotência:** um commit ambíguo (503) seguido de nova
   tentativa devolve 409 `WALLET_ALREADY_EXISTS`; o cliente consulta a carteira. Sem risco
@@ -3675,3 +3699,108 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
 - **Fora do escopo.** O wake-up de pendências quando a referência chega fica na T31. Um
   operador que corrige um dado corrompido antes do esgotamento só precisa esperar o backoff:
   a próxima retomada bem-sucedida zera o contador.
+- **Revisão (T31).** O wake-up está no ADR-032 e não altera nada do contador de falhas:
+  `WakePendingReferences` não toca em `resume_failures` nem no lease, então um item retido pelo
+  backoff de falhas continua retido. O `FAILED` gravado pelo agregado (`failExhausted`) também
+  acorda as dependentes, que recebem `REFERENCE_NOT_PROCESSED`.
+
+## ADR-032 — Wake-up de pendências quando a referência chega (T31)
+
+- **Contexto.** Lacuna L3 da revisão final: uma reversão (ou `WIN`) aceita antes da sua
+  referência fica `PENDING_REFERENCE` com `next_attempt_at` no backoff exponencial (2s, 4s, …,
+  até 1m). Quando a referência chegava, nada avisava a pendência: a resolução esperava o
+  próximo `next_attempt_at`, até `PENDING_REFERENCE_RETRY_MAX_DELAY` depois.
+- **Decisão: antecipar o agendamento na mesma transação.** `persistWagerOutcome` (usado pelo
+  fluxo síncrono e pelo worker), depois da outbox, chama `wakeDependents`: se a operação é
+  `EXTERNAL` e ficou **terminal**, roda `WagerTransactionStore.WakePendingReferences(provider,
+  externalId, t.UpdatedAt())`. `failExhausted` (ADR-031) faz o mesmo ao gravar `FAILED` pelo
+  agregado. O SQL (`postgres.wakePendingReferencesSQL`):
+
+  ```sql
+  UPDATE wager_transactions w
+  SET next_attempt_at = GREATEST($3, w.created_at)
+  FROM (SELECT id FROM wager_transactions
+        WHERE provider_id = $1 AND reference_external_transaction_id = $2
+          AND status = 'PENDING_REFERENCE' AND next_attempt_at > GREATEST($3, created_at)
+        FOR NO KEY UPDATE SKIP LOCKED) due
+  WHERE w.id = due.id AND w.status = 'PENDING_REFERENCE'
+  ```
+
+  - **Por que só estados terminais.** Qualquer terminal resolve a dependente: `PROCESSED`
+    aplica ou rejeita pelas regras estáticas (`*_MISMATCH`, `REFERENCE_NOT_REVERSIBLE`,
+    `ALREADY_REVERSED`…), e `REJECTED`/`FAILED` levam a `REFERENCE_NOT_PROCESSED` (ADR-009).
+    Uma referência `PENDING`/`PENDING_REFERENCE` mantém a dependente aguardando; acordá-la só
+    gastaria uma busca (`attempts`) à toa. Quando essa referência é resolvida pelo worker, o
+    mesmo `persistWagerOutcome` acorda as dependentes dela (cadeia `ROLLBACK → WIN → BET`).
+    Todos os tipos são considerados (um `LOSS` citado também resolve, com rejeição).
+  - **Instante.** `t.UpdatedAt()` é o relógio da aplicação que gravou a transição, o mesmo
+    que agenda `next_attempt_at` e que o `ClaimDue` compara. `GREATEST(now, created_at)`
+    respeita o CHECK `next_attempt_at >= created_at` mesmo com relógios de réplicas
+    desalinhados; `next_attempt_at > GREATEST(...)` faz o comando só **antecipar** (nunca
+    adiar) e ser idempotente.
+  - **O que muda na linha.** Só `next_attempt_at`. `attempts` (buscas, ADR-008), `updated_at`,
+    `claimed_by`/`claimed_until` e `resume_failures` (ADR-031) ficam intactos: um item
+    reivindicado continua do seu worker (fencing), um item retido pelo backoff de falhas
+    continua retido (o `ClaimDue` exige o lease vencido) e o trigger de guarda aceita a
+    mudança (coluna de agendamento; `attempts` não diminui). Nenhum evento é emitido
+    (reagendamento não gera evento, ADR-012).
+  - **Isolamento por provedor.** O filtro é `(provider_id, reference_external_transaction_id)`,
+    o mesmo escopo de `loadReference`: a referência de uma operação é sempre do mesmo provedor.
+  - **Locks e deadlock.** As dependentes podem ser de outra carteira (são rejeitadas com
+    `REFERENCE_MISMATCH` ao resolver), então o comando trava linhas fora do lock da carteira
+    em curso. Com `FOR NO KEY UPDATE SKIP LOCKED` ele **nunca espera**: não há aresta de
+    espera nova, logo nenhum ciclo com o caminho quente (carteira → linha) nem com o worker
+    (carteira → linha com fencing). `NO KEY` não conflita com o `KEY SHARE` da FK
+    `reference_transaction_id` de quem insere uma reversão citando a linha. Uma linha pulada
+    está travada por quem já a processa (worker no meio da retomada ou `ClaimDue` em curso).
+    Na mesma carteira, a retomada segura a carteira antes da linha, então a referência só
+    grava depois do commit dela e encontra a linha livre. Em carteira diferente, a dependente
+    fica com o backoff que já tinha (latência, não correção). Alternativa descartada: `UPDATE`
+    simples, que esperaria a linha travada pelo worker com a carteira do caminho quente travada.
+  - **Índice.** `wager_transactions_reference_external_idx (provider_id,
+    reference_external_transaction_id) WHERE reference_external_transaction_id IS NOT NULL`
+    (`0002`, criado já com esse propósito) serve: a igualdade em
+    `reference_external_transaction_id` implica o predicado parcial. Verificado por `EXPLAIN`
+    no teste de integração. Não houve migration.
+  - **Custo no caminho quente.** Um comando a mais por operação terminal, normalmente uma
+    sonda de índice que não encontra linhas. Medição (1000 `BET`s sequenciais, PostgreSQL no
+    Docker Desktop local, 2000 pendências de outras referências, duas rodadas): ~7,0–7,2 ms/op
+    com o wake-up contra ~6,4–6,5 ms/op sem (~0,6 ms, essencialmente um round-trip).
+    Alternativas descartadas: acordar só para tipos "referenciáveis" (`BET`/`WIN`/`REFUND`),
+    porque um `LOSS` ou `ROLLBACK` citado também resolve a dependente (com rejeição) e a
+    economia seria pequena; trigger no banco, que esconderia regra de domínio (quais estados
+    resolvem) no schema; `pgx.Batch` com a outbox, que ganharia um round-trip ao custo de
+    quebrar a porta `OutboxStore`.
+  - **Atomicidade.** O wake-up está no mesmo commit da referência: rollback desfaz os dois.
+    Um erro do wake-up faz a operação falhar e entrar no retry do `UnitOfWork` (transitório)
+    como qualquer outro comando. No `failExhausted`, um erro não transitório do wake-up
+    desvia para o caminho sem agregado, que não acorda.
+- **Decisão: sem notificação in-process.** O worker continua por poll
+  (`PENDING_WORKER_POLL_INTERVAL`, 1s). Um canal só acordaria o worker da mesma réplica; o
+  wake-up por linha vale para todas. A latência de 1s foi considerada suficiente.
+- **Limites.** Dependente travada por outra transação no instante do commit é pulada (acima).
+  O `FAILED` pelo caminho sem agregado (`FailClaimedUnreadable`, linha que não reidrata) não
+  acorda: não há agregado confiável para ler provedor e `externalId`; as dependentes veem o
+  `FAILED` no próprio backoff.
+- **Testes.**
+  - Unitários (`internal/app/wake_pending_test.go`, UnitOfWork em memória que espelha o
+    adapter: `woken` antecipa o vencimento no `ClaimDue`):
+    `TestWakePending_ReferenceArrivalWakesSameProviderOnly` (resolução no mesmo instante, sem
+    avançar o relógio; provedor alheio intacto; `PENDING_REFERENCE` não chama o wake-up) e
+    `TestWakePending_PendingReferenceDoesNotWakeUntilResolved` (cadeia `ROLLBACK → WIN → BET`).
+  - Adapter (`internal/adapters/postgres/wake_integration_test.go`):
+    `..._WakePendingReferences` (só as futuras do provedor e da referência; já vencidas,
+    outro provedor e outra referência intactas; `GREATEST` com `created_at` adiantado;
+    `attempts`/`updated_at` intactos; idempotente; exige transação; parâmetros vazios) e
+    `..._WakeUsesReferenceIndex` (`EXPLAIN` com o índice).
+  - Integração com o worker rodando (`internal/adapters/pendingworker/wake_integration_test.go`,
+    backoff de 1h): `TestIntegrationWorker_WakesPendingWhenReferenceArrives` (`ROLLBACK` vira
+    `PROCESSED` e `REFUND` vira `REJECTED REFERENCE_NOT_PROCESSED` em menos de 1s após a `BET`
+    `PROCESSED`/`REJECTED`, `attempts = 1`, eventos e reconciliação corretos; o `ROLLBACK` de
+    outro provedor com o mesmo `externalId` de referência fica intacto),
+    `TestIntegrationWake_ClaimedItemUndisturbed` (lease, `resume_failures`, `attempts` e
+    `updated_at` preservados; outro worker não reivindica; o dono do lease resolve),
+    `TestIntegrationWake_SkipsLockedRowWithoutBlocking` (linha travada por outra transação:
+    a `BET` não espera e a linha mantém o agendamento) e
+    `TestIntegrationWake_PendingReferenceDoesNotWake`. Sem o wake-up, os dois primeiros
+    falham (verificado removendo a chamada).

@@ -161,6 +161,61 @@ WHERE provider_id = $1 AND reference_external_transaction_id = $2
 ORDER BY created_at, id`, providerID, referenceExternalTransactionID)
 }
 
+// ErrInvalidWake indica parâmetros de WakePendingReferences inválidos.
+var ErrInvalidWake = errors.New("postgres: parâmetros de wake-up inválidos")
+
+// wakePendingReferencesSQL: $1 provider_id, $2 external_transaction_id da
+// referência, $3 instante. A subquery filtra pelo par do índice parcial
+// wager_transactions_reference_external_idx (a igualdade em
+// reference_external_transaction_id implica o IS NOT NULL do predicado).
+const wakePendingReferencesSQL = `UPDATE wager_transactions w
+SET next_attempt_at = GREATEST($3::timestamptz, w.created_at)
+FROM (
+    SELECT id FROM wager_transactions
+    WHERE provider_id = $1 AND reference_external_transaction_id = $2
+      AND status = 'PENDING_REFERENCE' AND next_attempt_at > GREATEST($3::timestamptz, created_at)
+    FOR NO KEY UPDATE SKIP LOCKED
+) due
+WHERE w.id = due.id AND w.status = 'PENDING_REFERENCE'`
+
+// WakePendingReferences antecipa para now (nunca antes de created_at) o
+// next_attempt_at das transações PENDING_REFERENCE do provedor providerID que
+// citam externalTransactionID e cujo next_attempt_at ainda está no futuro
+// (T31, ADR-032). Devolve quantas linhas foram acordadas.
+//
+//   - Só next_attempt_at muda: attempts, updated_at, o lease (claimed_by,
+//     claimed_until) e resume_failures ficam intactos. Uma linha reivindicada
+//     continua do worker que a reivindicou (fencing) e uma linha retida pelo
+//     backoff de falhas (T30, claimed_until no futuro) continua retida —
+//     ClaimDue exige o lease vencido.
+//   - Isolamento por provedor: o filtro é (provider_id, reference_external_
+//     transaction_id), o mesmo par do índice parcial
+//     wager_transactions_reference_external_idx (0002).
+//   - Nunca espera: as linhas são escolhidas com FOR NO KEY UPDATE SKIP
+//     LOCKED. Uma linha travada por outra transação (o worker retomando-a, um
+//     ClaimDue em curso) é pulada; quem a trava já a está processando ou a
+//     entrega ao worker, e ela no pior caso espera o backoff que já tinha. Sem
+//     espera não há ciclo de locks com o caminho quente (que segura a
+//     carteira) nem com o worker (carteira → linha). NO KEY não conflita com o
+//     KEY SHARE da FK reference_transaction_id.
+//
+// Exige pgx.Tx: o wake-up é gravado na mesma transação da operação que o
+// motiva (commit atômico; rollback desfaz).
+func (WagerTransactionRepository) WakePendingReferences(ctx context.Context, q Querier, providerID, externalTransactionID string, now time.Time) (int64, error) {
+	const op = "postgres: acordar transações pendentes da referência"
+	if err := requireTx(op, q); err != nil {
+		return 0, err
+	}
+	if providerID == "" || externalTransactionID == "" || now.IsZero() {
+		return 0, fmt.Errorf("%s: %w: provedor, referência ou instante vazio", op, ErrInvalidWake)
+	}
+	tag, err := q.Exec(ctx, wakePendingReferencesSQL, providerID, externalTransactionID, now.UTC())
+	if err != nil {
+		return 0, mapWriteError(op, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // ClaimParams são os parâmetros de ClaimDue.
 type ClaimParams struct {
 	// Now é o instante de referência (relógio da aplicação, o mesmo que
