@@ -752,7 +752,9 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
   sem duplicar efeito, por causa do fencing). A paginação do ledger usa `seq`, imune a desvio.
 - **Triggers podem ser desligados** pelo dono das tabelas ou superusuário; em produção a
   aplicação deve usar um papel que não seja dono. `down` das migrations destrói dados.
-  Migrations não suportam `CREATE INDEX CONCURRENTLY`.
+  Migrations não suportam `CREATE/DROP INDEX CONCURRENTLY` (cada uma roda numa transação);
+  a `0010` remove o índice antigo do extrato com `DROP INDEX IF EXISTS` comum (lock breve,
+  ADR-011).
 - **LocalStack Community não aplica IAM**: as políticas do broker estão provisionadas, mas só
   seriam aplicadas na AWS.
 - **Segredos de desenvolvimento** (clients do Keycloak, admin, senha do banco) são versionados
@@ -764,12 +766,6 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
 
 **Pendências abertas no código (não resolvidas nesta entrega)**
 
-- **Índice sem uso** `wallet_ledger_entries_wallet_page_idx` (`0003`, em `(wallet_id,
-  created_at, id)`): a paginação passou a usar `(wallet_id, seq)` na `0006`. Custo só de
-  escrita; remover numa migration futura.
-- **`tools.go`** ainda importa com `_` dependências que já são usadas diretamente (`aws-sdk`,
-  `uuid`, `pgxpool`). Inofensivo (build tag `tools`, fora do binário), mas é limpeza pendente
-  do ADR-001.
 - **Fora do escopo:** ledger de partidas dobradas, tracing (OpenTelemetry), dashboards e
   testes de carga (diferenciais opcionais) não foram implementados. Coletor de estatísticas do
   `pgxpool` não é exportado.
@@ -793,12 +789,14 @@ resolvidas nas tarefas indicadas (ver Parte I e as notas de revisão de cada ADR
   - `github.com/google/uuid` — identidades internas.
   - `github.com/coreos/go-oidc/v3` — validação de tokens OIDC do IdP externo (Keycloak).
   - `github.com/prometheus/client_golang` — métricas.
-- **Fixação antes do uso:** `tools.go` (build tag `tools`, raiz do módulo) importa as
-  dependências com `_` para que `go mod tidy` não as remova enquanto ainda não são usadas
-  pelo código de produção. Não entra no binário. Cada import deve ser removido quando a
-  dependência passar a ser usada diretamente. *(Estado na T28: os quatro imports restantes —
-  `aws-sdk-go-v2/config`, `service/sqs`, `uuid`, `pgxpool` — já são usados diretamente; a
-  remoção ficou pendente, seção 18.)*
+- **Fixação antes do uso:** `tools.go` (build tag `tools`, raiz do módulo) importava as
+  dependências com `_` para que `go mod tidy` não as removesse enquanto ainda não eram usadas
+  pelo código de produção. Não entrava no binário. Cada import devia ser removido quando a
+  dependência passasse a ser usada diretamente. *(Revisão T33: os quatro imports restantes —
+  `aws-sdk-go-v2/config`, `service/sqs`, `uuid`, `pgxpool` — já eram usados diretamente
+  (`adapters/sqs`, `outboxpublisher`, `adapters/http`, `adapters/postgres`), então o arquivo
+  foi removido inteiro. `go mod tidy -diff` continua vazio e `go.mod`/`go.sum` não mudaram.
+  Uma dependência nova entra no `go.mod` junto com o primeiro uso, sem arquivo de fixação.)*
 - **Dependências acrescentadas depois:** `github.com/go-jose/go-jose/v4` (JWKS próprio,
   ADR-019), `go.uber.org/goleak` e `testcontainers-go` (só testes).
 
@@ -1316,6 +1314,31 @@ do `fx.New` e injetada com `fx.Supply`, em vez de `config.Module`.
   outbox não publicada por `(next_attempt_at, seq)` e extrato por
   `(wallet_id, created_at, id)`. A paginação do extrato passou a usar
   `(wallet_id, seq)` na migration 0006 (ADR-014).
+  - *Revisão T33 (migration `0010_drop_ledger_wallet_page_idx`):*
+    `wallet_ledger_entries_wallet_page_idx` `(wallet_id, created_at, id)` foi removido. O
+    comentário da `0003` ("paginação keyset do extrato por `(created_at, id)`") ficou
+    desatualizado, mas a `0003` não é editada (o runner compara o checksum das já
+    aplicadas). Confirmado no código e com `EXPLAIN` (`enable_seqscan = off`) que nenhuma
+    consulta precisa dele: `ListByWallet` (`wallet_id = $1 AND seq > $2 ORDER BY seq`) usa
+    `wallet_ledger_entries_wallet_seq_key`; `Summarize` da reconciliação (`WHERE wallet_id
+    = $1`) usava o índice antigo só pelo prefixo `wallet_id` e, sem ele, usa o mesmo
+    `wallet_seq_key`; a busca por `(wallet_id, transaction_id)` usa
+    `wallet_ledger_entries_wallet_transaction_key`. Nenhuma consulta filtra ou ordena por
+    `created_at`. O índice só custava escrita a cada lançamento e espaço. Índices restantes
+    do ledger: `pkey`, `wallet_transaction_key`, `transaction_idx` (FK) e `wallet_seq_key`
+    (fixado por `TestLedgerIndexes`).
+  - **Sem `CONCURRENTLY`:** o runner aplica cada migration numa transação junto com o
+    registro em `schema_migrations`, e `DROP INDEX CONCURRENTLY` não roda em transação.
+    O `DROP INDEX` comum pega `ACCESS EXCLUSIVE` na tabela só pelo tempo de remover o
+    catálogo/arquivo (não varre nem reescreve dados), mas espera transações em curso que
+    usem a tabela. Aceitável aqui. Num ledger grande e quente, o operador rodaria
+    `DROP INDEX CONCURRENTLY wallet_ledger_entries_wallet_page_idx` fora do runner antes do
+    deploy; o `IF EXISTS` torna a `0010` um no-op nesse caso. O `down` recria o índice com
+    a definição idêntica à da `0003` (`CREATE INDEX` comum, bloqueia escritas durante o
+    build; `down` já é operação de ambiente descartável).
+  - Testes: `TestLoadEmbeddedMigrations` conhece a `0010`; `TestDownSteps` faz `Down(1)`
+    (índice volta com a mesma definição), `Up`, `Down(7)` (0010..0004) e `Up`, verificando o
+    índice em cada passo; `TestWorkerIndexes` não lista mais o índice removido.
 - **Erros para a T11:** CHECK → `23514`, UNIQUE → `23505`, FK → `23503`. As guardas de
   trigger usam `23001` (`restrict_violation`) com `CONSTRAINT` nomeado
   (`wallet_ledger_entries_append_only`, `wallets_version_increment`,
@@ -3869,3 +3892,23 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   e `FuzzJSONRoundTrip` (todo valor aceito reserializa e volta igual; erro não altera o alvo);
   `internal/adapters/strictjson/strictjson_test.go`: `TestMoneyObjectRules` (os casos
   espelhados acima, com sentinela e caminho de campo do adapter).
+
+## ADR-034 — Limpeza: índice sem uso do extrato e `tools.go` (T33)
+
+- **Contexto.** Duas pendências da seção 18 (lacunas L5 e L6): o índice
+  `wallet_ledger_entries_wallet_page_idx` `(wallet_id, created_at, id)` da `0003` ficou sem
+  uso quando a paginação passou a `seq` (`0006`, ADR-014), e `tools.go` ainda fixava com `_`
+  dependências já usadas diretamente (ADR-001).
+- **Decisão (índice).** Migration nova `0010_drop_ledger_wallet_page_idx`: up
+  `DROP INDEX IF EXISTS`, down recria com a definição idêntica à da `0003`. Migrations
+  antigas não são editadas (checksum). Sem `CONCURRENTLY`, porque o runner aplica cada
+  migration numa transação; o caminho para um ledger grande (drop concorrente fora do
+  runner, `IF EXISTS` vira no-op) e a evidência de não uso (código + `EXPLAIN`) estão na
+  revisão T33 do ADR-011. Nome curto para caber na coluna de 40 caracteres do
+  `cmd/migrate status`.
+- **Decisão (`tools.go`).** Arquivo removido inteiro: os quatro imports eram redundantes.
+  `go.mod`/`go.sum` inalterados e `go mod tidy -diff` vazio (revisão T33 do ADR-001).
+- **Testes.** `TestLoadEmbeddedMigrations` (10 migrations), `TestDownSteps` (Down(1)
+  recria o índice com a mesma definição, Down(7) reverte 0010..0004, Up remove de novo),
+  `TestWorkerIndexes` sem o índice removido e `TestLedgerIndexes` (conjunto exato de
+  índices do ledger). Seção 18 não lista mais as duas pendências.

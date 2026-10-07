@@ -1,0 +1,25 @@
+-- 0010: remove o índice sem uso wallet_ledger_entries_wallet_page_idx (T33).
+-- ADR-011 (revisão), ADR-014.
+--
+-- O índice (wallet_id, created_at, id) foi criado na 0003 para a paginação
+-- keyset do extrato por (created_at, id). Desde a 0006 o extrato pagina por
+-- seq (wallet_ledger_entries_wallet_seq_key, UNIQUE (wallet_id, seq)) e
+-- nenhuma consulta ordena ou filtra por created_at:
+--   * ListByWallet: WHERE wallet_id = $1 AND seq > $2 ORDER BY seq
+--     -> wallet_ledger_entries_wallet_seq_key;
+--   * Summarize (reconciliação): WHERE wallet_id = $1
+--     -> qualquer índice com wallet_id na frente (EXPLAIN: wallet_seq_key;
+--        wallet_transaction_key também serve);
+--   * idempotência por (wallet_id, transaction_id)
+--     -> wallet_ledger_entries_wallet_transaction_key.
+-- O índice só custava escrita em todo lançamento e espaço.
+--
+-- Sem CONCURRENTLY: o runner aplica cada migration dentro de uma transação
+-- (registro em schema_migrations atômico com o DDL), e DROP INDEX
+-- CONCURRENTLY não pode rodar em transação. O DROP INDEX comum pega um
+-- ACCESS EXCLUSIVE breve na tabela (não reescreve dados; só remove o
+-- arquivo do índice), aceitável para esta tabela. Num ledger muito grande e
+-- quente, o caminho seria rodar DROP INDEX CONCURRENTLY fora do runner antes
+-- do deploy; o IF EXISTS torna esta migration um no-op nesse caso.
+
+DROP INDEX IF EXISTS wallet_ledger_entries_wallet_page_idx;

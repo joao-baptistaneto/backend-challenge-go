@@ -5,6 +5,7 @@ package migrate_test
 import (
 	"errors"
 	"io/fs"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -155,36 +156,65 @@ func TestDownSteps(t *testing.T) {
 	if _, err := m.Up(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
-	reverted, err := m.Down(ctx, conn, 6)
-	if err != nil {
-		t.Fatalf("Down(6): %v", err)
+	// tableExists usa to_regclass, que também resolve nomes de índice.
+	const pageIdx = "wallet_ledger_entries_wallet_page_idx"
+	if tableExists(t, conn, pageIdx) {
+		t.Fatalf("index %s still exists after Up (0010)", pageIdx)
 	}
-	if len(reverted) != 6 || reverted[0].Name != "add_wager_transactions_resume_failures" ||
-		reverted[1].Name != "add_outbox_claim_indexes" || reverted[2].Name != "add_wager_transactions_claim" ||
-		reverted[3].Name != "add_wallet_ledger_entries_seq" || reverted[4].Name != "create_outbox" ||
-		reverted[5].Name != "create_inbox" {
-		t.Fatalf("Down(6) reverted %+v", reverted)
+
+	// Down(1) reverte só a 0010: o índice da 0003 volta idêntico.
+	reverted, err := m.Down(ctx, conn, 1)
+	if err != nil || len(reverted) != 1 || reverted[0].Name != "drop_ledger_wallet_page_idx" {
+		t.Fatalf("Down(1): reverted %+v, err %v", reverted, err)
+	}
+	var def string
+	if err := conn.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE indexname = $1`, pageIdx).Scan(&def); err != nil {
+		t.Fatalf("index %s missing after Down(1): %v", pageIdx, err)
+	}
+	if want := "ON public.wallet_ledger_entries USING btree (wallet_id, created_at, id)"; !strings.HasSuffix(def, want) {
+		t.Fatalf("index %s = %q, want suffix %q", pageIdx, def, want)
+	}
+	if applied, err := m.Up(ctx, conn); err != nil || len(applied) != 1 || tableExists(t, conn, pageIdx) {
+		t.Fatalf("Up after Down(1): applied %d, err %v, index exists %v", len(applied), err, tableExists(t, conn, pageIdx))
+	}
+
+	reverted, err = m.Down(ctx, conn, 7)
+	if err != nil {
+		t.Fatalf("Down(7): %v", err)
+	}
+	if len(reverted) != 7 || reverted[0].Name != "drop_ledger_wallet_page_idx" ||
+		reverted[1].Name != "add_wager_transactions_resume_failures" ||
+		reverted[2].Name != "add_outbox_claim_indexes" || reverted[3].Name != "add_wager_transactions_claim" ||
+		reverted[4].Name != "add_wallet_ledger_entries_seq" || reverted[5].Name != "create_outbox" ||
+		reverted[6].Name != "create_inbox" {
+		t.Fatalf("Down(7) reverted %+v", reverted)
 	}
 	if got := appliedVersions(t, conn); len(got) != 3 {
-		t.Fatalf("applied after Down(6) = %v", got)
+		t.Fatalf("applied after Down(7) = %v", got)
 	}
 	if tableExists(t, conn, "outbox") || tableExists(t, conn, "inbox") || !tableExists(t, conn, "wallet_ledger_entries") {
-		t.Fatal("unexpected tables after Down(6)")
+		t.Fatal("unexpected tables after Down(7)")
+	}
+	if !tableExists(t, conn, pageIdx) {
+		t.Fatalf("index %s missing after Down(7)", pageIdx)
 	}
 	cols := []string{"claimed_by", "claimed_until", "resume_failures"}
 	for _, col := range cols {
 		if columnExists(t, conn, "wager_transactions", col) {
-			t.Fatalf("column %s still exists after Down(6)", col)
+			t.Fatalf("column %s still exists after Down(7)", col)
 		}
 	}
 	applied, err := m.Up(ctx, conn)
-	if err != nil || len(applied) != 6 {
-		t.Fatalf("Up after Down(6): applied %d, err %v", len(applied), err)
+	if err != nil || len(applied) != 7 {
+		t.Fatalf("Up after Down(7): applied %d, err %v", len(applied), err)
 	}
 	for _, col := range cols {
 		if !columnExists(t, conn, "wager_transactions", col) {
 			t.Fatalf("column %s missing after Up", col)
 		}
+	}
+	if tableExists(t, conn, pageIdx) {
+		t.Fatalf("index %s still exists after Up", pageIdx)
 	}
 }
 

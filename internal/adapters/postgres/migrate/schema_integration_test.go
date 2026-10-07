@@ -743,7 +743,6 @@ func TestWorkerIndexes(t *testing.T) {
 		"wager_transactions_reversal_once_key":         "PROCESSED",
 		"outbox_unpublished_seq_idx":                   "published_at IS NULL",
 		"outbox_unpublished_aggregate_seq_idx":         "(aggregate_id, seq)",
-		"wallet_ledger_entries_wallet_page_idx":        "created_at",
 		"wallet_ledger_entries_wallet_seq_key":         "(wallet_id, seq)",
 	}
 	for name, fragment := range want {
@@ -755,5 +754,31 @@ func TestWorkerIndexes(t *testing.T) {
 		if !strings.Contains(def, fragment) {
 			t.Errorf("index %s = %q, want fragment %q", name, def, fragment)
 		}
+	}
+}
+
+// O ledger tem exatamente os índices que as consultas usam: o antigo
+// wallet_page_idx (created_at, 0003) foi removido na 0010 porque a paginação
+// usa seq desde a 0006 (ADR-014, revisão da ADR-011).
+func TestLedgerIndexes(t *testing.T) {
+	t.Parallel()
+	conn := migratedDB(t)
+	rows, err := conn.Query(t.Context(), `SELECT indexname FROM pg_indexes
+WHERE schemaname = current_schema() AND tablename = 'wallet_ledger_entries' ORDER BY indexname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"wallet_ledger_entries_pkey",
+		"wallet_ledger_entries_transaction_idx",
+		"wallet_ledger_entries_wallet_seq_key",
+		"wallet_ledger_entries_wallet_transaction_key",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ledger indexes = %v, want %v", got, want)
 	}
 }
