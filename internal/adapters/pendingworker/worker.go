@@ -37,6 +37,7 @@ import (
 
 	"github.com/junglegaming/backend-challenge-go/internal/app"
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/failpoint"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/logging"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 )
@@ -247,6 +248,9 @@ func (w *Worker) runCycle(ctx, procCtx context.Context) (int, bool, error) {
 	if len(claimed) == 0 {
 		return 0, false, nil
 	}
+	// Teste de recuperação (T26, ADR-028): crash com o lote reivindicado
+	// (lease gravado) e nenhuma retomada iniciada. No build normal é vazia.
+	failpoint.Hit(failpoint.PendingAfterClaim)
 	// Prazo para iniciar um item: o lease precisa cobrir um processamento
 	// completo depois do início.
 	startBy := claimedAt.Add(w.cfg.Lease - w.cfg.ProcessTimeout)

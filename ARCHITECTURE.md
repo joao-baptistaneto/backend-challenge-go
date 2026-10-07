@@ -2481,4 +2481,144 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   devolve `consistent: true` e diferença 0.00 para cada carteira.
 - **Resultado.** Nenhum defeito de concorrência foi encontrado. Não houve mudança no código de
   produção. `go test -race -tags=integration -count=3` passa nos pacotes novos e na suíte
-  inteira (`-p 1`). Os cenários com várias instâncias independentes e com falhas ficam para a T26.
+  inteira (`-p 1`). Os cenários com várias instâncias independentes e com falhas estão na T26 (ADR-028).
+
+## ADR-028 — Testes multi-instância e recuperação de falhas (T26)
+
+- **Instâncias = processos do SO.** Os cenários do README §8 ("pelo menos três processos
+  independentes") e de "Testes de concorrência e recuperação" (itens 4–8) rodam com o
+  binário `cmd/server` de verdade. O teste o compila uma vez por execução
+  (`go build -tags failpoint`, com `-race` quando o próprio teste roda com `-race`) e inicia
+  N processos com `HTTP_ADDR` distintos. Todos usam o mesmo banco (exclusivo do teste,
+  `TEST_DATABASE_URL`) e as mesmas filas FIFO do LocalStack (exclusivas do teste). Cada
+  processo tem seu pool pgx, seu cliente SQS, seu consumidor, seu publisher da outbox e seu
+  worker de pendências. Nada é compartilhado em memória. Grafos Fx no mesmo processo foram
+  descartados: não dá para "matar" um deles sem matar o teste, e eles dividiriam o runtime
+  (GC, `http.DefaultTransport`, relógio). Os filhos rodam com `GORACE=halt_on_error=1`.
+  Uma corrida detectada derruba o processo, e o harness falha o teste se encontrar
+  `WARNING: DATA RACE` na saída de qualquer filho. O IdP é o de teste do pacote
+  (httptest): os filhos buscam o JWKS nele por HTTP. O Keycloak real fica para a T27.
+- **Crash.** Encerramento abrupto do processo: `os.Process.Kill` (TerminateProcess no
+  Windows, SIGKILL no Linux), sem `OnStop`, sem defers, sem `DeleteMessage`/`MarkPublished`
+  pendentes. O Windows não tem SIGTERM, então não há parada graciosa nesses cenários,
+  apenas o kill. Para matar o processo num ponto exato, o código de produção chama
+  `failpoint.Hit(nome)` (`internal/platform/failpoint`):
+  - no build normal, `Hit` é uma função vazia (inlined), o ambiente nem é lido e o binário
+    de produção (Dockerfile) não tem como ativar falhas;
+  - com a build tag `failpoint`, `WALLET_FAILPOINTS=nome=crash` faz o processo escrever
+    `FAILPOINT-HIT nome` no stderr e se matar (`Kill` do próprio pid). `nome=hang` bloqueia
+    a goroutine para o teste matar de fora.
+
+  Pontos instrumentados:
+
+  | Ponto | Onde |
+  |---|---|
+  | `sqs-consumer-after-commit` | consumidor: tratamento confirmado (inbox COMPLETED no commit), antes do `DeleteMessage` |
+  | `outbox-after-claim` | publisher: lote reivindicado (lease gravado), nada enviado |
+  | `outbox-after-send` | publisher: `SendMessage` aceito, antes do `MarkPublished` |
+  | `pending-after-claim` | worker: lote de pendências reivindicado (lease gravado), nenhuma retomada iniciada |
+- **Indisponibilidade de dependências.** Um proxy TCP do teste fica entre os processos e o
+  PostgreSQL (DSN reescrito) ou o LocalStack (`AWS_ENDPOINT_URL` e URLs das filas
+  reescritos). As conexões de verificação do teste vão direto à dependência. Há dois modos:
+  - `reset`: derruba as conexões abertas e fecha as novas na hora, como um restart ou uma
+    queda;
+  - `pause`: congela o tráfego das conexões abertas e segura as novas sem conectar, como
+    `docker compose pause`. Nesse modo os bytes retidos são entregues depois da volta,
+    mesmo que o cliente já tenha desistido. Isso produz commits ambíguos (o cliente recebe
+    erro e o COMMIT acontece), o caso mais difícil para a idempotência.
+
+  Escolhemos o proxy e não `docker pause/stop`: ele afeta só os processos do teste (o
+  PostgreSQL e o LocalStack do Compose seguem atendendo a verificação) e não deixa container
+  pausado se o teste morrer. Cada teste aplica 3s de `reset`, espera o readiness voltar, 4s
+  normais e 3s de `pause`, sob carga contínua.
+- **Cenários** (`cmd/server/multiinstance_test.go`):
+  - `TestMultiInstanceConcurrency`: 3 processos. A disputa 80/80 em 6 carteiras ao mesmo
+    tempo, cada aposta por um processo diferente e uma em cada três pelo SQS (consumida por
+    qualquer processo). Resultado: uma PROCESSED e uma `INSUFFICIENT_FUNDS` por carteira,
+    saldo 20.00 e um débito. A mesma aposta vai 45× pelo HTTP (nos 3 processos) e 5× pelo
+    SQS, e gera um débito. Reenvios cruzados (outro processo, outro transporte) são replays,
+    sem lançamento nem outbox novos.
+  - `TestFailureConsumerKilledAfterCommitBeforeDelete`: o processo A morre em
+    `sqs-consumer-after-commit` com duas apostas de 80.00 do mesmo grupo na fila. A
+    primeira fica PROCESSED, com inbox COMPLETED e a mensagem ainda na fila; a segunda não
+    é processada (o grupo FIFO fica retido). Quando a visibilidade (4s) vence, B ou C
+    recebe a primeira de novo, devolve o replay (log `idempotentReplay:true` com o
+    `messageId`) e só então a apaga. A segunda vira `INSUFFICIENT_FUNDS`. Resultado: um
+    débito e duas linhas na inbox.
+  - `TestFailureOutboxPublishersCrash`: a outbox é preenchida (64 eventos) por um processo
+    cujo publisher fica ocioso (`OUTBOX_POLL_INTERVAL=50m`). Dois publishers disputam a
+    outbox e morrem: P1 em `outbox-after-send` (publicado sem confirmação) e P2 em
+    `outbox-after-claim` (commit sem publicação). Os leases deles ficam gravados. P3 e P4,
+    também em disputa, os reassumem quando expiram (`attempts >= 2`) e publicam tudo.
+  - `TestFailureReversalBeforeReference`: ROLLBACK/REFUND chegam antes das referências,
+    pelo HTTP de processos diferentes e pelo SQS, e ficam `PENDING_REFERENCE` (202). Duas
+    referências chegam depois, por outro processo e pelo SQS, e as reversões são resolvidas
+    pelo worker de qualquer instância. As outras duas expiram com `REFERENCE_NOT_FOUND` no
+    TTL (8s). A referência que chega depois da expiração é processada sem reabrir a
+    reversão. Replays em outro processo devolvem o estado final (200 ou 422). Há um
+    `WagerTransactionPendingReference` por pendência.
+  - `TestFailureRestartPreservesIdempotencyAndPending`: os três processos morrem (kill) com
+    operações concluídas, uma mensagem consumida e duas reversões pendentes (`attempts >= 2`).
+    O processo D reivindica as pendências e morre em `pending-after-claim`, deixando o lease
+    gravado. Depois sobem E, F e G:
+    - os replays HTTP devolvem o resultado original (transação, status, código e saldo);
+    - a reentrega SQS do mesmo `messageId` é replay pela inbox;
+    - não surge nenhuma transação ou lançamento novo;
+    - a pendência cuja referência chega é resolvida (o lease de D é reassumido quando
+      expira);
+    - a outra expira no TTL, sem regressão de `attempts`.
+  - `TestFailurePostgresUnavailable`: 3 processos com apostas contínuas em 6 carteiras
+    (3/4 pelo HTTP, 1/4 pelo SQS) atravessam `reset` e `pause` do PostgreSQL. O readiness
+    fica 503 com `postgres` DOWN e volta a 200. O provedor reenvia a mesma operação em
+    503/erro de transporte, e o teste exige que algum reenvio tenha acontecido. As
+    mensagens voltam com o backoff do consumidor. No fim, cada operação foi processada
+    exatamente uma vez, a inbox está toda concluída e a DLQ vazia.
+  - `TestFailureSQSUnavailable`: o mesmo, com o LocalStack. O readiness fica 503 com `sqs`
+    DOWN. O consumidor volta a receber e o publisher registra a falha (`MarkFailed`, backoff
+    persistido; o teste exige `last_error`/`attempts >= 2` em algum evento) e publica tudo
+    quando o SQS volta.
+- **Verificação final de todo cenário.**
+  - A reconciliação do ADR-027 no banco inteiro: saldo == créditos − débitos do ledger,
+    cadeia `balance_before`/`balance_after`, sem saldo negativo, sem lançamento duplicado ou
+    de transação não PROCESSED, sem operação externa duplicada, outbox coerente com o status
+    de cada transação e `POST /wallets/{id}/reconciliation` consistente.
+  - Nenhuma transação `PENDING`/`PENDING_REFERENCE` sobra.
+  - A fila de entrada e a DLQ terminam vazias, com a inbox concluída na contagem esperada.
+  - **Entrega da outbox sem perda.** Toda a outbox tem `published_at`. A fila de eventos é
+    drenada e contém exatamente os `eventId` da outbox, com o corpo byte a byte igual ao
+    snapshot gravado. A primeira entrega de cada agregado segue a ordem de `seq`. Uma cópia
+    repetida (at-least-once) só é aceita com o mesmo `eventId` e o mesmo corpo. Nas
+    execuções, o FIFO do LocalStack deduplicou as republicações (0 cópias): P1 publicou e
+    morreu, P3/P4 republicaram com o mesmo `MessageDeduplicationId` (`eventId`).
+- **Parâmetros dos processos de teste.**
+  - Prazos curtos: visibilidade 4s, `SQS_WAIT_TIME` 1s, leases de outbox/worker de 3s,
+    backoff de referência de 200ms a 1s.
+  - `SQS_MAX_ATTEMPTS=8` com backoff de 1s a 2s (≈13s de orçamento) e filas com
+    `maxReceiveCount=10`. Assim uma mensagem atravessa as duas janelas de indisponibilidade
+    sem ir à DLQ. Indisponibilidade mais longa que o orçamento leva a mensagem à DLQ, por
+    contrato (ADR-022). Isso é retenção, não perda, mas não é o que esses testes medem.
+- **Execução** (build tags `integration` + `multiinstance`; a tag separa esses testes de
+  `go test -tags=integration ./...`, porque eles compilam o binário e levam cerca de 3
+  minutos):
+
+  ```sh
+  docker compose up -d --wait postgres localstack
+  make test-multiinstance   # = TEST_DATABASE_URL=... SQS_ENDPOINT=http://localhost:4566 \
+                            #   CGO_ENABLED=1 go test -race -tags=integration,multiinstance \
+                            #   -p 1 -count=1 -run 'TestMultiInstance|TestFailure' ./cmd/server
+  ```
+
+  Sem `SQS_ENDPOINT`, o teste falha em vez de ser pulado: quem passa a tag pediu
+  explicitamente esses cenários. Nenhum container é pausado ou parado. O proxy é do próprio
+  teste.
+- **Resultado.** Nenhum defeito encontrado. A única mudança no código de produção são os
+  quatro `failpoint.Hit`, no-op no build normal. Os 7 cenários passam com `-race`
+  (processos filhos também com `-race`) em execuções repetidas.
+- **Limitações.**
+  - O fluxo síncrono não confirma `PENDING` (ADR-017), então o item 8 ("interromper depois
+    de confirmar `PENDING`") não tem ponto de aceite assíncrono a interromper. O equivalente
+    exercitado é o processo que morre com o lease de pendências gravado.
+  - O IdP dos processos é o de teste. A autenticação contra o Keycloak real fica para a
+    T27.
+  - O proxy simula a falha na rede entre aplicação e dependência, não o crash do servidor
+    PostgreSQL (WAL/recovery), que é responsabilidade do próprio PostgreSQL.

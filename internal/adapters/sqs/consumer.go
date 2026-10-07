@@ -21,6 +21,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/app"
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/failpoint"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/logging"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
@@ -773,6 +774,9 @@ func (c *Consumer) handleMessage(m types.Message) bool {
 		if res.FailureCode != "" {
 			attrs = append(attrs, slog.String("failureCode", res.FailureCode.String()))
 		}
+		// Teste de recuperação (T26, ADR-028): crash depois do commit e
+		// antes do DeleteMessage. No build normal é uma função vazia.
+		failpoint.Hit(failpoint.SQSConsumerAfterCommit)
 		if derr := c.delete(m); derr != nil {
 			// O resultado já está confirmado: a reentrega encontra a inbox
 			// COMPLETED e devolve o replay, e então a mensagem é apagada.

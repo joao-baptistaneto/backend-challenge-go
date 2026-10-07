@@ -61,6 +61,7 @@ import (
 
 	"github.com/junglegaming/backend-challenge-go/internal/adapters/postgres"
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/failpoint"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/logging"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 )
@@ -338,6 +339,9 @@ func (p *Publisher) runCycle(ctx, procCtx context.Context) (int, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
+	// Teste de recuperação (T26, ADR-028): crash com o lote reivindicado e
+	// nada enviado. No build normal é uma função vazia.
+	failpoint.Hit(failpoint.OutboxAfterClaim)
 	// Um item só começa se envio e marcação ainda couberem no lease. claimedAt
 	// é anterior ao statement_timestamp() do claim, então o prazo local é
 	// conservador.
@@ -437,6 +441,9 @@ func (p *Publisher) publish(ctx context.Context, m postgres.OutboxMessage) {
 		p.failed(ctx, m, err, start)
 		return
 	}
+	// Teste de recuperação (T26, ADR-028): crash entre a publicação e a
+	// marcação. No build normal é uma função vazia.
+	failpoint.Hit(failpoint.OutboxAfterSend)
 	publishedAt := p.now()
 
 	markCtx, cancel := context.WithTimeout(ctx, p.cfg.PublishTimeout)

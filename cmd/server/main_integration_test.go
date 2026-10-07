@@ -63,11 +63,18 @@ const postgresImage = "postgres:17-alpine"
 
 var adminDSN string
 
+// afterAll são limpezas do pacote executadas depois de todos os testes (ex.:
+// o binário compilado pelos testes multi-instância, T26).
+var afterAll []func()
+
 func TestMain(m *testing.M) { os.Exit(runIntegration(m)) }
 
 func runWithLeakCheck(m *testing.M) int {
 	ignore := goleak.IgnoreCurrent()
 	code := m.Run()
+	for _, f := range afterAll {
+		f()
+	}
 	if code != 0 {
 		return code
 	}
