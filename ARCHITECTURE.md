@@ -2427,3 +2427,58 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   ele trouxer e só libera as mensagens depois dele. `fx.StopTimeout` e `stop_grace_period`
   foram ajustados (75s e 90s, item "Parada"). Agora o teste passa contra o LocalStack
   (`-count=3`, junto com o pacote inteiro).
+
+## ADR-027 — Testes de concorrência obrigatórios (T25)
+
+- **Onde.** Os cenários do README §8 e de "Testes de concorrência e recuperação" (itens 1–3 e
+  o cruzamento HTTP × SQS) rodam pela **aplicação completa** (`cmd/server.Options`, o mesmo
+  grafo Fx do binário) em `cmd/server/concurrency_integration_test.go`: servidor HTTP real com
+  o middleware OIDC (IdP de teste do pacote, que assina tokens de serviço interno e de
+  provedor com `provider_id` e papel `wager-provider`), casos de uso e repositórios PostgreSQL
+  reais, consumidor SQS real. Banco exclusivo por teste (`TEST_DATABASE_URL`). Nenhum lock,
+  fila ou deduplicação em memória participa do resultado. O nível do caso de uso já tinha
+  disputa 80/80, 7.00 × 30 e duplicatas paralelas (T15). A T25 acrescenta em
+  `internal/app/reversal_concurrency_integration_test.go` as reversões concorrentes da mesma
+  referência.
+- **Cenários.**
+  - 50 POSTs paralelos da mesma aposta (mesma chave e corpo): um débito, uma resposta não
+    replay, as 50 com a mesma transação e o saldo do processamento original (75.00).
+    Reenvios posteriores não gravam eventos.
+  - 80.00 × 2 sobre 100.00, em 5 carteiras seguidas para variar as intercalações:
+    1 PROCESSED (200, saldo 20.00), 1 REJECTED `INSUFFICIENT_FUNDS` (422), um débito, versão 2.
+    Cinco reenvios de cada, em paralelo, devolvem replays idênticos (status, código e
+    transação) e não gravam outbox.
+  - Carteiras distintas: com a linha de uma carteira travada (`FOR UPDATE` numa conexão do
+    teste), as apostas das outras 7 concluem enquanto a da carteira travada continua
+    esperando. Ela só conclui depois do unlock. Isso mostra que a coordenação é por linha de
+    carteira, sem lock global. Depois, a disputa 80/80 nas 8 carteiras ao mesmo tempo
+    (16 envios): cada carteira tem o seu resultado correto.
+  - HTTP × SQS, mesma operação (LocalStack real, `SQS_ENDPOINT`; sem ele o teste é pulado):
+    25 POSTs e 25 entregas SQS simultâneas. As entregas têm 20 `messageId` distintos e 5
+    reentregas do mesmo `messageId`, cada uma com `MessageDeduplicationId` e `MessageGroupId`
+    próprios, para o SQS não deduplicar nem serializar. Ou seja, o teste usa de propósito o pior
+    caso de produtor, fora do contrato. Resultado: uma transação, um débito, 21 linhas na
+    inbox (uma por `messageId`) apontando para ela. A fila e a DLQ terminam vazias, o que
+    também prova que o hash de idempotência do HTTP e o do SQS coincidem (ADR-010).
+  - HTTP × SQS, 80/80: em 4 carteiras ao mesmo tempo, uma aposta vai pelo HTTP e a outra pelo
+    SQS (`MessageGroupId = walletId`, contrato do ADR-022). Em cada carteira, uma PROCESSED e
+    uma `INSUFFICIENT_FUNDS`. Depois cada operação é reenviada pelo **outro** transporte. Os
+    reenvios são replays, sem efeito e sem outbox novo.
+  - Reversões concorrentes da mesma referência (pendência da T15/T21): 12 ROLLBACK/REFUND
+    alternados, com externalIds distintos, sobre uma BET processada. Resultado: uma PROCESSED e
+    11 REJECTED `ALREADY_REVERSED`, um crédito, replays idênticos. Na variante em que as 10
+    reversões disputam com a própria BET, as que chegam antes ficam `PENDING_REFERENCE`. Três
+    "workers" (`Claim`/`Resume` em paralelo) as retomam, e no fim há exatamente uma reversão
+    PROCESSED, nenhuma pendência e saldo 100.00. A proteção é o lock da carteira + a regra
+    `ALREADY_REVERSED`, com `wager_transactions_reversal_once_key` como última barreira.
+- **Reconciliação final (todo cenário de `cmd/server`).** Feita no banco inteiro do teste:
+  saldo armazenado == créditos − débitos do ledger em toda carteira, cadeia
+  `balance_before`/`balance_after` íntegra por `seq`, nenhum saldo negativo, no máximo um
+  lançamento por transação, lançamentos só de transações PROCESSED, nenhuma operação externa
+  duplicada. Na outbox, um `WalletBalanceChanged` por lançamento e exatamente um evento
+  terminal coerente com o status de cada transação (PROCESSED ↔ `WagerTransactionProcessed`,
+  REJECTED ↔ `WagerTransactionRejected`). Além disso, `POST /wallets/{id}/reconciliation`
+  devolve `consistent: true` e diferença 0.00 para cada carteira.
+- **Resultado.** Nenhum defeito de concorrência foi encontrado. Não houve mudança no código de
+  produção. `go test -race -tags=integration -count=3` passa nos pacotes novos e na suíte
+  inteira (`-p 1`). Os cenários com várias instâncias independentes e com falhas ficam para a T26.

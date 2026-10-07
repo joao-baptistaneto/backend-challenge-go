@@ -281,12 +281,33 @@ func (p *testIdP) jwksURL() string { return p.issuer() + "/protocol/openid-conne
 // internalToken assina um token de acesso do serviço interno.
 func (p *testIdP) internalToken(t *testing.T) string {
 	t.Helper()
+	return p.sign(t, map[string]any{
+		"sub": "service-account-internal", "azp": "internal-service",
+		"realm_access": map[string]any{"roles": []string{"wallet-internal"}},
+	})
+}
+
+// providerToken assina um token de acesso de provedor (papel wager-provider e
+// claim provider_id, os padrões da configuração).
+func (p *testIdP) providerToken(t *testing.T, providerID string) string {
+	t.Helper()
+	return p.sign(t, map[string]any{
+		"sub": "service-account-" + providerID, "azp": providerID, "provider_id": providerID,
+		"realm_access": map[string]any{"roles": []string{"wager-provider"}},
+	})
+}
+
+// sign assina um token de acesso com as claims padrão (iss, aud, typ,
+// validade de 5 minutos) mais extra.
+func (p *testIdP) sign(t *testing.T, extra map[string]any) string {
+	t.Helper()
 	now := time.Now()
 	claims := map[string]any{
-		"iss": p.issuer(), "aud": []string{idpAudience}, "sub": "service-account-internal",
-		"azp": "internal-service", "typ": "Bearer",
+		"iss": p.issuer(), "aud": []string{idpAudience}, "typ": "Bearer",
 		"iat": now.Unix(), "nbf": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
-		"realm_access": map[string]any{"roles": []string{"wallet-internal"}},
+	}
+	for k, v := range extra {
+		claims[k] = v
 	}
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: p.key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader(jose.HeaderKey("kid"), idpKID))
