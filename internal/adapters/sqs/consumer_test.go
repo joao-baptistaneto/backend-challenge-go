@@ -845,23 +845,135 @@ func TestConsumerShutdownDeadlineReleasesVisibility(t *testing.T) {
 	}
 }
 
-func TestConsumerStopCancelsLongPolling(t *testing.T) {
+// Como no SQS real e no LocalStack, um long polling cancelado no cliente
+// continua no servidor (serverSidePolls). Se o Stop liberasse a mensagem
+// interrompida com esse poll ainda aberto, o poll órfão a pegaria e ela
+// ficaria invisível pela visibilidade inteira. O Stop espera o último
+// receive e só então libera: a mensagem fica visível na hora.
+func TestConsumerShutdownReleasesAfterLastLongPoll(t *testing.T) {
 	f := newFakeSQS(5)
-	f.unit = time.Second // WaitTime 20s reais
+	f.unit = 100 * time.Millisecond // poll de 500ms; visibilidade de 3s
+	f.serverSidePolls = true
+	a1 := f.send("A", envelopeJSON(t, "msg-a1", "a1", nil))
+	entered := make(chan struct{})
+	p := &fakeProcessor{fn: func(ctx context.Context, _ app.ProcessWagerCommand, _ int) (app.WagerResult, error) {
+		close(entered)
+		<-ctx.Done()
+		return app.WagerResult{}, fmt.Errorf("process wager: %w", ctx.Err())
+	}}
 	cfg := testConfig(f)
-	cfg.WaitTime = 20 * time.Second
-	c := startConsumer(t, f, &fakeProcessor{}, cfg)
-	waitFor(t, "receive em andamento", func() bool { return f.state().receiveCalls >= 1 })
+	cfg.WaitTime = 5 * time.Second
+	cfg.DrainTimeout = 50 * time.Millisecond
+	c := startConsumer(t, f, p, cfg)
+	<-entered
+	waitFor(t, "long polling em curso", func() bool { return f.state().receiveCalls >= 2 })
+
 	start := time.Now()
-	if err := stop(t, c); err != nil {
-		t.Fatal(err)
+	if err := stop(t, c); !errors.Is(err, ErrDrainTimeout) {
+		t.Fatalf("Stop = %v, want ErrDrainTimeout", err)
 	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("Stop deveria cancelar o long polling, levou %s", d)
+	if d := time.Since(start); d > cfg.WaitTime+cfg.CallTimeout+time.Second {
+		t.Fatalf("Stop levou %s", d)
+	}
+	f.polls.Wait()
+	s := f.state()
+	f.mu.Lock()
+	lost := slices.Clone(f.lostReceives)
+	f.mu.Unlock()
+	if len(lost) != 0 {
+		t.Fatalf("nenhum poll órfão pode pegar a mensagem liberada: %v", lost)
+	}
+	if !slices.Equal(s.visChanges, []visChange{{id: a1, seconds: 0}}) || !f.visibleNow(a1) {
+		t.Fatalf("a1 deve estar visível logo após o Stop: %+v", s)
+	}
+}
+
+// As mensagens que o último long polling trouxer depois do início do Stop
+// não são processadas: voltam à fila com visibilidade 0.
+func TestConsumerStopReleasesMessagesFromLastLongPoll(t *testing.T) {
+	f := newFakeSQS(5)
+	f.unit = 200 * time.Millisecond // poll de 2s
+	cfg := testConfig(f)
+	cfg.WaitTime = 10 * time.Second
+	p := &fakeProcessor{}
+	c := startConsumer(t, f, p, cfg)
+	waitFor(t, "long polling em curso", func() bool { return f.state().receiveCalls >= 1 })
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- stop(t, c) }()
+	waitFor(t, "Stop iniciado", c.stopping.Load)
+	receivesAtStop := f.state().receiveCalls
+	a1 := f.send("A", envelopeJSON(t, "msg-a1", "a1", nil))
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	s := f.state()
+	if n := len(p.snapshot()); n != 0 {
+		t.Fatalf("nada pode ser processado depois do início do Stop (chamadas %d)", n)
+	}
+	if !slices.Equal(s.visChanges, []visChange{{id: a1, seconds: 0}}) || !f.visibleNow(a1) {
+		t.Fatalf("a1, trazida pelo último receive, deve ser liberada: %+v", s)
+	}
+	if s.receiveCalls != receivesAtStop {
+		t.Fatalf("nenhum ReceiveMessage novo depois do Stop: %d → %d", receivesAtStop, s.receiveCalls)
 	}
 	if err := c.Ready(t.Context()); err == nil {
 		t.Fatal("readiness deve falhar depois do Stop")
 	}
+}
+
+// Ocioso, o Stop só espera o último long polling; se ele durar mais que o
+// DrainTimeout, isso não é estouro de drenagem (nada estava em processamento).
+func TestConsumerIdleStopWaitingLongPollIsNotDrainTimeout(t *testing.T) {
+	f := newFakeSQS(5)
+	f.unit = 100 * time.Millisecond // poll de 500ms
+	cfg := testConfig(f)
+	cfg.WaitTime = 5 * time.Second
+	cfg.DrainTimeout = 50 * time.Millisecond
+	c := startConsumer(t, f, &fakeProcessor{}, cfg)
+	waitFor(t, "long polling em curso", func() bool { return f.state().receiveCalls >= 1 })
+	if err := stop(t, c); err != nil {
+		t.Fatalf("Stop ocioso = %v, want nil", err)
+	}
+}
+
+// Se o servidor não responde ao long polling em WaitTime + CallTimeout, ou o
+// ctx do Stop vence antes, o receive é cancelado e o Stop não trava.
+func TestConsumerStopCancelsUnresponsiveLongPolling(t *testing.T) {
+	t.Run("prazo do receive", func(t *testing.T) {
+		f := newFakeSQS(5)
+		f.hangReceive = true
+		cfg := testConfig(f)
+		cfg.CallTimeout = 200 * time.Millisecond
+		c := startConsumer(t, f, &fakeProcessor{}, cfg)
+		waitFor(t, "receive em andamento", func() bool { return f.state().receiveCalls >= 1 })
+		start := time.Now()
+		if err := stop(t, c); err != nil {
+			t.Fatal(err)
+		}
+		if d := time.Since(start); d < cfg.WaitTime || d > cfg.WaitTime+cfg.CallTimeout+time.Second {
+			t.Fatalf("Stop deve esperar WaitTime + CallTimeout e então cancelar; levou %s", d)
+		}
+		if err := c.Ready(t.Context()); err == nil {
+			t.Fatal("readiness deve falhar depois do Stop")
+		}
+	})
+	t.Run("prazo do ctx", func(t *testing.T) {
+		f := newFakeSQS(5)
+		f.hangReceive = true
+		cfg := testConfig(f)
+		cfg.WaitTime = 20 * time.Second
+		c := startConsumer(t, f, &fakeProcessor{}, cfg)
+		waitFor(t, "receive em andamento", func() bool { return f.state().receiveCalls >= 1 })
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_ = c.Stop(ctx)
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("Stop deve respeitar o prazo do ctx; levou %s", d)
+		}
+	})
 }
 
 func TestConsumerDeleteFailureIsRedeliveredAsReplay(t *testing.T) {

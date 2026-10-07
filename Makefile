@@ -3,7 +3,8 @@ BIN_DIR ?= bin
 PKGS    ?= ./...
 GO_IMAGE ?= golang:1.25
 
-.PHONY: all build run test test-race test-race-docker test-integration vet fmt fmt-check tidy check clean migrate-up migrate-down migrate-status
+.PHONY: all build run test test-race test-race-docker test-integration vet fmt fmt-check tidy check clean migrate-up migrate-down migrate-status \
+	compose-up compose-up-scaled compose-down compose-ps compose-logs compose-smoke test-integration-compose
 
 all: check build
 
@@ -52,3 +53,42 @@ migrate-down:
 
 migrate-status:
 	$(GO) run ./cmd/migrate status
+
+# Docker Compose (ADR-026). --wait espera todos os healthchecks (o job de
+# migrations precisa terminar com 0). Portas no host: API 8080 (nginx),
+# Keycloak 8081, LocalStack 4566, PostgreSQL 5433.
+COMPOSE  ?= docker compose
+REPLICAS ?= 3
+
+compose-up:
+	$(COMPOSE) up --build -d --wait
+
+compose-up-scaled:
+	$(COMPOSE) up --build -d --wait --scale app=$(REPLICAS)
+
+compose-down:
+	$(COMPOSE) down -v --remove-orphans
+
+compose-ps:
+	$(COMPOSE) ps -a
+
+compose-logs:
+	$(COMPOSE) logs -f --tail=100
+
+# Token client_credentials (provider-a, provider-b, internal-service),
+# chamadas autenticadas à API e atributos das filas (FIFO, redrive, dedup).
+compose-smoke:
+	COMPOSE="$(COMPOSE)" bash scripts/compose-smoke.sh
+
+# Integração contra a stack do Compose (valores de DESENVOLVIMENTO). -p 1:
+# os pacotes compartilham o mesmo LocalStack/PostgreSQL e rodam em série
+# para não disputar o mesmo LocalStack (ADR-026).
+COMPOSE_TEST_ENV = \
+	TEST_DATABASE_URL='postgres://wallet:wallet-dev-pw@localhost:5433/wallet?sslmode=disable' \
+	SQS_ENDPOINT=http://localhost:4566 \
+	KEYCLOAK_URL=http://localhost:8081 \
+	KEYCLOAK_CLIENT_ID=internal-service \
+	KEYCLOAK_CLIENT_SECRET=internal-service-dev-secret
+
+test-integration-compose:
+	$(COMPOSE_TEST_ENV) CGO_ENABLED=1 $(GO) test -race -tags=integration -p 1 -count=1 $(PKGS)

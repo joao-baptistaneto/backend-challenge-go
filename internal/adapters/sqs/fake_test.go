@@ -45,6 +45,16 @@ type fakeSQS struct {
 	getURLErr    int            // próximos N GetQueueUrl falham
 	sendCalls    int
 	getURLCalls  int
+
+	// serverSidePolls: como no SQS real (e no LocalStack), cancelar o
+	// ReceiveMessage no cliente não encerra o long polling no servidor; ele
+	// segue até o fim do WaitTime e as mensagens que pegar ficam invisíveis
+	// (resposta perdida). polls conta esses polls órfãos (wait).
+	serverSidePolls bool
+	polls           sync.WaitGroup
+	lostReceives    []string // ids pegos por polls órfãos
+	// hangReceive: o servidor não responde; o receive só volta cancelado.
+	hangReceive bool
 }
 
 const fakeAccount = "000000000000"
@@ -88,13 +98,21 @@ func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *awssqs.ReceiveMessageI
 	if fail {
 		f.failReceive--
 	}
+	hang, orphan := f.hangReceive, f.serverSidePolls
 	f.mu.Unlock()
 	if fail {
 		return nil, errors.New("fake: receive failed")
 	}
+	if hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	deadline := time.Now().Add(time.Duration(in.WaitTimeSeconds) * f.unit)
 	for {
 		if err := ctx.Err(); err != nil {
+			if orphan {
+				f.orphanPoll(in, deadline)
+			}
 			return nil, err
 		}
 		if out := f.take(in); len(out) > 0 || !time.Now().Before(deadline) {
@@ -102,10 +120,41 @@ func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *awssqs.ReceiveMessageI
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+// orphanPoll continua, "no servidor", um long polling cancelado no cliente:
+// até o deadline, a primeira entrega é feita e perdida (ninguém a recebe).
+func (f *fakeSQS) orphanPoll(in *awssqs.ReceiveMessageInput, deadline time.Time) {
+	f.polls.Add(1)
+	go func() {
+		defer f.polls.Done()
+		for time.Now().Before(deadline) {
+			if out := f.take(in); len(out) > 0 {
+				f.mu.Lock()
+				for _, m := range out {
+					f.lostReceives = append(f.lostReceives, aws.ToString(m.MessageId))
+				}
+				f.mu.Unlock()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+}
+
+// visibleNow informa se a mensagem id está na fila e visível agora.
+func (f *fakeSQS) visibleNow(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, m := range f.msgs {
+		if m.id == id {
+			return !m.visibleAt.After(time.Now())
+		}
+	}
+	return false
 }
 
 func (f *fakeSQS) take(in *awssqs.ReceiveMessageInput) []types.Message {

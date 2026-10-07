@@ -1729,20 +1729,48 @@ o `*awssqs.Client` satisfaz e os testes unitários substituem por uma fila FIFO 
   - Entre lotes não há bloqueio local: o próprio SQS segura o grupo enquanto houver
     mensagem dele em voo. Como nenhum lock é global, outras carteiras seguem
     normalmente.
-- **Shutdown (OnStop).**
-  1. Para de buscar: o contexto do long polling é cancelado, e a chamada em curso
-     retorna na hora.
-  2. As mensagens em processamento terminam (commit + delete) até `SQS_DRAIN_TIMEOUT`
-     ou o prazo do ctx do OnStop. As recebidas e ainda não iniciadas são liberadas com
-     `ChangeMessageVisibility(0)`.
-  3. Estourado o prazo, o contexto do processamento é cancelado (rollback). As mensagens
-     interrompidas também são liberadas com visibilidade 0, e o Stop devolve
-     `ErrDrainTimeout`.
-  4. O Stop sempre espera todas as goroutines do consumidor, salvo se o próprio ctx do
+- **Shutdown (OnStop).** *(Revisado na T24; ver "Correção" abaixo.)*
+  1. Para de buscar: nenhum `ReceiveMessage` novo começa, mas o que está em curso
+     **não** é cancelado. O Stop espera ele terminar (até `SQS_WAIT_TIME` +
+     `CallTimeout` 5s). As mensagens que ele trouxer não são processadas: são liberadas
+     com `ChangeMessageVisibility(0)`.
+  2. Em paralelo, as mensagens em processamento terminam (commit + delete) até
+     `SQS_DRAIN_TIMEOUT` (contado do início do Stop) ou o prazo do ctx do OnStop. As
+     recebidas e ainda não iniciadas são liberadas com visibilidade 0.
+  3. Estourado o prazo com mensagem em processamento, o contexto do processamento é
+     cancelado (rollback). As interrompidas também são liberadas com visibilidade 0, e o
+     Stop devolve `ErrDrainTimeout`. Se o prazo vence só esperando o último long polling
+     (nada em processamento), não é estouro: o Stop devolve nil.
+  4. **Toda liberação do shutdown acontece depois do último receive** (`release` espera
+     o fim do laço quando `stopping`).
+  5. O Stop sempre espera todas as goroutines do consumidor, salvo se o próprio ctx do
      OnStop vencer.
 
-  Uma resposta de `ReceiveMessage` perdida pelo cancelamento só atrasa as mensagens até
-  o fim da visibilidade, sem risco: elas não foram processadas.
+  **Correção (T24, achada contra o LocalStack real).** A versão original cancelava o
+  contexto do long polling no Stop. Só que cancelar um `ReceiveMessage` no cliente não o
+  encerra no servidor, nem no LocalStack nem na AWS: a chamada continua até o fim do
+  `WaitTime`, e a resposta vai para uma conexão que ninguém lê. A mensagem interrompida,
+  liberada com visibilidade 0 logo depois, era entregue a esse poll órfão e ficava
+  invisível pelo `VisibilityTimeout` inteiro (30s). Não havia perda (at-least-once), mas
+  a "reentrega imediata" do shutdown falhava, e um poll órfão também escondia mensagens
+  novas que chegassem no fim do `WaitTime`. Alternativas consideradas:
+  - cancelar o poll e liberar depois de `WaitTime`: o mesmo custo de espera, e ainda
+    perde as mensagens que o poll órfão pegar;
+  - `WaitTime` curto: mais chamadas vazias e mais custo, só para encurtar a janela.
+
+  A escolha foi deixar o último receive terminar, liberar o que ele trouxer e só então
+  liberar o resto. Custo: o Stop de uma réplica ociosa leva até `SQS_WAIT_TIME` (20s por
+  padrão) em vez de ser imediato. Isso entra no `fx.StopTimeout` por
+  `sqs.StopBudget` = max(`SQS_DRAIN_TIMEOUT`, `SQS_WAIT_TIME` + 5s), já que a espera corre
+  em paralelo com a drenagem: 75s com os defaults (ADR-025, ADR-026). Só se o servidor não
+  responder em `WaitTime` + 5s, ou o ctx do OnStop vencer, o receive é cancelado no
+  cliente. Nesse caso volta o comportamento antigo, atraso até o fim da visibilidade, sem
+  perda. Testes: `TestConsumerShutdownReleasesAfterLastLongPoll` (fila falsa com poll que
+  continua no servidor depois do cancelamento, `serverSidePolls`),
+  `TestConsumerStopReleasesMessagesFromLastLongPoll`,
+  `TestConsumerIdleStopWaitingLongPollIsNotDrainTimeout`,
+  `TestConsumerStopCancelsUnresponsiveLongPolling` e, contra o LocalStack,
+  `TestIntegrationConsumerShutdownReleasesVisibility`.
 - **Fx.**
   - `ClientModule` provê `*sqs.Client` e `sqs.API`. O cliente tem transporte HTTP
     próprio, e o OnStop fecha as conexões ociosas. Como é construído antes de quem o
@@ -1795,7 +1823,8 @@ o `*awssqs.Client` satisfaz e os testes unitários substituem por uma fila FIFO 
     - drenagem no shutdown, com liberação das seguintes do grupo e nenhum receive
       depois do Stop;
     - prazo de drenagem com liberação (visibilidade 0);
-    - cancelamento do long polling;
+    - long polling no shutdown: o último receive termina antes das liberações, o que
+      ele traz é liberado, e um servidor que não responde é cancelado (T24);
     - delete que falha leva a replay;
     - retry do receive;
     - renovação de visibilidade;
@@ -2221,7 +2250,11 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   `SQS_DRAIN_TIMEOUT` + `PENDING_WORKER_DRAIN_TIMEOUT` + `OUTBOX_DRAIN_TIMEOUT` + folga de 15s.
   A folga cobre a liberação das mensagens SQS depois do estouro da drenagem (5s por chamada,
   em paralelo), a última marcação da outbox (`OUTBOX_PUBLISH_TIMEOUT`) e o fechamento do pool
-  e dos clients. Com os defaults: 15 + 10 + 10 + 10 + 15 = **60s**. Se o ctx vencesse antes, o
+  e dos clients. Com os defaults: 15 + 10 + 10 + 10 + 15 = **60s**. *(Revisado na T24: a
+  parcela do SQS passou a ser `sqs.StopBudget` = max(`SQS_DRAIN_TIMEOUT`, `SQS_WAIT_TIME` +
+  5s), porque o Stop espera o último long polling (ADR-022, "Shutdown"). Com os defaults:
+  15 + 25 + 10 + 10 + 15 = **75s**. A reserva de rollback passa a 75s e o `StartTimeout` a
+  120s.)* Se o ctx vencesse antes, o
   Fx abandonaria os hooks restantes e o pool/clients não fechariam em ordem. O orquestrador
   precisa dar ao processo pelo menos esse tempo entre SIGTERM e SIGKILL (no Compose,
   `stop_grace_period`, cujo default é 10s; T24).
@@ -2268,3 +2301,129 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
     `KEYCLOAK_URL`, `KEYCLOAK_CLIENT_SECRET`; Skip sem eles) e roda na T24. Para a aplicação
     num `defer` se algo falhar depois do start e confere que client secret, token e senha do
     banco não aparecem nos logs.
+
+## ADR-026 — Dockerfile, Docker Compose e provisionamento (T24)
+
+- **Imagem (`Dockerfile`).** Multi-stage: `golang:1.25-alpine` (a diretiva `go 1.25.0` do
+  go.mod; `GOTOOLCHAIN=local` faz o build falhar em vez de baixar outro toolchain se o go.mod
+  subir), `CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`, cache de módulos/build via BuildKit.
+  Uma imagem com os dois binários: `server` (entrypoint) e `migrate` (job). Runtime
+  `alpine:3.22` com usuário não-root (uid 10001). Alpine e não distroless para ter o `wget`
+  do busybox no healthcheck sem um binário extra. `.dockerignore` restringe o contexto a
+  `go.mod/go.sum`, `cmd/`, `internal/` e `migrations/` (nada de `.env`/`.git`).
+- **Serviços (`docker-compose.yml`, projeto `junglegaming-wallet`).**
+
+  | Serviço | Imagem | Host | Pronto quando |
+  |---|---|---|---|
+  | `postgres` | `postgres:17-alpine` (mesma dos testcontainers) | 5433 | `pg_isready` |
+  | `keycloak` | `quay.io/keycloak/keycloak:26.0`, `start-dev --import-realm` | 8081 | discovery do realm `junglegaming` responde (realm importado) |
+  | `localstack` | `localstack/localstack:4.4` (`SERVICES=sqs,iam,sts`) | 4566 | init hook terminou (marcador) e `/_localstack/health` ok |
+  | `migrate` | imagem da app, `migrate up` | — | sai com 0 (`service_completed_successfully`) |
+  | `app` | imagem da app | — (só `expose: 8080`) | `GET /health/ready` (postgres, sqs, http-server) |
+  | `lb` | `nginx:1.28-alpine` | 8080 | `/lb/health` |
+
+  `app` depende de `postgres`/`localstack`/`keycloak` com `service_healthy` e de `migrate` com
+  `service_completed_successfully`; `lb` depende de `app` saudável. `docker compose up --build
+  -d --wait` só retorna com tudo saudável (o job encerrado com 0 não quebra o `--wait`).
+  O PostgreSQL é publicado em **5433** porque 5432 costuma estar ocupada por um PostgreSQL
+  local. O healthcheck do Keycloak usa `/dev/tcp` do bash (a imagem não tem curl/wget) e
+  precisa mandar `Host`: sem ele o Keycloak 26 responde 500 (NPE em `authority()`).
+- **Escala (`--scale app=3`).** As réplicas não publicam porta, então não há conflito no
+  host. O nginx publica a API em `localhost:8080`. `server app:8080 resolve` (nginx ≥ 1.27.3,
+  com `zone` e `resolver 127.0.0.11 valid=5s`) re-resolve o DNS do Docker: réplicas
+  acrescentadas ou removidas entram e saem do round-robin sem reiniciar o nginx (verificado:
+  9 requisições → 3 por réplica, `upstream=` no access log). Com
+  `proxy_next_upstream error timeout http_502`, uma réplica parando (listener fechado →
+  conexão recusada) faz a requisição ir para outra. Requisições não idempotentes só são
+  repetidas se não chegaram a ser enviadas (padrão do nginx), então um POST não é duplicado.
+  Mesmo que fosse, a idempotência por chave cobriria (ADR-010). Medido: 60 requisições
+  seguidas durante `--scale app=2` (a partir de 3) e durante `docker stop` de uma réplica →
+  60× 200. Limitação observada: depois que o container some, o IP antigo fica no cache de
+  DNS do nginx por até 5s. Com o nginx ocioso, a primeira requisição nesse intervalo pode ir
+  para o IP morto, esperar o `proxy_connect_timeout` (2s) e voltar 502 ("no live upstreams").
+  Isso não acontece com o listener fechado durante a drenagem, porque a conexão é recusada na
+  hora e a requisição segue para outra réplica. Alternativa descartada: faixa
+  de portas no host (`8080-8082:8080`), que expõe N endpoints e deixa o balanceamento para o
+  cliente. As migrations rodam uma vez, no job; o runner já é seguro em paralelo (advisory
+  lock, ADR-011).
+- **Parada.** `stop_grace_period: 90s` ≥ `fx.StopTimeout` = SHUTDOWN_TIMEOUT 15s +
+  max(SQS_DRAIN_TIMEOUT 10s, SQS_WAIT_TIME 20s + 5s) + PENDING_WORKER_DRAIN_TIMEOUT 10s +
+  OUTBOX_DRAIN_TIMEOUT 10s + 15s = 75s (ADR-025; a parcela do SQS vem da correção do
+  shutdown do consumidor, ADR-022). O default do Docker (10s) mataria o processo no meio da
+  drenagem. Esses prazos, incluindo `SQS_WAIT_TIME`, ficam explícitos no `x-app-env` do
+  Compose. `docker stop` de uma réplica ociosa sai com 0 em até ~`SQS_WAIT_TIME`: o
+  consumidor espera o último long polling terminar (medido: 7s e 19s, exit 0).
+- **Issuer OIDC (host × rede do Compose).** O app valida `iss`. O Keycloak roda com
+  `KC_HOSTNAME=http://localhost:8081` (hostname v2, URL completa) e
+  `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true`. Assim **todo** token tem
+  `iss=http://localhost:8081/realms/junglegaming`, seja pedido do host, seja de dentro da rede.
+  O app usa `OIDC_ISSUER_URL=http://localhost:8081/realms/junglegaming`, que só é comparado
+  com o `iss` e nunca acessado, e
+  `OIDC_JWKS_URL=http://keycloak:8080/realms/junglegaming/protocol/openid-connect/certs`
+  (chaves pela rede interna, sem discovery). Um token obtido no host (curl em
+  `localhost:8081`) é aceito pelas réplicas, e os testes de integração no host usam o
+  discovery normal em `localhost:8081`. Com o app fora do Compose (no host), `.env.example`
+  aponta os dois para `localhost:8081`.
+- **Realm (`deploy/keycloak/realm-junglegaming.json`).** Papéis de realm `wager-provider` e
+  `wallet-internal`. Os clients são confidenciais e só usam client_credentials (service
+  account; sem standard flow nem direct grants):
+  - `provider-a` e `provider-b`: papel `wager-provider` e mapper hardcoded `provider_id` = id
+    do client (String, só no access token);
+  - `internal-service`: papel `wallet-internal`, sem `provider_id`.
+
+  Os três têm um audience mapper com `included.custom.audience=wallet-api`
+  (= `OIDC_AUDIENCE`). Os papéis saem em `realm_access.roles` pelo client scope padrão
+  `roles`, e `typ=Bearer`. **Os segredos (`provider-a-dev-secret`, `provider-b-dev-secret`,
+  `internal-service-dev-secret`), o admin `admin/admin` e a senha do banco são valores fixos
+  de DESENVOLVIMENTO**, versionados de propósito; o `displayName` do realm diz isso. Nenhum
+  `.env` real é versionado (`.gitignore`). A senha do banco é `wallet-dev-pw`, e não
+  `wallet`, porque o teste da composição confere que a senha não aparece nos logs, e
+  `wallet` é o nome do serviço em todo log.
+- **SQS (`deploy/localstack/init-sqs.sh`, hook `ready.d`).** O script é idempotente:
+  `create-queue` só com `FifoQueue=true` e o resto via `set-queue-attributes`.
+  Com `SQS_ENDPOINT_STRATEGY=path` o LocalStack devolve URLs
+  `http://<host>:4566/queue/us-east-1/000000000000/<fila>` (sem DNS `*.localstack.cloud`),
+  mas também aceita a forma `http://<host>:4566/000000000000/<fila>`, que é a usada no app e
+  nos testes (verificado: réplicas saudáveis consumindo/publicando com ela).
+  - `wager-transactions-dlq.fifo`: FIFO, retenção de 14 dias, `RedriveAllowPolicy` byQueue
+    só para a fila de entrada.
+  - `wager-transactions.fifo`: FIFO, `ContentBasedDeduplication=false` (produtores mandam
+    `MessageGroupId=walletId` e `MessageDeduplicationId=messageId`), `VisibilityTimeout=30`,
+    `RedrivePolicy` com `maxReceiveCount=5` → DLQ. O consumidor recusa o start sem ela
+    (`ErrNoRedrivePolicy`) e exige `SQS_MAX_ATTEMPTS` (3) < 5 (ADR-022).
+  - `wager-events.fifo`: FIFO, `ContentBasedDeduplication=false` (dedup por `eventId`,
+    ADR-024).
+  - Credenciais e políticas: o app usa `test/test` (conta `000000000000`). Cada fila tem uma
+    `Policy` de recurso restrita à conta, e o usuário IAM `wallet-app` recebe a política
+    mínima (Receive/Delete/ChangeVisibility/GetAttributes na entrada, SendMessage na DLQ e
+    nos eventos). O LocalStack Community **não aplica IAM**: isso documenta, de forma
+    executável, o que a AWS exigiria.
+  - O healthcheck só passa depois do marcador gravado no fim do script, então o app nunca
+    sobe antes de as filas e o redrive existirem.
+- **Verificação.**
+  - `make compose-up` / `make compose-up-scaled` (`REPLICAS=3`).
+  - `make compose-smoke` (`scripts/compose-smoke.sh`): obtém do host tokens
+    client_credentials dos três clients e confere `iss`/`aud`/`provider_id`/papel. Via nginx:
+    401 sem token, 201 em `POST /wallets` com `internal-service`, 200 na consulta, 403 para
+    `provider-a` na rota de carteira e 404 (autenticado) para `provider-a` em transação
+    inexistente. Confere os atributos FIFO, RedrivePolicy e ContentBasedDeduplication via
+    `docker compose exec localstack awslocal`.
+  - `make test-integration-compose`: `-tags=integration -race -p 1`, com
+    `TEST_DATABASE_URL` no PostgreSQL do Compose, `SQS_ENDPOINT`, `KEYCLOAK_URL` e o segredo
+    de dev do `internal-service`.
+
+  `.gitattributes` força LF em `.sh`/`.conf`/`.json`/`.yml`/Dockerfile, que são montados em
+  containers Linux a partir de um checkout Windows com `core.autocrlf=true`.
+- **Achado nos testes contra o LocalStack real (resolvido na T24).**
+  `TestIntegrationConsumerShutdownReleasesVisibility` (T20) falhava sempre nesta máquina. No `Stop`, o consumidor cancela no cliente o `ReceiveMessage` em long
+  polling, mas o servidor mantém a chamada até o fim do `WaitTime`. A mensagem liberada
+  (visibilidade 0) é entregue a essa chamada abandonada e fica invisível pelo
+  `VisibilityTimeout` inteiro (30s), o que estoura a espera do teste. Reproduzido só com
+  `awslocal`: receive abandonado + `change-message-visibility 0` → 0 visíveis, 1 em voo. Na
+  AWS real o comportamento é o mesmo. Não há perda (at-least-once: a mensagem volta depois
+  da visibilidade), mas a "reentrega imediata" do shutdown não era garantida. **Correção
+  aplicada** (ADR-022, "Shutdown"): o `Stop` não cancela mais o receive em curso. Ele espera
+  o receive terminar (até `SQS_WAIT_TIME` + 5s, em paralelo com a drenagem), libera o que
+  ele trouxer e só libera as mensagens depois dele. `fx.StopTimeout` e `stop_grace_period`
+  foram ajustados (75s e 90s, item "Parada"). Agora o teste passa contra o LocalStack
+  (`-count=3`, junto com o pacote inteiro).

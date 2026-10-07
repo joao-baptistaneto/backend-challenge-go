@@ -1,0 +1,14 @@
+# Só go.mod/go.sum, cmd/, internal/ e migrations/ entram no build.
+.git
+.claude
+.env
+.env.*
+bin
+deploy
+scripts
+*.md
+*.out
+coverage.*
+docker-compose.yml
+Dockerfile
+.dockerignore

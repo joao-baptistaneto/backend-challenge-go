@@ -1,0 +1,7 @@
+# Scripts e configs montados em containers Linux precisam de LF mesmo em
+# checkouts Windows (core.autocrlf=true).
+*.sh   text eol=lf
+*.conf text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+Dockerfile text eol=lf

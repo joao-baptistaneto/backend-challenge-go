@@ -67,11 +67,16 @@ import (
 // tentar (releaseTracker); assim a seguinte de uma mensagem com falhas não
 // herda as tentativas dela.
 //
-// Shutdown (Stop): para de buscar (o long polling é cancelado), deixa as
-// mensagens em processamento terminarem até DrainTimeout e libera
-// (visibilidade 0) as recebidas e ainda não iniciadas. Estourado o prazo, o
-// contexto do processamento é cancelado (a transação faz rollback) e essas
-// mensagens também são liberadas.
+// Shutdown (Stop): para de buscar, mas NÃO cancela o long polling em curso:
+// um ReceiveMessage cancelado só no cliente continua no servidor (SQS e
+// LocalStack) até o fim do WaitTime, e a mensagem que ele pegar fica
+// invisível pelo VisibilityTimeout inteiro sem ninguém para processá-la. O
+// Stop espera esse último receive terminar (até WaitTime + CallTimeout; só
+// depois disso o cancela) e libera o que ele trouxer. Em paralelo, deixa as
+// mensagens em processamento terminarem até DrainTimeout. Estourado o prazo,
+// o contexto do processamento é cancelado (a transação faz rollback). Toda
+// liberação do shutdown (visibilidade 0) acontece depois do último receive,
+// para nenhum poll pendente pegar a mensagem liberada.
 
 // WagerProcessor é o caso de uso consumido (*app.ProcessWagerTransaction).
 type WagerProcessor interface {
@@ -245,11 +250,13 @@ type Consumer struct {
 
 	maxReceiveCount atomic.Int32
 	stopping        atomic.Bool
+	processing      atomic.Int32 // mensagens em handleMessage (drenagem)
 
 	mu         sync.Mutex
 	started    bool
 	stopped    bool
-	recvCancel context.CancelFunc
+	loopCancel context.CancelFunc // para o laço (vagas, backoff); não o receive
+	recvCancel context.CancelFunc // cancela o receive em curso (só como último recurso)
 	procCtx    context.Context
 	procCancel context.CancelFunc
 	loopDone   chan struct{}
@@ -324,12 +331,14 @@ func (c *Consumer) Start(ctx context.Context) error {
 			slog.String("configuredDLQ", c.dlqName), slog.String("redriveDLQ", policy.dlq.name))
 	}
 
+	loopCtx, loopCancel := context.WithCancel(context.Background())
 	recvCtx, recvCancel := context.WithCancel(context.Background())
 	procCtx, procCancel := context.WithCancel(context.Background())
-	c.recvCancel, c.procCtx, c.procCancel = recvCancel, procCtx, procCancel
+	c.loopCancel, c.recvCancel = loopCancel, recvCancel
+	c.procCtx, c.procCancel = procCtx, procCancel
 	c.loopDone = make(chan struct{})
 	c.started = true
-	go c.loop(recvCtx, c.loopDone)
+	go c.loop(loopCtx, recvCtx, c.loopDone)
 	c.logger.InfoContext(ctx, "consumidor SQS iniciado",
 		slog.String("queue", c.queueName),
 		slog.String("dlq", policy.dlq.name),
@@ -448,9 +457,19 @@ func parseRedrivePolicy(raw string) (redrivePolicy, error) {
 	return redrivePolicy{dlq: arn, maxReceiveCount: int32(n)}, nil
 }
 
-// Stop para de buscar mensagens, drena as em processamento até DrainTimeout
-// (ou o prazo do ctx) e libera as não concluídas. Sempre espera todas as
-// goroutines do consumidor terminarem.
+// StopBudget é o pior caso do Stop antes das liberações finais: a drenagem
+// (drainTimeout) corre em paralelo com a espera do último long polling
+// (waitTime + CallTimeout padrão). Entra no fx.StopTimeout (ADR-025/026).
+func StopBudget(waitTime, drainTimeout time.Duration) time.Duration {
+	return max(drainTimeout, waitTime+defaultCallTimeout)
+}
+
+// Stop para de buscar mensagens, espera o receive em curso terminar (até
+// WaitTime + CallTimeout; depois disso, ou se o ctx vencer, ele é cancelado),
+// drena as em processamento até DrainTimeout (contado do início do Stop, em
+// paralelo com essa espera) ou o prazo do ctx, e libera as não concluídas
+// depois do último receive. Sempre espera todas as goroutines do consumidor,
+// salvo se o ctx vencer.
 func (c *Consumer) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	if !c.started || c.stopped {
@@ -461,31 +480,40 @@ func (c *Consumer) Stop(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.stopping.Store(true)
-	c.recvCancel()
-	<-c.loopDone // o laço não cria grupos depois disto
+	c.loopCancel() // nenhum receive novo; o em curso segue até o fim do WaitTime
 
 	drainCtx, cancel := context.WithTimeout(ctx, c.cfg.DrainTimeout)
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		c.wg.Wait()
-		close(done)
+		defer close(done)
+		c.awaitLastReceive(ctx)
+		c.wg.Wait() // depois do loopDone: o laço não cria grupos depois disto
 	}()
 
 	var result error
 	select {
 	case <-done:
 	case <-drainCtx.Done():
-		c.logger.WarnContext(context.WithoutCancel(ctx), "drenagem do consumidor SQS estourou o prazo; cancelando processamento")
-		result = ErrDrainTimeout
-		c.procCancel()
-		// Cancelado, cada mensagem é liberada com prazo próprio
-		// (CallTimeout). Se nem isso couber no prazo do OnStop, o Stop
-		// retorna para não travar a parada da aplicação.
 		select {
-		case <-done:
-		case <-ctx.Done():
-			return errors.Join(ErrDrainTimeout, ctx.Err())
+		case <-done: // terminou junto com o prazo
+		default:
+			c.procCancel()
+			// O prazo também pode vencer só esperando o último long polling
+			// (WaitTime > DrainTimeout) com nada em processamento: isso não
+			// é estouro de drenagem.
+			if c.processing.Load() > 0 {
+				c.logger.WarnContext(context.WithoutCancel(ctx), "drenagem do consumidor SQS estourou o prazo; cancelando processamento")
+				result = ErrDrainTimeout
+			}
+			// Cancelado, cada mensagem é liberada com prazo próprio
+			// (CallTimeout), depois do último receive. Se nem isso couber no
+			// prazo do OnStop, o Stop retorna para não travar a parada.
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return errors.Join(result, ctx.Err())
+			}
 		}
 	}
 	c.procCancel()
@@ -493,6 +521,25 @@ func (c *Consumer) Stop(ctx context.Context) error {
 		c.logger.InfoContext(context.WithoutCancel(ctx), "consumidor SQS parado")
 	}
 	return result
+}
+
+// awaitLastReceive espera o laço terminar, o que inclui o ReceiveMessage em
+// curso (até WaitTime + CallTimeout). Só se o servidor não responder nesse
+// prazo, ou o ctx do Stop vencer, o receive é cancelado no cliente; aí o poll
+// abandonado ainda pode pegar uma mensagem, que só reaparece depois da
+// visibilidade (atraso, sem perda: ela não foi processada).
+func (c *Consumer) awaitLastReceive(ctx context.Context) {
+	t := time.NewTimer(c.cfg.WaitTime + c.cfg.CallTimeout)
+	defer t.Stop()
+	select {
+	case <-c.loopDone:
+		return
+	case <-t.C:
+		c.logger.Warn("o último ReceiveMessage não terminou no prazo; cancelando")
+	case <-ctx.Done():
+	}
+	c.recvCancel()
+	<-c.loopDone
 }
 
 // Ready verifica o acesso à fila de entrada (readiness).
@@ -508,12 +555,14 @@ func (c *Consumer) Ready(ctx context.Context) error {
 }
 
 // loop recebe lotes enquanto houver vaga de grupo e despacha cada grupo para
-// uma goroutine.
-func (c *Consumer) loop(ctx context.Context, done chan<- struct{}) {
+// uma goroutine. ctx para o laço (Stop) sem interromper o ReceiveMessage em
+// curso, que usa recvCtx: as mensagens do último receive são despachadas e o
+// handleGroup as libera (stopping).
+func (c *Consumer) loop(ctx, recvCtx context.Context, done chan<- struct{}) {
 	defer close(done)
 	backoff := c.cfg.ReceiveErrorBackoff
 	var lastDLQ time.Time
-	for {
+	for ctx.Err() == nil {
 		if c.dlqName != "" && c.metrics != nil && time.Since(lastDLQ) >= c.cfg.DLQDepthInterval {
 			lastDLQ = time.Now()
 			c.refreshDLQDepth(ctx)
@@ -534,8 +583,12 @@ func (c *Consumer) loop(ctx context.Context, done chan<- struct{}) {
 				break fill
 			}
 		}
+		if ctx.Err() != nil { // o select acima pode ter escolhido a vaga
+			c.releaseSlots(slots)
+			return
+		}
 
-		out, err := c.api.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
+		out, err := c.api.ReceiveMessage(recvCtx, &awssqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(c.cfg.QueueURL),
 			MaxNumberOfMessages: int32(slots),
 			WaitTimeSeconds:     int32(c.cfg.WaitTime / time.Second),
@@ -548,7 +601,7 @@ func (c *Consumer) loop(ctx context.Context, done chan<- struct{}) {
 		receivedAt := time.Now()
 		if err != nil {
 			c.releaseSlots(slots)
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || recvCtx.Err() != nil {
 				return
 			}
 			c.logger.Warn("falha no ReceiveMessage; tentando novamente", logging.Err(err), slog.Duration("retryIn", backoff))
@@ -632,7 +685,10 @@ func (c *Consumer) handleGroup(msgs []types.Message, receivedAt time.Time) {
 				return
 			}
 		}
-		if !c.handleMessage(m) {
+		c.processing.Add(1)
+		ok := c.handleMessage(m)
+		c.processing.Add(-1)
+		if !ok {
 			c.release(msgs[i+1:], "group_interrupted")
 			return
 		}
@@ -640,8 +696,13 @@ func (c *Consumer) handleGroup(msgs []types.Message, receivedAt time.Time) {
 }
 
 // release devolve mensagens à fila (visibilidade 0) sem processá-las. Esses
-// recebimentos não contam como tentativa (releaseTracker).
+// recebimentos não contam como tentativa (releaseTracker). No shutdown, só
+// libera depois do último ReceiveMessage (loopDone): um poll ainda aberto
+// pegaria a mensagem liberada e a esconderia de novo.
 func (c *Consumer) release(msgs []types.Message, reason string) {
+	if len(msgs) > 0 && c.stopping.Load() {
+		<-c.loopDone
+	}
 	for _, m := range msgs {
 		c.released.add(aws.ToString(m.MessageId))
 		if err := c.changeVisibility(m, 0); err != nil {

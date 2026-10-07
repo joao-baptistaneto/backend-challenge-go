@@ -52,22 +52,32 @@ func TestAppGraphIsValid(t *testing.T) {
 
 func TestStopTimeoutIsTheSumOfStopBudgetsPlusSlack(t *testing.T) {
 	cfg := loadConfig(t, testEnv())
-	// Defaults: 15s + 10s + 10s + 10s + folga.
-	if got, want := StopTimeout(cfg), 45*time.Second+stopSlack; got != want {
+	// Defaults: 15s + max(SQS_DRAIN_TIMEOUT 10s, SQS_WAIT_TIME 20s + 5s) +
+	// 10s + 10s + folga. O consumidor espera o último long polling terminar
+	// antes de liberar mensagens (ADR-022), em paralelo com a drenagem.
+	if got, want := StopTimeout(cfg), 60*time.Second+stopSlack; got != want {
 		t.Fatalf("StopTimeout = %s, quer %s", got, want)
 	}
 
 	env := testEnv()
 	env[config.EnvShutdownTimeout] = "20s"
 	env[config.EnvSQSDrainTimeout] = "7s"
+	env[config.EnvSQSWaitTime] = "1s"
 	env[config.EnvPendingWorkerDrainTimeout] = "3s"
 	env[config.EnvOutboxDrainTimeout] = "11s"
 	cfg = loadConfig(t, env)
 	got := StopTimeout(cfg)
+	// Drenagem SQS (7s) maior que WaitTime + 5s (6s): vale a drenagem.
 	sum := cfg.App.ShutdownTimeout + cfg.SQS.Consumer.DrainTimeout +
 		cfg.Workers.PendingWorker.DrainTimeout + cfg.Workers.OutboxDrainTimeout
 	if got != sum+stopSlack || got <= sum {
 		t.Fatalf("StopTimeout = %s, quer soma %s + folga %s", got, sum, stopSlack)
+	}
+	// Long polling (15s + 5s) maior que a drenagem (7s): vale a espera dele.
+	env[config.EnvSQSWaitTime] = "15s"
+	cfg = loadConfig(t, env)
+	if got, want := StopTimeout(cfg), 20*time.Second+20*time.Second+3*time.Second+11*time.Second+stopSlack; got != want {
+		t.Fatalf("StopTimeout = %s, quer %s (espera do último long polling)", got, want)
 	}
 	// A folga cobre a liberação das mensagens SQS depois do estouro da
 	// drenagem (5s por chamada) e a última marcação da outbox.

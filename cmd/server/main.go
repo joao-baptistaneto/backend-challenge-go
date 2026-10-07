@@ -66,13 +66,15 @@ func StartReserve(c config.Config) startbudget.Reserve {
 // (ordem inversa dos OnStart), todos com o mesmo ctx; no pior caso cada
 // componente usa o seu prazo inteiro, então o total é a SOMA: servidor HTTP
 // (SHUTDOWN_TIMEOUT, que já inclui HTTP_DRAIN_DELAY) + consumidor SQS
-// (SQS_DRAIN_TIMEOUT) + worker de pendências (PENDING_WORKER_DRAIN_TIMEOUT)
-// + publisher da outbox (OUTBOX_DRAIN_TIMEOUT) + folga. Se o ctx do OnStop
-// vencesse antes, o Fx abandonaria os hooks restantes e o pool/clients não
-// seriam fechados de forma ordenada.
+// (sqs.StopBudget: o maior entre SQS_DRAIN_TIMEOUT e SQS_WAIT_TIME + 5s, pois
+// o Stop espera o último long polling terminar em paralelo com a drenagem) +
+// worker de pendências (PENDING_WORKER_DRAIN_TIMEOUT) + publisher da outbox
+// (OUTBOX_DRAIN_TIMEOUT) + folga. Se o ctx do OnStop vencesse antes, o Fx
+// abandonaria os hooks restantes e o pool/clients não seriam fechados de
+// forma ordenada.
 func StopTimeout(c config.Config) time.Duration {
 	return c.App.ShutdownTimeout +
-		c.SQS.Consumer.DrainTimeout +
+		sqs.StopBudget(c.SQS.Consumer.WaitTime, c.SQS.Consumer.DrainTimeout) +
 		c.Workers.PendingWorker.DrainTimeout +
 		c.Workers.OutboxDrainTimeout +
 		stopSlack
