@@ -7,8 +7,13 @@ O documento tem duas partes:
 - **Parte I — Síntese (seções 1 a 18).** Uma seção por tema exigido no enunciado, com o estado
   **atual** do código, valores padrão e links para os ADRs detalhados. Quando um ADR antigo
   diverge da Parte I (valores revisados depois, pendências já resolvidas), vale a Parte I.
-- **Parte II — Registro de decisões (ADR-001 a ADR-029).** Histórico incremental, um ADR por
+- **Parte II — Registro de decisões (ADR-001 a ADR-030).** Histórico incremental, um ADR por
   tarefa, com contexto, alternativas, testes e notas de revisão.
+
+**Referências ao enunciado.** O enunciado do desafio está em [`docs/DESAFIO.md`](docs/DESAFIO.md)
+(era o `README.md` até a T29, ADR-030). Neste documento, em `task_plan.md` e nos comentários do
+código, "README §N" quer dizer a seção N **do enunciado**. O [`README.md`](README.md) atual é o
+da solução: execução, variáveis, filas, migrations, exemplos e testes.
 
 ## Sumário
 
@@ -34,9 +39,9 @@ O documento tem duas partes:
 18. [Interpretações adotadas, limitações, trade-offs e trabalho não concluído](#18-interpretações-adotadas-limitações-trade-offs-e-trabalho-não-concluído)
 
 **Parte II — Registro de decisões:** [ADR-001](#adr-001--módulo-versão-go-e-dependências-base-t01)
-a [ADR-029](#adr-029--testes-e2e-de-autenticaçãoautorização-contra-o-keycloak-real-t27).
+a [ADR-030](#adr-030--readme-da-solução-e-verificação-final-t29).
 
-**Mapa enunciado (README) → seção**
+**Mapa enunciado ([docs/DESAFIO.md](docs/DESAFIO.md)) → seção**
 
 | Exigência do enunciado | Seção | ADRs |
 | --- | --- | --- |
@@ -3418,3 +3423,35 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   validação contra o Keycloak real é a mesma em todas as instâncias (o código é o mesmo, e
   o JWKS fica em cache por processo). A revogação antes do `exp` não é testada, porque não
   existe por desenho (validação local por JWKS, ADR-019).
+
+## ADR-030 — README da solução e verificação final (T29)
+
+- **Onde fica o README da solução.** O enunciado (docs/DESAFIO.md §15) exige que "o
+  `README.md` da solução" explique pré-requisitos, variáveis, filas, migrations, execução,
+  exemplos e testes. Até a T28 o `README.md` era o próprio enunciado. Ele foi movido sem
+  alteração (`git mv README.md docs/DESAFIO.md`, blob idêntico) e o `README.md` passou a ser o
+  da solução, com link para o enunciado. Os "README §N" já espalhados pelo ARCHITECTURE.md, pelo
+  `task_plan.md` e por comentários do código continuam valendo como referências ao enunciado;
+  em vez de reescrever dezenas de comentários, a convenção ficou registrada no topo deste
+  documento e do `task_plan.md`.
+- **Conteúdo.** Pré-requisitos (Go 1.25+, Docker Compose, gcc para `-race`, make opcional),
+  variáveis (o `.env.example` já cobria todas as lidas por `internal/platform/config`; o
+  README só agrupa e aponta para ele), filas e contratos de produtor (grupo `walletId`, dedup
+  `messageId`, envelope) e de consumidor de eventos (pendência da T22: grupo `aggregateId`,
+  dedup `eventId`, atributos, at-least-once, sem ordem entre grupos, `walletVersion`),
+  migrations up/down, Compose com 3 réplicas, identidades do realm, exemplos curl com tokens
+  `client_credentials` (carteira, aposta, replay, ganho com referência, consultas, ledger,
+  reconciliação, 401/403, envio pela fila e leitura dos eventos) e comandos de teste por build
+  tag. Todos os comandos do README foram executados contra a stack antes de entrar no texto.
+- **LF para Go/SQL.** Com `core.autocrlf=true` (padrão do Git no Windows) um checkout limpo
+  grava os `.go` em CRLF e `gofmt -l .` lista todos os arquivos, embora o conteúdo versionado
+  esteja formatado. O `.gitattributes` passou a fixar `eol=lf` para `*.go`, `*.sql`, `go.mod` e
+  `go.sum` (o índice já estava todo em LF; nenhuma renormalização foi necessária).
+- **Verificação final** (clone local do repositório com as mudanças da T29 aplicadas, stack do
+  Compose recriada do zero): `docker compose up --build -d --wait` saudável; `--scale app=3`
+  saudável; `scripts/compose-smoke.sh` → `SMOKE OK`; exemplos do README §6 executados
+  literalmente; `gofmt -l .` vazio; `go vet ./...` (também com `-tags` `integration`,
+  `integration,multiinstance` e `failpoint`); `go build ./...`; `go test -count=1 ./...`;
+  `CGO_ENABLED=1 go test -race -count=1 ./...`; integração completa contra o Compose
+  (`-race -tags=integration -p 1 -count=1 ./...`, nenhum teste pulado) e multi-instância/falhas
+  (`-tags=integration,multiinstance`, ~2 min) passando. Nenhuma mudança de código Go.
