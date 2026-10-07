@@ -18,6 +18,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/app"
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
 )
 
 // testConfig: na fila falsa 1 "segundo" vale f.unit (10ms por padrão), então
@@ -1022,5 +1023,29 @@ func TestNewConsumerValidatesConfig(t *testing.T) {
 	}
 	if _, err := NewConsumer(testConfig(f), f, nil); err == nil {
 		t.Fatal("processor nil")
+	}
+}
+
+// TestConsumerStartHonorsStartReserve: com a fila indisponível, Start desiste
+// no prazo do ctx menos a reserva, deixando o resto do prazo para o rollback
+// do Fx (ADR-025).
+func TestConsumerStartHonorsStartReserve(t *testing.T) {
+	f := newFakeSQS(3)
+	f.attrsErr = errors.New("connection refused")
+	c, err := NewConsumer(testConfig(f), f, &fakeProcessor{}, WithStartReserve(startbudget.Reserve(5*time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second+300*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	if err := c.Start(ctx); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Start = %v", err)
+	}
+	if elapsed := time.Since(begin); elapsed > 3*time.Second {
+		t.Fatalf("Start levou %s: não respeitou a reserva de rollback", elapsed)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("o ctx do start venceu: não sobrou tempo para o rollback")
 	}
 }

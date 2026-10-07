@@ -23,6 +23,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/logging"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
 )
 
 // Consumidor da fila de entrada wager-transactions.fifo (ARCHITECTURE.md,
@@ -217,6 +218,12 @@ func WithLogger(l *slog.Logger) Option {
 // WithMetrics liga as métricas (opcional).
 func WithMetrics(m *metrics.Metrics) Option { return func(c *Consumer) { c.metrics = m } }
 
+// WithStartReserve reserva o final do prazo do ctx de Start para o rollback
+// do Fx (ADR-025): as chamadas iniciais repetem só até prazo(ctx) − r.
+func WithStartReserve(r startbudget.Reserve) Option {
+	return func(c *Consumer) { c.startReserve = r }
+}
+
 // Consumer é o consumidor da fila de entrada com Start/Stop para o
 // fx.Lifecycle.
 type Consumer struct {
@@ -227,6 +234,8 @@ type Consumer struct {
 	metrics   *metrics.Metrics
 	dlqName   string // fila da métrica de profundidade (DLQURL)
 	queueName string
+
+	startReserve startbudget.Reserve
 
 	// Destino dos envios à DLQ, resolvido no Start pela RedrivePolicy.
 	dlqTargetURL  string
@@ -285,13 +294,16 @@ func (c *Consumer) MaxReceiveCount() int32 { return c.maxReceiveCount.Load() }
 
 // Start lê a RedrivePolicy da fila, confere MaxAttempts < maxReceiveCount,
 // resolve a URL da DLQ (GetQueueUrl pelo ARN; chamadas com retry até o prazo
-// do ctx) e inicia o laço de recebimento em background.
+// do ctx menos a reserva de rollback, WithStartReserve) e inicia o laço de
+// recebimento em background.
 func (c *Consumer) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.started {
 		return errors.New("sqs: consumidor já iniciado")
 	}
+	ctx, cancel := startbudget.Context(ctx, c.startReserve)
+	defer cancel()
 	policy, err := c.loadRedrivePolicy(ctx)
 	if err != nil {
 		return err

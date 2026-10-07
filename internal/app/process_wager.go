@@ -565,3 +565,7 @@ func (uc *ProcessWagerTransaction) logResult(ctx context.Context, p wagerPlan, r
 	}
 	uc.logger.InfoContext(ctx, "operação processada", attrs...)
 }
+
+// ReferenceRetryDelay devolve o atraso da primeira nova busca de referência
+// em uso (para conferência da composição).
+func (uc *ProcessWagerTransaction) ReferenceRetryDelay() time.Duration { return uc.referenceDelay }

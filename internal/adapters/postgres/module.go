@@ -9,6 +9,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/app"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
 )
 
 // Params são as dependências de newDBWithLifecycle.
@@ -18,6 +19,9 @@ type Params struct {
 	Lifecycle fx.Lifecycle
 	Config    config.Config
 	Logger    *slog.Logger `optional:"true"`
+	// StartReserve (opcional) é a reserva de rollback do prazo do start
+	// (ADR-025); cmd/server a fornece.
+	StartReserve startbudget.Reserve `optional:"true"`
 }
 
 // newDBWithLifecycle cria o DB e registra Start (ping com retry) e Stop
@@ -27,6 +31,7 @@ func newDBWithLifecycle(p Params) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetStartReserve(p.StartReserve)
 	p.Lifecycle.Append(fx.Hook{OnStart: db.Start, OnStop: db.Stop})
 	return db, nil
 }

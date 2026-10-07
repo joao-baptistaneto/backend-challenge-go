@@ -36,6 +36,7 @@ const (
 	EnvHTTPAddr        = "HTTP_ADDR"
 	EnvLogLevel        = "LOG_LEVEL"
 	EnvShutdownTimeout = "SHUTDOWN_TIMEOUT"
+	EnvMetricsAccess   = "METRICS_ACCESS"
 
 	EnvHTTPReadHeaderTimeout = "HTTP_READ_HEADER_TIMEOUT"
 	EnvHTTPReadTimeout       = "HTTP_READ_TIMEOUT"
@@ -104,6 +105,15 @@ const (
 	EnvDevelopment = "development"
 	EnvStaging     = "staging"
 	EnvProduction  = "production"
+)
+
+// Valores aceitos em METRICS_ACCESS (ADR-020, ADR-025).
+const (
+	// MetricsAccessInternal (padrão): /metrics exige token do serviço interno.
+	MetricsAccessInternal = "internal"
+	// MetricsAccessPublic: /metrics sem autenticação, para scrapers sem
+	// OAuth; só onde a porta não é exposta publicamente.
+	MetricsAccessPublic = "public"
 )
 
 // Limites de validação. São guardas contra erros grosseiros de configuração,
@@ -215,6 +225,9 @@ type AppConfig struct {
 	HTTPAddr        string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
+	// MetricsAccess define quem lê /metrics: MetricsAccessInternal (padrão)
+	// ou MetricsAccessPublic.
+	MetricsAccess string
 }
 
 // HTTPConfig agrupa os timeouts do http.Server e a espera de drenagem
@@ -411,6 +424,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	c.App.HTTPAddr = p.listenAddr(EnvHTTPAddr, ":8080")
 	c.App.LogLevel = p.logLevel(EnvLogLevel, slog.LevelInfo)
 	c.App.ShutdownTimeout = p.positiveDuration(EnvShutdownTimeout, 15*time.Second)
+	c.App.MetricsAccess = p.oneOf(EnvMetricsAccess, MetricsAccessInternal, []string{MetricsAccessInternal, MetricsAccessPublic})
 
 	c.HTTP.ReadHeaderTimeout = p.positiveDuration(EnvHTTPReadHeaderTimeout, DefaultHTTPReadHeaderTimeout)
 	c.HTTP.ReadTimeout = p.positiveDuration(EnvHTTPReadTimeout, DefaultHTTPReadTimeout)

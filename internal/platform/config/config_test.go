@@ -33,6 +33,7 @@ func validEnv() map[string]string {
 		EnvHTTPAddr:                       ":8080",
 		EnvLogLevel:                       "info",
 		EnvShutdownTimeout:                "15s",
+		EnvMetricsAccess:                  "internal",
 		EnvHTTPReadHeaderTimeout:          "5s",
 		EnvHTTPReadTimeout:                "30s",
 		EnvHTTPWriteTimeout:               "30s",
@@ -99,7 +100,8 @@ func TestLoadValidEnvExample(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	want := Config{
-		App: AppConfig{Env: "local", HTTPAddr: ":8080", LogLevel: slog.LevelInfo, ShutdownTimeout: 15 * time.Second},
+		App: AppConfig{Env: "local", HTTPAddr: ":8080", LogLevel: slog.LevelInfo, ShutdownTimeout: 15 * time.Second,
+			MetricsAccess: MetricsAccessInternal},
 		HTTP: HTTPConfig{
 			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
 			WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second,
@@ -155,7 +157,7 @@ func TestLoadDefaults(t *testing.T) {
 		EnvPendingWorkerPollInterval, EnvPendingWorkerBatchSize, EnvPendingWorkerConcurrency, EnvPendingWorkerLease,
 		EnvPendingWorkerProcessTimeout, EnvPendingWorkerDrainTimeout, EnvPendingOrphanGrace,
 		EnvOutboxConcurrency, EnvOutboxPublishTimeout, EnvOutboxDrainTimeout, EnvOutboxRetryBaseDelay,
-		EnvOutboxRetryMaxDelay,
+		EnvOutboxRetryMaxDelay, EnvMetricsAccess,
 	} {
 		delete(env, k)
 	}
@@ -174,7 +176,7 @@ func TestLoadDefaults(t *testing.T) {
 		c.Workers.PendingWorker != defaultPendingWorker() ||
 		c.Workers.OutboxConcurrency != DefaultOutboxConcurrency || c.Workers.OutboxPublishTimeout != DefaultOutboxPublishTimeout ||
 		c.Workers.OutboxDrainTimeout != DefaultOutboxDrainTimeout || c.Workers.OutboxRetryBaseDelay != DefaultOutboxRetryBaseDelay ||
-		c.Workers.OutboxRetryMaxDelay != DefaultOutboxRetryMaxDelay {
+		c.Workers.OutboxRetryMaxDelay != DefaultOutboxRetryMaxDelay || c.App.MetricsAccess != MetricsAccessInternal {
 		t.Fatalf("defaults inesperados: %#v", c)
 	}
 	if c.AWS.HasStaticCredentials() || c.AWS.EndpointURL != "" || c.SQS.InboundDLQURL != "" {
@@ -264,6 +266,7 @@ func TestLoadInvalid(t *testing.T) {
 		{"http addr porta inválida", func(e map[string]string) { e[EnvHTTPAddr] = ":99999" }, EnvHTTPAddr},
 		{"http addr porta não numérica", func(e map[string]string) { e[EnvHTTPAddr] = ":http" }, EnvHTTPAddr},
 		{"log level", func(e map[string]string) { e[EnvLogLevel] = "verbose" }, EnvLogLevel},
+		{"metrics access", func(e map[string]string) { e[EnvMetricsAccess] = "open" }, EnvMetricsAccess},
 		{"shutdown malformado", func(e map[string]string) { e[EnvShutdownTimeout] = "15" }, EnvShutdownTimeout},
 		{"shutdown zero", func(e map[string]string) { e[EnvShutdownTimeout] = "0s" }, EnvShutdownTimeout},
 		{"shutdown negativo", func(e map[string]string) { e[EnvShutdownTimeout] = "-1s" }, EnvShutdownTimeout},

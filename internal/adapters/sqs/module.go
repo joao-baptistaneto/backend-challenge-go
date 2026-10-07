@@ -10,6 +10,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/app"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
 )
 
 // ReadinessCheckName é o nome da verificação de prontidão do consumidor.
@@ -45,12 +46,15 @@ type ConsumerParams struct {
 	Processor WagerProcessor
 	Metrics   *metrics.Metrics `optional:"true"`
 	Logger    *slog.Logger     `optional:"true"`
+	// StartReserve (opcional) é a reserva de rollback do prazo do start
+	// (ADR-025); cmd/server a fornece.
+	StartReserve startbudget.Reserve `optional:"true"`
 }
 
 // NewConsumerFx cria o consumidor e registra Start/Stop no ciclo de vida.
 func NewConsumerFx(p ConsumerParams) (*Consumer, error) {
 	c, err := NewConsumer(ConsumerConfigFrom(p.Config), p.API, p.Processor,
-		WithLogger(p.Logger), WithMetrics(p.Metrics))
+		WithLogger(p.Logger), WithMetrics(p.Metrics), WithStartReserve(p.StartReserve))
 	if err != nil {
 		return nil, err
 	}

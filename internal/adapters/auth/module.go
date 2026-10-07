@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"context"
 	"log/slog"
+	"net/http"
 
 	"go.uber.org/fx"
 
@@ -24,8 +26,32 @@ type componentParams struct {
 	Logger   *slog.Logger `optional:"true"`
 }
 
-func newAuthenticatorFx(p componentParams) (*Authenticator, error) {
-	return NewAuthenticator(p.Settings, p.Logger)
+type authenticatorParams struct {
+	fx.In
+
+	Lifecycle fx.Lifecycle
+	Settings  Settings
+	Logger    *slog.Logger `optional:"true"`
+}
+
+// newAuthenticatorFx cria o Authenticator com um transporte HTTP próprio
+// (JWKS/discovery) e fecha as conexões ociosas dele no OnStop (T23,
+// ADR-025): sem isso, a conexão keep-alive com o IdP sobreviveria ao Stop
+// (goroutines de leitura/escrita do net/http). Como o Authenticator é
+// construído antes do servidor HTTP que o usa, este OnStop roda depois do
+// Stop do servidor.
+func newAuthenticatorFx(p authenticatorParams) (*Authenticator, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	a, err := NewAuthenticator(p.Settings, p.Logger,
+		WithHTTPClient(&http.Client{Timeout: defaultFetchTimeout, Transport: tr}))
+	if err != nil {
+		return nil, err
+	}
+	p.Lifecycle.Append(fx.Hook{OnStop: func(context.Context) error {
+		tr.CloseIdleConnections()
+		return nil
+	}})
+	return a, nil
 }
 
 func newAuthorizerFx(p componentParams) *Authorizer {

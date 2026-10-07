@@ -11,6 +11,7 @@ import (
 
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/logging"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
 )
 
 // Pool pgx (ARCHITECTURE.md, ADR-013).
@@ -19,7 +20,8 @@ import (
 //
 //   - NewDB só monta o pool (pgxpool.NewWithConfig não abre conexões quando
 //     MinConns = 0); a primeira conexão é aberta em Start (OnStart do Fx),
-//     com ping repetido e backoff limitado pelo ctx do start. Assim fx.New
+//     com ping repetido e backoff limitado pelo ctx do start menos a reserva
+//     de rollback (startbudget, ADR-025). Assim fx.New
 //     continua sem I/O e a aplicação não fica "pronta" sem banco.
 //   - O DSN só sai de config.Secret via Reveal, uma única vez, direto para
 //     pgxpool.ParseConfig. Erros de parse NÃO são propagados textualmente: o
@@ -46,6 +48,9 @@ var ErrPoolConfig = errors.New("postgres: configuração do pool inválida (deta
 type DB struct {
 	pool   *pgxpool.Pool
 	logger *slog.Logger
+	// startReserve é a parte final do prazo do start reservada ao rollback
+	// do Fx (ADR-025): Start desiste antes dela.
+	startReserve startbudget.Reserve
 	// sleep é substituível em testes.
 	sleep func(ctx context.Context, d time.Duration) error
 }
@@ -101,8 +106,17 @@ func (db *DB) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Start faz ping até ter sucesso, até um erro permanente ou até ctx expirar.
+// SetStartReserve define quanto do final do prazo do ctx de Start fica
+// reservado (ADR-025): Start repete só até prazo(ctx) − r, para que o Fx
+// ainda tenha tempo de executar o rollback se o start falhar. Chame antes
+// de Start.
+func (db *DB) SetStartReserve(r startbudget.Reserve) { db.startReserve = r }
+
+// Start faz ping até ter sucesso, até um erro permanente ou até o orçamento
+// do start (prazo do ctx menos a reserva de rollback) expirar.
 func (db *DB) Start(ctx context.Context) error {
+	ctx, cancel := startbudget.Context(ctx, db.startReserve)
+	defer cancel()
 	backoff := startInitialBackoff
 	for attempt := 1; ; attempt++ {
 		err := db.Ping(ctx)

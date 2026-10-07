@@ -626,7 +626,7 @@ Pacote `internal/adapters/postgres` (`pool.go`, `tx.go`, `errors.go`, `module.go
   sai do `config.Secret` por um único `Reveal()`, direto para `pgxpool.ParseConfig`. Erro de parse
   vira `ErrPoolConfig` sem o texto do pgx, porque `url.Error` cita a URL inteira. O construtor não
   faz I/O. `OnStart` (`DB.Start`) faz ping com backoff exponencial (100ms→2s) até o prazo do ctx de
-  start, mas só repete falha transitória (conexão recusada, `57P03`, timeout). Falha permanente
+  start menos a reserva de rollback (`SetStartReserve`, ADR-025), mas só repete falha transitória (conexão recusada, `57P03`, timeout). Falha permanente
   (`28P01`, `3D000`) aborta na hora. `OnStop` (`DB.Stop`) faz `Close`, limitado pelo ctx de stop.
   Como os dependentes param antes no Fx, as conexões já estão devolvidas. `DB.Ping(ctx)` é o
   probe de readiness (T18); quem chama define o prazo.
@@ -2168,3 +2168,103 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   permissão de `sqs:SendMessage` nessa fila e aos consumidores de eventos
   `ReceiveMessage`/`DeleteMessage`. Rodar `TestIntegrationRealSQSPublishDedupAndRouting`
   com `SQS_ENDPOINT`.
+
+## ADR-025 — Composição Fx da aplicação e ordem de parada (T23)
+
+- **Composição (`cmd/server.Options`).** `logging.Module` + `logging.FxEventLogger()` (eventos
+  do Fx no mesmo logger JSON/slog), `metrics.Module`, `postgres.Module`, `app.Module`,
+  `auth.Module`, `outboxpublisher.Module`, `pendingworker.Module`, `sqs.Module` (que já inclui
+  `sqs.ClientModule`; ele não é repetido), `httpadapter.Module`, `httpserver.Module` e as
+  ligações que nenhum módulo conhece sozinho:
+  - `*metrics.Metrics` como `app.ReconciliationRecorder` (ADR-018);
+  - `app.ReferenceRetryDelay` = `PENDING_REFERENCE_RETRY_BASE_DELAY`: o
+    `ProcessWagerTransaction` agenda a primeira nova busca com a mesma base do backoff do
+    worker (ADR-023). Ausente, `app.Module` mantém o default de 2s;
+  - `httpadapter.MetricsAccess` de `METRICS_ACCESS` (`internal`, padrão: exige token do
+    serviço interno; `public`: sem autenticação, para scrapers sem OAuth em rede privada);
+  - a verificação de prontidão `postgres` (`db.Ping`) no grupo `readinessChecks`, ao lado de
+    `sqs` (consumidor) e `http-server` (drenagem).
+- **Config antes do `fx.New`.** `main` carrega a config (`config.LoadFromEnv`) e a injeta com
+  `fx.Supply`, em vez de `config.Module`, porque `fx.StartTimeout`/`fx.StopTimeout` são opções
+  do `fx.New` e dependem dela. Config inválida → log JSON em stderr (sem valores sensíveis) e
+  exit 1, sem abrir conexões.
+- **Ordem de start/stop.** O Fx registra os hooks na ordem em que os construtores rodam e
+  executa os OnStop na ordem **inversa**, em **sequência**, todos com o mesmo ctx. Pool pgx,
+  cliente SQS e transporte do JWKS são dependências de quem os usa, então são sempre
+  construídos antes e parados depois. Entre componentes independentes, a ordem vem da ordem
+  dos módulos (os `fx.Invoke` dos módulos rodam na ordem de declaração): workers e consumidor
+  vêm antes do servidor HTTP, para que o servidor seja o **primeiro** a parar, e o publisher
+  da outbox vem antes do worker de pendências, para que o worker pare **antes** do publisher
+  (eventos gravados na drenagem do worker ainda saem por esta instância). Ordem real,
+  verificada pelo teste de integração:
+
+  | Stop | Hook (construtor que o registrou) |
+  |---|---|
+  | 1 | servidor HTTP (`httpserver.NewFx`): readiness DOWN, drenagem, `Shutdown` |
+  | 2 | transporte HTTP do JWKS (`auth.newAuthenticatorFx`): fecha conexões ociosas com o IdP |
+  | 3 | consumidor SQS (`sqs.NewConsumerFx`): para de receber, drena, libera visibilidade |
+  | 4 | worker de pendências (`pendingworker.NewWorkerFx`) |
+  | 5 | publisher da outbox (`outboxpublisher.NewPublisherFx`) |
+  | 6 | cliente SQS (`sqs.NewClientFx`): fecha conexões ociosas |
+  | 7 | pool pgx (`postgres.newDBWithLifecycle`): `Close`, por último |
+
+  O start é o inverso: o pool faz ping primeiro e o servidor só escuta depois que consumidor,
+  publisher e worker iniciaram. Uma falha de start (ex.: fila sem RedrivePolicy, ou SQS/banco
+  indisponível até o fim do orçamento) faz o Fx executar os OnStop dos hooks já iniciados
+  (rollback): workers param, o pool fecha e o processo sai com 1 (ver `fx.StartTimeout`).
+- **Transporte do JWKS.** `auth.Module` passou a criar o `Authenticator` com um
+  `http.Transport` próprio (clone do padrão) e a fechar as conexões ociosas no OnStop. Antes,
+  a conexão keep-alive com o IdP sobrevivia ao Stop (goroutines do net/http, detectadas pelo
+  goleak).
+- **`fx.StopTimeout`.** Como os OnStop rodam em sequência, o pior caso é a **soma** dos
+  orçamentos: `SHUTDOWN_TIMEOUT` (servidor, já inclui `HTTP_DRAIN_DELAY`) +
+  `SQS_DRAIN_TIMEOUT` + `PENDING_WORKER_DRAIN_TIMEOUT` + `OUTBOX_DRAIN_TIMEOUT` + folga de 15s.
+  A folga cobre a liberação das mensagens SQS depois do estouro da drenagem (5s por chamada,
+  em paralelo), a última marcação da outbox (`OUTBOX_PUBLISH_TIMEOUT`) e o fechamento do pool
+  e dos clients. Com os defaults: 15 + 10 + 10 + 10 + 15 = **60s**. Se o ctx vencesse antes, o
+  Fx abandonaria os hooks restantes e o pool/clients não fechariam em ordem. O orquestrador
+  precisa dar ao processo pelo menos esse tempo entre SIGTERM e SIGKILL (no Compose,
+  `stop_grace_period`, cujo default é 10s; T24).
+- **`fx.StartTimeout` e reserva de rollback.** O Fx executa o rollback de um start que falhou
+  com o **mesmo** ctx do start (`app.withRollback`), e o `lifecycle.Stop` não executa nenhum
+  OnStop se esse ctx já venceu (e o lifecycle fica `stopped`: um `app.Stop` posterior também
+  não faz nada). Um OnStart que repetisse até o prazo do ctx (ping do pool, chamadas iniciais
+  ao SQS) deixaria pool, worker e publisher rodando até o `os.Exit`. Por isso o prazo é
+  dividido: **orçamento** (`StartBudget` = `DATABASE_CONNECT_TIMEOUT` + 15s, default 45s) +
+  **reserva de rollback** (`StartReserve` = `StopTimeout`, o pior caso de parar o que já
+  iniciou; default 60s) = `StartTimeout` (default 105s). `cmd/server` fornece a reserva
+  (`startbudget.Reserve`) ao grafo; `postgres.DB.Start` e `sqs.Consumer.Start` derivam um ctx
+  com prazo = prazo(ctx) − reserva (`startbudget.Context`) e desistem nele, devolvendo o erro
+  com a reserva inteira para o rollback. Os demais OnStart (listen do HTTP, goroutines dos
+  workers) não repetem e retornam na hora. Optou-se por isso, e não por um `fx.Decorate` do
+  `fx.Lifecycle` que embrulhasse todos os OnStart, porque o wrapper viraria o "caller" de
+  todos os hooks nos eventos do Fx (logs e ordem de parada ficariam ilegíveis).
+- **Sinais e exit codes.** `runApp` equivale a `fx.App.Run`, mas devolve o código em vez de
+  chamar `os.Exit`: `app.Wait()` recebe SIGINT/SIGTERM (exit 0 com parada limpa) ou um
+  `fx.Shutdowner.Shutdown(fx.ExitCode(n))` (ex.: o `Serve` do HTTP morreu → 1). Start ou stop
+  com erro → 1. Os erros de start/stop são logados pelo logger de eventos do Fx.
+- **Testes.**
+  - Unitários (`cmd/server`): `fx.ValidateApp(Options(cfg)...)`; `StopTimeout` = soma +
+    folga; o `fx.App` usa os prazos calculados; ligações (readiness `postgres`/`sqs`/
+    `http-server`, `ReferenceRetryDelay` da config, recorder de reconciliação);
+    `METRICS_ACCESS`; exit codes de `runApp` (Shutdowner, parada limpa, falha de start com
+    rollback, falha de stop); `StartTimeout` = orçamento + reserva (= `StopTimeout`); um
+    OnStart que repete até o prazo (com a reserva) falha a tempo de o Fx executar o OnStop já
+    iniciado. `startbudget`, `postgres.DB.Start` e `sqs.Consumer.Start` têm testes de que
+    desistem antes da reserva.
+  - Integração (`-tags=integration`, banco novo com migrations): a aplicação completa sobe
+    com `fx.Decorate` trocando `sqs.API` por uma fila em memória e um IdP `httptest`
+    (`OIDC_ISSUER_URL`/`OIDC_JWKS_URL`). O teste faz requisições reais a `/health/live`,
+    `/health/ready` (com `postgres`, `sqs` e `http-server`), `POST /wallets` e
+    `GET /wallets/{id}` (401 sem token, 201/200 com token interno) e `/metrics` (401/200).
+    Espera o publisher publicar o evento da abertura na fila de eventos falsa e para dentro
+    do `StopTimeout`. Confere então a ordem dos OnStop (por um `fxevent.Logger` que os
+    registra), que o pool foi fechado (`Ping` falha), que senha e token não aparecem nos logs
+    e `goleak.VerifyNone`. Outros testes cobrem o rollback de um start que falha: fila
+    inexistente (falha imediata) e SQS indisponível (erro transitório repetido até esgotar
+    um orçamento de 2s, via `runApp`): exit 1, `fxevent.RolledBack` sem erro, OnStop de
+    worker, publisher, cliente SQS e pool (por último), pool fechado e sem vazamento.
+  - `TestIntegrationRealDependencies` usa LocalStack e Keycloak reais (`SQS_ENDPOINT`,
+    `KEYCLOAK_URL`, `KEYCLOAK_CLIENT_SECRET`; Skip sem eles) e roda na T24. Para a aplicação
+    num `defer` se algo falhar depois do start e confere que client secret, token e senha do
+    banco não aparecem nos logs.

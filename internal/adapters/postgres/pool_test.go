@@ -17,6 +17,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/logging"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/startbudget"
 )
 
 const testPassword = "s3cr3t-pa55"
@@ -153,4 +154,33 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// TestStartHonorsStartReserve: com o banco indisponível, Start desiste no
+// prazo do ctx menos a reserva, deixando o resto do prazo para o rollback do
+// Fx (ADR-025).
+func TestStartHonorsStartReserve(t *testing.T) {
+	t.Parallel()
+	db, err := NewDB(config.DatabaseConfig{
+		URL:            config.Secret("postgres://wallet:x@" + closedPort(t) + "/wallet?sslmode=disable"),
+		ConnectTimeout: time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.pool.Close)
+	db.SetStartReserve(startbudget.Reserve(5 * time.Second))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second+300*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	if err := db.Start(ctx); err == nil {
+		t.Fatal("Start succeeded against closed port")
+	}
+	if elapsed := time.Since(begin); elapsed > 3*time.Second {
+		t.Fatalf("Start levou %s: não respeitou a reserva de rollback", elapsed)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("o ctx do start venceu: não sobrou tempo para o rollback")
+	}
 }
