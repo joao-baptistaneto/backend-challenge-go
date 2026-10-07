@@ -127,6 +127,70 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "e2e-short-lived",
+      "name": "E2E: token de vida curta",
+      "description": "DEV/TESTE ONLY (T27, ADR-029): sem papéis da aplicação; token de acesso de 5s para testar expiração com token real.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "e2e-short-lived-dev-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "attributes": {
+        "access.token.lifespan": "5"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-wallet-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "wallet-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "e2e-other-audience",
+      "name": "E2E: audiência errada",
+      "description": "DEV/TESTE ONLY (T27, ADR-029): papel wager-provider e provider_id, mas SEM o mapper de audiência wallet-api; a API deve recusar o token (401).",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "e2e-other-audience-dev-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "provider-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "provider_id",
+            "claim.value": "provider-a",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [
@@ -147,6 +211,18 @@
       "enabled": true,
       "serviceAccountClientId": "internal-service",
       "realmRoles": ["default-roles-junglegaming", "wallet-internal"]
+    },
+    {
+      "username": "service-account-e2e-short-lived",
+      "enabled": true,
+      "serviceAccountClientId": "e2e-short-lived",
+      "realmRoles": ["default-roles-junglegaming"]
+    },
+    {
+      "username": "service-account-e2e-other-audience",
+      "enabled": true,
+      "serviceAccountClientId": "e2e-other-audience",
+      "realmRoles": ["default-roles-junglegaming", "wager-provider"]
     }
   ]
 }

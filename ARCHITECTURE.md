@@ -2369,9 +2369,12 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   account; sem standard flow nem direct grants):
   - `provider-a` e `provider-b`: papel `wager-provider` e mapper hardcoded `provider_id` = id
     do client (String, só no access token);
-  - `internal-service`: papel `wallet-internal`, sem `provider_id`.
+  - `internal-service`: papel `wallet-internal`, sem `provider_id`;
+  - `e2e-short-lived` e `e2e-other-audience`: clients só de teste, acrescentados na T27
+    (ADR-029). O primeiro não tem papel da aplicação e emite tokens de 5s. O segundo tem
+    `wager-provider` e `provider_id`, mas não tem audience mapper.
 
-  Os três têm um audience mapper com `included.custom.audience=wallet-api`
+  Os três clients da aplicação têm um audience mapper com `included.custom.audience=wallet-api`
   (= `OIDC_AUDIENCE`). Os papéis saem em `realm_access.roles` pelo client scope padrão
   `roles`, e `typ=Bearer`. **Os segredos (`provider-a-dev-secret`, `provider-b-dev-secret`,
   `internal-service-dev-secret`), o admin `admin/admin` e a senha do banco são valores fixos
@@ -2497,7 +2500,7 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   (GC, `http.DefaultTransport`, relógio). Os filhos rodam com `GORACE=halt_on_error=1`.
   Uma corrida detectada derruba o processo, e o harness falha o teste se encontrar
   `WARNING: DATA RACE` na saída de qualquer filho. O IdP é o de teste do pacote
-  (httptest): os filhos buscam o JWKS nele por HTTP. O Keycloak real fica para a T27.
+  (httptest): os filhos buscam o JWKS nele por HTTP. O Keycloak real é coberto na T27 (ADR-029).
 - **Crash.** Encerramento abrupto do processo: `os.Process.Kill` (TerminateProcess no
   Windows, SIGKILL no Linux), sem `OnStop`, sem defers, sem `DeleteMessage`/`MarkPublished`
   pendentes. O Windows não tem SIGTERM, então não há parada graciosa nesses cenários,
@@ -2622,3 +2625,109 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
     T27.
   - O proxy simula a falha na rede entre aplicação e dependência, não o crash do servidor
     PostgreSQL (WAL/recovery), que é responsabilidade do próprio PostgreSQL.
+
+## ADR-029 — Testes E2E de autenticação/autorização contra o Keycloak real (T27)
+
+- **Escopo.** `cmd/server/auth_e2e_integration_test.go` (build tag `integration`) sobe a
+  aplicação completa (`newApp`, mesmo grafo Fx de produção) com a configuração OIDC de
+  produção apontando para o realm real do Compose: `OIDC_ISSUER_URL =
+  {KEYCLOAK_URL}/realms/junglegaming`, `OIDC_JWKS_URL` vazio (discovery + JWKS reais) e
+  audiência `wallet-api`. Nenhum token é assinado pelo teste. Todos vêm do Keycloak por
+  `client_credentials` (`provider-a`, `provider-b`, `internal-service` e os dois clients
+  de teste abaixo) ou por `password` no `admin-cli` do realm `master`, que é o "outro
+  issuer". O SQS é a `sqs.API` em memória do pacote, porque a entrada exercitada aqui é o
+  HTTP; a autorização do consumidor SQS não depende de token. O PostgreSQL é real, com um
+  banco por teste. Sem `KEYCLOAK_URL`, `t.Skip`.
+- **Token expirado com token real.** Não dá para alterar o `exp` de um token real sem
+  quebrar a assinatura. Esse caso é o "payload adulterado", testado à parte. Por isso o
+  realm ganhou o client **`e2e-short-lived`**, com atributo `access.token.lifespan=5`
+  (5s, só nele; o realm continua com 300s), audience mapper `wallet-api` e **nenhum papel
+  da aplicação**. O teste:
+  1. confere que `exp - iat ≤ 10s` (se o Keycloak foi criado com um realm antigo, a
+     mensagem pede `--force-recreate keycloak`);
+  2. usa o token ainda válido e recebe 403 `FORBIDDEN` em todas as rotas, o que prova que
+     o token é autêntico e que o 401 seguinte vem só da expiração;
+  3. espera o `exp` real + `OIDC_CLOCK_SKEW` (2s no teste) + 1s e recebe 401 com
+     `error_description="token expired"`;
+  4. pede um token novo e recebe 403 de novo.
+
+  A falta de papel desse client também cobre o caso "papel ausente → 403". Alternativas
+  descartadas:
+  - um IdP de teste, porque a tarefa exige o Keycloak real;
+  - mudar o relógio, que não é viável no Windows/Docker Desktop;
+  - alterar o lifespan pela Admin API durante o teste, porque mudaria o estado
+    compartilhado do Keycloak e exigiria admin no caminho principal.
+- **Audiência errada com token real.** Client **`e2e-other-audience`**, com papel
+  `wager-provider` e `provider_id=provider-a`, mas **sem** audience mapper (o Keycloak põe
+  `aud=account`). Tudo nele está certo, exceto a audiência, e a API o recusa com 401.
+  Os dois clients são confidenciais, só com client_credentials, e os segredos são de
+  desenvolvimento (`e2e-*-dev-secret`), como os demais. Nenhum consegue operar a API:
+  um não tem papel, o outro não tem audiência. O smoke test (`scripts/compose-smoke.sh`)
+  continua checando só os três clients da aplicação.
+- **Matriz coberta.**
+  - **401 `UNAUTHENTICATED` + `WWW-Authenticate: Bearer realm="wallet"`** em todas as 8
+    rotas protegidas (wallets ×4, transações ×3, `/metrics`), com corpos válidos para que
+    um processamento antes da autenticação aparecesse no banco. Casos:
+    - sem `Authorization` ou com ele vazio, esquema `Basic`, `Bearer` sem token ou token
+      sem esquema;
+    - não-JWT, token com espaço, dois cabeçalhos `Authorization`;
+    - assinatura adulterada;
+    - payload adulterado com a assinatura original (`provider_id` trocado, papel
+      `wallet-internal` injetado, `exp` estendido);
+    - `alg=none`;
+    - token do realm `master` (outro issuer e outras chaves);
+    - audiência errada;
+    - token expirado.
+  - **403 `FORBIDDEN`** (`error="insufficient_scope"`):
+    - provider-a e provider-b em `POST /wallets`, `GET /wallets/{id}`, ledger,
+      reconciliação e `/metrics`;
+    - `internal-service` nas três rotas de provedor;
+    - client sem papel em todas.
+
+    `internal-service` recebe 201/200 nas rotas de carteira e em `/metrics`.
+  - **Isolamento entre provedores** (contrato do ADR-019/ADR-018):
+    - provider-b consultando por id a transação de provider-a recebe 404
+      `TRANSACTION_NOT_FOUND`, com corpo igual ao de um id inexistente (não revela
+      existência);
+    - consulta no path `/providers/provider-a/...` recebe 403 `PROVIDER_MISMATCH`;
+    - a mesma `externalTransactionId` no próprio path de B recebe 404;
+    - replay de B com o corpo e a `Idempotency-Key` exatos de A recebe 403
+      `PROVIDER_MISMATCH`, e com corpo divergente também (403, não 409, e nada da
+      transação de A volta);
+    - a mesma `externalTransactionId` e a mesma chave literal enviadas por B como
+      provider-b são **outra operação**, porque a idempotência é por provedor (`UNIQUE
+      (provider_id, …)`). B recebe outra transação e a linha de A não muda (hash da linha).
+      Cada um consulta só a sua, e os replays legítimos devolvem a de cada um;
+    - REFUND de B que referencia uma `externalTransactionId` que só A tem fica
+      `PENDING_REFERENCE` (202), sem `reference_transaction_id`. Nunca resolve para a
+      transação de A.
+- **"Nenhum efeito de acesso negado".** Antes e depois de cada lote de requisições
+  negadas, com a outbox já publicada para não haver corrida, o teste compara:
+  - as contagens de `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox` e
+    `outbox`;
+  - um md5 de todas as linhas de `wallets` e `wager_transactions`, que pega também
+    UPDATEs.
+
+  Ao fim de cada teste roda a reconciliação completa (`assertConsistent`, ADR-027). Nenhum
+  token nem segredo de client aparece nos logs da aplicação.
+- **Resultado.** Nenhum defeito encontrado, e o código de produção não mudou. Mudaram o
+  realm (dois clients de teste) e os testes.
+- **Execução:**
+
+  ```sh
+  docker compose up -d --wait postgres localstack keycloak
+  TEST_DATABASE_URL=postgres://wallet:wallet-dev-pw@localhost:5433/wallet?sslmode=disable \
+  SQS_ENDPOINT=http://localhost:4566 KEYCLOAK_URL=http://localhost:8081 \
+  KEYCLOAK_CLIENT_ID=internal-service KEYCLOAK_CLIENT_SECRET=internal-service-dev-secret \
+  CGO_ENABLED=1 go test -race -tags=integration -run TestIntegrationAuthE2E ./cmd/server
+  ```
+
+  Segredos dos demais clients: `PROVIDER_A_SECRET`, `PROVIDER_B_SECRET`,
+  `E2E_SHORT_LIVED_SECRET`, `E2E_OTHER_AUDIENCE_SECRET`, `KEYCLOAK_ADMIN_USER` e
+  `KEYCLOAK_ADMIN_PASSWORD`. Os defaults são os valores de dev do realm e do Compose. O
+  Keycloak importa o realm só na criação do container, então, depois de mudar o JSON, é
+  preciso rodar `docker compose up -d --wait --force-recreate keycloak`.
+- **Limitações.** Os processos multi-instância (ADR-028) continuam com o IdP de teste. A
+  validação contra o Keycloak real é a mesma em todas as instâncias (o código é o mesmo, e
+  o JWKS fica em cache por processo). A revogação antes do `exp` não é testada, porque não
+  existe por desenho (validação local por JWKS, ADR-019).
