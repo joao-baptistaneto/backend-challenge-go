@@ -1,7 +1,687 @@
 # ARCHITECTURE
 
-Registro das decisões arquiteturais do serviço de carteira (desafio Junglegaming).
-Cada decisão traz contexto, escolha e consequências. Atualizado a cada tarefa.
+Decisões arquiteturais do serviço de carteira (desafio Junglegaming).
+
+O documento tem duas partes:
+
+- **Parte I — Síntese (seções 1 a 18).** Uma seção por tema exigido no enunciado, com o estado
+  **atual** do código, valores padrão e links para os ADRs detalhados. Quando um ADR antigo
+  diverge da Parte I (valores revisados depois, pendências já resolvidas), vale a Parte I.
+- **Parte II — Registro de decisões (ADR-001 a ADR-029).** Histórico incremental, um ADR por
+  tarefa, com contexto, alternativas, testes e notas de revisão.
+
+## Sumário
+
+**Parte I — Síntese**
+
+1. [Visão geral, componentes e estrutura de pastas](#1-visão-geral-componentes-e-estrutura-de-pastas)
+2. [Fluxos principais (diagramas)](#2-fluxos-principais-diagramas)
+3. [Dinheiro (`Money`)](#3-dinheiro-money)
+4. [Persistência: pgx, transações e mapeamento](#4-persistência-pgx-transações-e-mapeamento)
+5. [Idempotência e hash canônico](#5-idempotência-e-hash-canônico)
+6. [Concorrência e locks](#6-concorrência-e-locks)
+7. [Máquina de estados; falha transitória × permanente](#7-máquina-de-estados-falha-transitória--permanente)
+8. [Referências pendentes: tentativas, backoff e TTL](#8-referências-pendentes-tentativas-backoff-e-ttl)
+9. [Reversões: `REFUND` × `ROLLBACK`](#9-reversões-refund--rollback)
+10. [`failureCode`s](#10-failurecodes)
+11. [Inbox e outbox](#11-inbox-e-outbox)
+12. [SQS: filas, `MessageGroupId`/`MessageDeduplicationId`, visibilidade, tentativas e DLQ](#12-sqs-filas-messagegroupidmessagededuplicationid-visibilidade-tentativas-e-dlq)
+13. [Eventos de integração e contrato da fila de eventos](#13-eventos-de-integração-e-contrato-da-fila-de-eventos)
+14. [Autenticação (OIDC) e autorização](#14-autenticação-oidc-e-autorização)
+15. [Uber Fx: composição, ciclo de vida e shutdown](#15-uber-fx-composição-ciclo-de-vida-e-shutdown)
+16. [Contrato HTTP: códigos e corpos](#16-contrato-http-códigos-e-corpos)
+17. [Observabilidade](#17-observabilidade)
+18. [Interpretações adotadas, limitações, trade-offs e trabalho não concluído](#18-interpretações-adotadas-limitações-trade-offs-e-trabalho-não-concluído)
+
+**Parte II — Registro de decisões:** [ADR-001](#adr-001--módulo-versão-go-e-dependências-base-t01)
+a [ADR-029](#adr-029--testes-e2e-de-autenticaçãoautorização-contra-o-keycloak-real-t27).
+
+**Mapa enunciado (README) → seção**
+
+| Exigência do enunciado | Seção | ADRs |
+| --- | --- | --- |
+| §2 IdP, validação de credenciais e modelo de permissões | 14 | 019, 026, 029 |
+| §2 acesso à mensageria por credenciais/políticas do broker | 12, 14 | 022, 026 |
+| §4 biblioteca de banco, mapeamento de `Money`, delimitação da transação entre repositórios | 3, 4 | 004, 011, 013, 014, 016 |
+| §4 Fx: módulos, `fx.Lifecycle`, prazos, shutdown, ordem de fechamento | 15 | 021, 022, 023, 024, 025 |
+| §6.1 representação e limites de `Money`, normalização antes do hash | 3, 5 | 004, 010 |
+| §6.2 estratégia de controle de concorrência | 6 | 005, 014, 017 |
+| §6.3 máquina de estados, transitório × permanente | 7 | 008, 013, 017 |
+| §7 combinações `REFUND`/`ROLLBACK` | 9 | 009, 011 |
+| §7 tentativas/TTL, referência pendente ou terminada sem sucesso | 8 | 009, 023 |
+| §7 `failureCode` estável, corrigível × definitivo | 10 | 008, 009 |
+| §9 algoritmo, campos e normalizações do hash; equivalência HTTP × SQS | 5 | 010, 020, 022 |
+| §9 códigos HTTP e corpos (inválido, conflito, rejeição, pendente, indisponível) | 16 | 020 |
+| §10 tentativas, visibility timeout, mensagens inválidas, `MessageGroupId`/`MessageDeduplicationId`, SIGTERM | 12, 15 | 022, 026 |
+| §11 roteamento e consumo do destino dos eventos | 13 | 012, 024 |
+| §15 dinheiro, transações, idempotência, locks, pendências, reversões, inbox/outbox, autenticação, autorização, Fx, shutdown | 3–15 | — |
+| §15 limitações, interpretações e trabalho não concluído | 18 | — |
+
+---
+
+# Parte I — Síntese
+
+## 1. Visão geral, componentes e estrutura de pastas
+
+Um único binário (`cmd/server`) roda em N réplicas idênticas e sem estado em memória que
+afete o resultado financeiro. Cada réplica tem quatro entradas e saídas de trabalho, todas
+com garantias equivalentes:
+
+- **API HTTP** (`net/http`), autenticada por OIDC;
+- **consumidor SQS** da fila `wager-transactions.fifo`;
+- **worker de pendências**, que retoma `PENDING_REFERENCE` vencidos e `PENDING` órfãos;
+- **publisher da outbox**, que envia os eventos confirmados para `wager-events.fifo`.
+
+Toda coordenação é feita no PostgreSQL: lock de linha por carteira, constraints e índices
+únicos, leases persistidos com fencing. Nenhum lock global e nenhum estado em memória
+compartilhado entre instâncias (ADR-005, 015, 023, 024).
+
+Estrutura de pastas (arquitetura hexagonal, dependências de fora para dentro, ADR-002):
+
+```
+cmd/server/                      composição Fx (main), prazos de start/stop; testes da aplicação
+                                 completa (integração, concorrência, multi-instância, E2E de auth)
+cmd/migrate/                     CLI de migrations (up, down N, down -all, status)
+migrations/                      SQL versionado NNNN_nome.{up,down}.sql, embutido (embed.FS)
+internal/domain/                 modelo puro: Money, Wallet, WalletLedgerEntry, WagerTransaction,
+                                 regras (DecideWager/ApplyWagerDecision), eventos de integração
+internal/domain/idempotency/     hash canônico de requisição (SHA-256 de JSON canônico)
+internal/app/                    casos de uso (OpenWallet, ProcessWagerTransaction,
+                                 ResumeWagerTransaction, ReconcileWallet, Queries) e portas
+internal/adapters/postgres/      pool pgx, TxManager, UnitOfWork, repositórios, classificação de erros
+internal/adapters/postgres/migrate/  runner de migrations (advisory lock, checksum)
+internal/adapters/http/          handlers net/http (package httpadapter), DTOs, health, middlewares
+internal/adapters/http/server/   servidor HTTP com fx.Lifecycle e parada graciosa (package httpserver)
+internal/adapters/http/apierror/ corpo de erro padronizado {code, message, correlationId}
+internal/adapters/strictjson/    decoder JSON estrito, compartilhado por HTTP e SQS
+internal/adapters/auth/          validação OIDC (JWKS próprio), middleware, autorização
+internal/adapters/sqs/           cliente SQS, envelope e consumidor da fila de entrada
+internal/adapters/outboxpublisher/ publisher da outbox para wager-events.fifo
+internal/adapters/pendingworker/ worker de referências pendentes e PENDING órfãos
+internal/platform/config/        configuração por variáveis de ambiente, validada no start
+internal/platform/logging/       slog JSON com IDs de rastreio e redação de dados sensíveis
+internal/platform/metrics/       registry Prometheus próprio, rótulos de cardinalidade fechada
+internal/platform/startbudget/   divisão do prazo de start entre orçamento e reserva de rollback
+internal/platform/failpoint/     pontos de crash para testes (no-op sem a build tag failpoint)
+deploy/                          realm Keycloak, provisionamento das filas (LocalStack), nginx
+scripts/                         smoke test do Docker Compose
+```
+
+Regras de dependência: `domain` não importa Fx, pgx, SQS, HTTP nem `app`/`adapters`/`platform`.
+`app` depende só de `domain` e das portas que declara (`app.UnitOfWork`, `app.Tx` e stores); em
+`app` só `module.go` importa Fx. Os adapters implementam as portas.
+
+## 2. Fluxos principais (diagramas)
+
+Entrada de uma operação (HTTP e SQS compartilham o caso de uso e a transação):
+
+```mermaid
+flowchart LR
+    P[Provedor] -- "POST /wagering/transactions<br/>Bearer + Idempotency-Key" --> H[HTTP<br/>auth + decoder estrito]
+    Q[(wager-transactions.fifo)] -- "ReceiveMessage" --> C[Consumidor SQS<br/>envelope estrito]
+    H --> U[ProcessWagerTransaction]
+    C -- "cmd + Inbox{consumer, messageId}" --> U
+    U --> T{{"Transação SQL única (READ COMMITTED)<br/>1. inbox.Register (só SQS)<br/>2. idempotência por (provider, key)<br/>3. SELECT wallet FOR UPDATE<br/>4. releitura por key e externalId<br/>5. referência + reversões existentes<br/>6. DecideWager / ApplyWagerDecision<br/>7. UPDATE wallet WHERE version<br/>8. INSERT transação, ledger, outbox<br/>9. inbox.Complete (só SQS)"}}
+    T -- COMMIT --> DB[(PostgreSQL)]
+    T -.->|depois do commit| R1[HTTP 200/202/422]
+    T -.->|depois do commit| R2[DeleteMessage]
+```
+
+Publicação dos eventos e retomada de pendências (workers em todas as réplicas):
+
+```mermaid
+flowchart LR
+    DB[(PostgreSQL<br/>outbox / wager_transactions)]
+    OP[Publisher da outbox] -- "1. claim com lease (autocommit,<br/>SKIP LOCKED, cabeça de cada agregado)" --> DB
+    OP -- "2. SendMessage<br/>GroupId = aggregateId<br/>DedupId = eventId" --> EQ[(wager-events.fifo)]
+    OP -- "3. MarkPublished / MarkFailed<br/>(fencing pelo lease)" --> DB
+    PW[Worker de pendências] -- "ClaimDue (lease + token,<br/>FOR NO KEY UPDATE SKIP LOCKED)" --> DB
+    PW -- "Resume: tx curta por item<br/>wallet FOR UPDATE → linha com token<br/>→ DecideWager → Update + ledger + outbox" --> DB
+```
+
+Mensagem SQS com falhas:
+
+```mermaid
+sequenceDiagram
+    participant Q as wager-transactions.fifo
+    participant C as Consumidor
+    participant DB as PostgreSQL
+    participant D as wager-transactions-dlq.fifo
+    Q->>C: ReceiveMessage (visibilidade 30s)
+    C->>C: envelope inválido?
+    alt inválida / permanente / conflito
+        C->>D: SendMessage (corpo original + dlqReason)
+        C->>Q: DeleteMessage (só depois do envio confirmado)
+    else válida
+        C->>DB: BEGIN … inbox + efeitos + outbox + inbox.Complete … COMMIT
+        alt PROCESSED / REJECTED / PENDING_REFERENCE / replay
+            C->>Q: DeleteMessage
+        else transitória (503, prazo, erro sem classe)
+            C->>Q: ChangeMessageVisibility(backoff)
+            Note over C,Q: esgotado SQS_MAX_ATTEMPTS → DLQ explícita (max_receives)
+        end
+    end
+```
+
+## 3. Dinheiro (`Money`)
+
+Detalhes: ADR-004, ADR-011, ADR-014, ADR-020.
+
+- **Representação:** `int64` em centavos (escala fixa 2) + código ISO 4217 alfabético. Nenhum
+  `float32`/`float64` no parsing, no cálculo, na serialização, na persistência nem nas métricas
+  (as métricas contam ocorrências, nunca valores).
+- **Limites:** `[-92233720368547758.08, 92233720368547758.07]`. Parsing, `Add`, `Sub` e `Neg`
+  detectam overflow (`ErrMoneyOverflow`), sem wrap-around. Só moedas com expoente ISO 2 (BRL,
+  USD, EUR, GBP, CAD, AUD, CHF, MXN, ARS, COP, PEN, UYU); JPY/KWD são rejeitadas.
+- **Gramática:** `["-"] ("0" | [1-9][0-9]*) ["." [0-9]{1,2}]`. Rejeita vazio, `NaN`,
+  `Infinity`, notação científica, `+`, espaços, zeros à esquerda, `.5`, `5.`, `-0` e escala
+  maior que 2 (sem arredondar). Entradas externas usam `ParseNonNegative` (negativo é
+  rejeitado); negativos só existem em diferenças internas (reconciliação).
+- **Normalização antes do hash:** `"25"`, `"25.5"` e `"25.50"` são aceitos e equivalentes; o
+  hash usa sempre a forma canônica `Amount()` com duas casas (`"25.50"`). Moeda não é
+  normalizada (`"brl"` é inválido).
+- **Contrato externo:** `{"amount":"25.00","currency":"BRL"}`. No HTTP e no SQS o Money é lido
+  por `strictjson` (amount precisa ser string JSON; chave desconhecida, repetida ou com outra
+  caixa é rejeitada). Aritmética e comparação entre moedas diferentes → `ErrCurrencyMismatch`;
+  `Money{}` não inicializado é rejeitado em toda operação.
+- **Persistência:** `BIGINT` (centavos) + `CHAR(3)` com `CHECK ~ '^[A-Z]{3}$'`; reidratação por
+  `FromMinorUnits`. O CHECK aritmético do ledger roda em `NUMERIC` (exato, sem overflow). A soma
+  da reconciliação é feita em `NUMERIC` no banco e um total fora de `int64` é erro, nunca é
+  truncado.
+
+## 4. Persistência: pgx, transações e mapeamento
+
+Detalhes: ADR-011, ADR-013, ADR-014, ADR-016, ADR-018.
+
+- **Biblioteca:** `github.com/jackc/pgx/v5` + `pgxpool`, com **SQL explícito** (sem ORM, sem
+  sqlc). Migrations próprias (runner de ~300 linhas sobre pgx; cada migration numa transação;
+  `pg_advisory_lock` para réplicas simultâneas; checksum do arquivo aplicado).
+- **Fronteira transacional explícita:** o caso de uso chama `app.UnitOfWork.WithinTx(ctx,
+  TxOptions, fn)`; dentro de `fn`, `app.Tx` entrega os stores `Wallets()`, `Transactions()`,
+  `Ledger()`, `Outbox()` e `Inbox()`, **todos ligados ao mesmo `pgx.Tx`**. Não há transação
+  escondida no `context`: dá para auditar, lendo o caso de uso, que carteira, transação, ledger,
+  outbox e inbox entram no mesmo commit. Os métodos que travam linhas recusam um `Querier` que
+  não seja `pgx.Tx` (`ErrTxRequired`).
+- **Isolamento:** `READ COMMITTED` nas escritas (a consistência vem do lock da carteira e da
+  versão condicional, seção 6). `REPEATABLE READ READ ONLY` na reconciliação (snapshot único
+  entre saldo e soma do ledger). `READ ONLY` nas consultas.
+- **Rollback e retry:** erro, panic ou `Goexit` em `fn` → ROLLBACK (com 5s próprios, mesmo com
+  o ctx cancelado). Retry opt-in por chamada (`DefaultRetryPolicy`: 4 execuções, 10ms→250ms com
+  jitter) só para SQLSTATE transitórios (`40001`, `40P01`, `55P03`, `57014`, `08xxx`,
+  `57P01-03`, `53300`) e, no `ProcessWagerTransaction`, para a duplicata perdedora de uma
+  corrida de UNIQUE (a nova tentativa vê a linha vencedora e devolve o replay). **Commit
+  ambíguo** (`ErrCommitOutcomeUnknown`) nunca é repetido internamente: vira 503 / mensagem não
+  apagada, e a nova tentativa externa passa pela idempotência.
+- **Mapeamento:** `Money` ↔ `BIGINT` + `CHAR(3)`; UUIDs ↔ `UUID`; valores vazios do domínio ↔
+  `NULL`. Toda leitura reidrata pelo domínio (`Rehydrate*`), que revalida as invariantes; uma
+  linha inconsistente falha alto. Violações de constraint são traduzidas pelo **nome** da
+  constraint para sentinelas do adapter e depois para erros de `app`.
+- **Invariantes no schema** (independentes de locks locais e do SQS): `UNIQUE(player_id,
+  currency)`, `balance >= 0`, versão sobe exatamente 1 por mudança de saldo (trigger),
+  `UNIQUE(provider_id, external_transaction_id)`, `UNIQUE(provider_id, idempotency_key)`,
+  OPENING único por carteira, uma reversão bem-sucedida por referência, ledger com
+  `UNIQUE(wallet_id, transaction_id)`, CHECK aritmético e triggers que bloqueiam
+  `UPDATE`/`DELETE`/`TRUNCATE`, terminais imutáveis, snapshot da outbox imutável.
+
+## 5. Idempotência e hash canônico
+
+Detalhes: ADR-010, ADR-015, ADR-017, ADR-020, ADR-022.
+
+- **Persistente:** a idempotência mora nas linhas de `wager_transactions` (únicos por
+  `(provider_id, idempotency_key)` e `(provider_id, external_transaction_id)`) e na `inbox`
+  (`(consumer_name, message_id)`). Sobrevive ao reinício de todos os processos.
+- **Hash:** SHA-256 (64 hex minúsculos) do JSON canônico, chaves em ordem de bytes, JSON
+  compacto, escape no estilo RFC 8785. Campos: `externalTransactionId`, `gameId`, `kind`,
+  `money{amount,currency}`, `playerId`, `providerId`, `referenceExternalTransactionId` (`null`
+  quando ausente), `roundId`, `v` (versão do esquema, hoje `1`) e `walletId`. Ficam de fora a
+  `Idempotency-Key`/`idempotencyKey` e todo metadado de transporte (headers, `messageId`,
+  `correlationId`, `occurredAt`).
+- **Normalizações:** Money canônico com duas casas; UUIDs na forma minúscula de
+  `uuid.UUID.String()`; referência omitida, `null` ou `""` → `null`. Identificadores de texto
+  **não** são normalizados (caixa e espaços mudam o hash). No HTTP, `providerId` vem da
+  identidade autenticada (que precisa casar com o corpo). Equivalência HTTP × SQS: a mesma
+  função de hash e os mesmos campos, então a mesma operação pelos dois transportes é replay
+  (testado na T25/T26).
+- **Regras:**
+  - mesma chave + mesmo hash → replay com `idempotentReplay: true` e o resultado persistido,
+    inclusive o `balance` gravado no processamento original (não o saldo atual);
+  - mesma chave + outro hash → 409 `IDEMPOTENCY_KEY_CONFLICT`;
+  - mesmo `(providerId, externalTransactionId)` com outra chave → 409
+    `EXTERNAL_TRANSACTION_CONFLICT` (nunca reaplica);
+  - SQS: mesmo `messageId` com outro hash → `MESSAGE_CONFLICT` (DLQ); mensagem nova para uma
+    operação já feita → replay, e a inbox aponta para a transação original.
+- A `Idempotency-Key` é usada exatamente como recebida; o servidor nunca a substitui por
+  `{providerId}:{externalTransactionId}`.
+
+## 6. Concorrência e locks
+
+Detalhes: ADR-005, ADR-009, ADR-014, ADR-017, ADR-023, ADR-027, ADR-028.
+
+- **Coordenação por carteira, combinando pessimista e otimista:**
+  `SELECT ... FROM wallets WHERE id = $1 FOR UPDATE` serializa as operações **da mesma
+  carteira**; `UPDATE wallets ... WHERE id = $1 AND version = $lida` é a defesa em
+  profundidade contra lost update (0 linhas → `ErrStaleWallet`, nada gravado). O trigger
+  `wallets_guard_update` exige versão +1 exatamente quando o saldo muda.
+- **Sem lock global:** carteiras diferentes avançam em paralelo (testado travando uma carteira
+  e vendo as outras concluírem). Referência e reversões ficam na mesma carteira, então o mesmo
+  lock serializa reversões concorrentes de uma referência.
+- **Barreiras finais no schema:** `CHECK (balance >= 0)`, os únicos de idempotência, o índice
+  de reversão única e `UNIQUE(wallet_id, transaction_id)` do ledger valem mesmo se uma regra
+  de aplicação falhasse.
+- **Replays não esperam o lock:** a leitura por `(provider, key)` é feita antes do
+  `FOR UPDATE`; depois do lock há uma releitura (em `READ COMMITTED` cada comando vê os commits
+  anteriores).
+- **Workers:** outbox e pendências usam lease persistido (`locked_until`/`claimed_until`) com
+  `SKIP LOCKED` e fencing por token/tentativa; a ordem de locks do worker de pendências é a
+  mesma das entradas (carteira → linha), sem deadlock.
+- **Demonstração exigida:** 100.00 BRL e duas apostas simultâneas de 80.00 → uma `PROCESSED`,
+  uma `REJECTED INSUFFICIENT_FUNDS`, saldo 20.00, um débito; reenvios não mudam o resultado.
+  Coberto no caso de uso, na aplicação completa e com 3 processos independentes
+  (ADR-027/028).
+
+## 7. Máquina de estados; falha transitória × permanente
+
+Detalhes: ADR-008, ADR-013, ADR-017.
+
+| De \ Para | `PENDING_REFERENCE` | `PROCESSED` | `REJECTED` | `FAILED` |
+| --- | --- | --- | --- | --- |
+| `PENDING` | `MarkPendingReference` | `MarkProcessed` | `Reject` | `Fail` |
+| `PENDING_REFERENCE` | `RescheduleReferenceRetry` (attempts+1) | `MarkProcessed` | `Reject` | `Fail` |
+
+- `PROCESSED`, `REJECTED` e `FAILED` são terminais: o domínio recusa transições
+  (`ErrWagerTransactionTerminal`) e o trigger `wager_transactions_guard_update` as torna
+  imutáveis no banco. Não há aresta de volta para `PENDING`.
+- `OPENING` nasce `PROCESSED` (interno, no mesmo commit da carteira). Operações externas nascem
+  `PENDING` no domínio, mas o fluxo síncrono grava **já no estado final** (`PROCESSED`,
+  `REJECTED` ou `PENDING_REFERENCE`) numa única transação, sem commit intermediário de aceite.
+  Um `PENDING` confirmado só existiria num aceite interrompido; o worker o retoma como órfão
+  (`PENDING_ORPHAN_GRACE`).
+- **Transitório:** timeout, serialização, deadlock, lock timeout, conexão, `57P0x`, `53300`,
+  IdP sem chaves. **Não vira estado**: a transação faz rollback e é refeita (retry interno
+  limitado, reentrega SQS com backoff, nova chamada do provedor após 503, lease do worker). O
+  registro continua inexistente, `PENDING` ou `PENDING_REFERENCE`.
+- **Permanente de negócio:** `REJECTED` com `failureCode` `INPUT` ou `BUSINESS`, persistido e
+  com evento.
+- **Permanente de infraestrutura:** `FAILED` com código `INFRASTRUCTURE`
+  (`PROCESSING_FAILED`, `RETRIES_EXHAUSTED`) é suportado pelo domínio, pelo schema e pelo
+  contrato HTTP (422), mas **nenhum fluxo atual grava `FAILED`** (seção 18): transitórios
+  esgotados no SQS vão para a DLQ sem tocar no banco, e no HTTP o provedor recebe 503 e repete.
+- Entradas inválidas que impedem construir a transação (parsing, `OPENING` externo) não criam
+  linha nem evento: são 400 no HTTP e DLQ no SQS.
+
+## 8. Referências pendentes: tentativas, backoff e TTL
+
+Detalhes: ADR-009, ADR-017, ADR-023.
+
+- Referência ausente → a operação é gravada `PENDING_REFERENCE` (`attempts = 1`,
+  `next_attempt_at = agora + PENDING_REFERENCE_RETRY_BASE_DELAY`) com o evento
+  `WagerTransactionPendingReference`, no mesmo commit (e, no SQS, com a inbox concluída e a
+  mensagem apagada: o worker assume).
+- O worker de cada réplica reivindica as vencidas (`ClaimDue`, lease + token,
+  `FOR NO KEY UPDATE SKIP LOCKED`) e reaplica `DecideWager`/`ApplyWagerDecision` com a carteira
+  travada. Backoff exponencial **persistido**: `base · 2^(attempts−1)`, teto
+  `PENDING_REFERENCE_RETRY_MAX_DELAY`, nunca agendado depois do fim do TTL. Sobrevive a
+  reinícios porque o estado está na linha.
+- **Limite:** `PENDING_REFERENCE_MAX_ATTEMPTS` (10, buscas totais, inclusive a do aceite) ou
+  `PENDING_REFERENCE_TTL` (10m desde `created_at`), o que vier antes. Esgotado →
+  `REJECTED REFERENCE_NOT_FOUND` + `WagerTransactionRejected`. A busca vem antes da expiração:
+  uma referência que chegou é aplicada mesmo na última tentativa.
+- **Referência existente mas pendente** (`PENDING`/`PENDING_REFERENCE`): a operação continua
+  aguardando; se o prazo esgotar, `REFERENCE_NOT_FOUND` ("não ficou disponível a tempo").
+- **Referência terminada sem sucesso** (`REJECTED`/`FAILED`): rejeição imediata com
+  `REFERENCE_NOT_PROCESSED`, sem esperar.
+- Defaults: base 2s, teto 1m, 10 buscas, TTL 10m (a última busca acontece ~5 min após o
+  aceite); poll 1s, lote 20, concorrência 4, lease 30s, prazo por item 5s.
+- O replay de uma operação pendente devolve o estado atual (202 enquanto pendente; o estado
+  final depois da resolução).
+
+## 9. Reversões: `REFUND` × `ROLLBACK`
+
+Detalhes: ADR-009, ADR-011.
+
+- `REFUND` referencia só `BET` e credita. `ROLLBACK` referencia `BET` (credita), `WIN` ou
+  `REFUND` (debita). `LOSS`, `ROLLBACK` e `OPENING` não são reversíveis
+  (`REFERENCE_NOT_REVERSIBLE`). `WIN` pode citar uma `BET` da mesma rodada como vínculo e
+  credita o próprio valor.
+- A referência é resolvida por `(providerId, referenceExternalTransactionId)` e precisa
+  concordar em provedor, jogador, carteira e rodada (`REFERENCE_MISMATCH`) e moeda
+  (`CURRENCY_MISMATCH`); o valor precisa ser igual (`AMOUNT_MISMATCH`; sem reversão parcial).
+- **Política:** cada referência admite **no máximo uma reversão `PROCESSED`, de qualquer
+  tipo**. Uma segunda (`REFUND` ou `ROLLBACK`) → `ALREADY_REVERSED`. Assim o mesmo débito nunca
+  é devolvido duas vezes. Um `ROLLBACK` do próprio `REFUND` é permitido (desfaz a devolução,
+  uma única vez). Defesa final no schema:
+  `UNIQUE (reference_transaction_id) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')`.
+- Reversão que debitaria além do saldo → `REVERSAL_INSUFFICIENT_FUNDS` (distinto de
+  `INSUFFICIENT_FUNDS` da `BET`), persistida e com evento.
+- Limitação consciente: uma `BET` cuja devolução foi desfeita (`REFUND` + `ROLLBACK(REFUND)`)
+  não pode ser devolvida de novo.
+
+## 10. `failureCode`s
+
+Detalhes: ADR-008, ADR-009. Contrato público estável (`domain.AllFailureCodes()`), com
+`failureCategory` no corpo e nos eventos.
+
+| Categoria | Significado | Códigos |
+| --- | --- | --- |
+| `INPUT` | corrigível: o provedor corrige e envia **uma nova** operação | `INVALID_REQUEST`, `INVALID_KIND`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH`, `CURRENCY_MISMATCH`, `REFERENCE_MISMATCH`, `AMOUNT_MISMATCH` |
+| `BUSINESS` | resultado definitivo | `INSUFFICIENT_FUNDS` (só `BET`), `REVERSAL_INSUFFICIENT_FUNDS` (só `ROLLBACK`), `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_REVERSIBLE`, `REFERENCE_NOT_PROCESSED`, `ALREADY_REVERSED` |
+| `INFRASTRUCTURE` | só em `FAILED` (não gravado hoje, seção 7) | `PROCESSING_FAILED`, `RETRIES_EXHAUSTED` |
+
+Os códigos de `INPUT` de formato (`INVALID_*`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`)
+normalmente saem como **400 sem persistência** (validação antes da transação); os de carteira
+e referência (`WALLET_*`, `*_MISMATCH`) dependem do banco e saem como **422 `REJECTED`
+persistido**. Os códigos dos erros de API (`IDEMPOTENCY_KEY_CONFLICT`, `TRANSACTION_NOT_FOUND`,
+`PROVIDER_MISMATCH`...) são outro espaço de nomes: campo `code` do corpo de erro (seção 16).
+
+## 11. Inbox e outbox
+
+Detalhes: ADR-011, ADR-015, ADR-017, ADR-022, ADR-024.
+
+- **Inbox** (`inbox`, PK `(consumer_name, message_id)`, `request_hash`, `transaction_id`,
+  `received_at`, `completed_at`): `Register` e `Complete` rodam **na mesma transação** que
+  carteira, ledger, transação e outbox. Uma reentrega depois do commit encontra `COMPLETED` e
+  devolve o replay; uma entrega concorrente da mesma mensagem espera no índice único. Em
+  `PENDING_REFERENCE` a mensagem é concluída no commit da pendência.
+- **Outbox** (`outbox`: `seq` IDENTITY, `event_id` UNIQUE, `aggregate_id`, `event_type`,
+  `payload JSON` imutável, `occurred_at`, `attempts`, `next_attempt_at`,
+  `locked_by`/`locked_until`, `last_error`, `published_at`): os eventos são gravados no mesmo
+  commit do estado que os originou; **nada é publicado antes do commit**.
+- **Publisher:** claim em autocommit com lease (`statement_timestamp()` do banco), `SKIP
+  LOCKED`, ordem por `seq` e só a **cabeça** de cada agregado (head-of-line: um evento em
+  lease/backoff segura os seguintes do mesmo agregado). Envio fora de transação, depois
+  `MarkPublished`/`MarkFailed` com fencing `(seq, eventId, owner, attempts)`. Falha →
+  backoff persistido `min(1s·2^(n−1), 5min)`. Lease expirado (processo morto) → outra
+  instância republica o **mesmo `eventId` e o mesmo corpo**.
+- **Sem limite de tentativas nem DLQ na outbox:** descartar um evento confirmado violaria a
+  garantia de não perda; um evento que falha sempre bloqueia só o seu agregado e aparece em
+  `outbox_oldest_pending_age_seconds` e `last_error`.
+- Crash entre commit e publicação, e entre publicação e marcação: testados com processos
+  reais mortos (ADR-024, ADR-028).
+
+## 12. SQS: filas, `MessageGroupId`/`MessageDeduplicationId`, visibilidade, tentativas e DLQ
+
+Detalhes: ADR-022, ADR-024, ADR-026.
+
+**Filas** (provisionadas por `deploy/localstack/init-sqs.sh`):
+
+| Fila | Configuração | Uso |
+| --- | --- | --- |
+| `wager-transactions.fifo` | FIFO, `ContentBasedDeduplication=false`, `VisibilityTimeout=30`, retenção 4 dias, `RedrivePolicy` `maxReceiveCount=5` → DLQ | entrada (`WagerTransactionRequested`) |
+| `wager-transactions-dlq.fifo` | FIFO, retenção 14 dias, `RedriveAllowPolicy` só para a entrada | mensagens inválidas, permanentes e transitórias esgotadas |
+| `wager-events.fifo` | FIFO, `ContentBasedDeduplication=false`, retenção 4 dias | eventos de integração (seção 13) |
+
+**Produtores da fila de entrada (contrato):** `MessageGroupId = walletId` (ordem por carteira,
+paralelismo entre carteiras) e `MessageDeduplicationId = messageId` do envelope (dedup de 5 min
+do SQS). Nenhum dos dois é necessário para a correção: inbox, idempotência por chave e lock da
+carteira valem sem eles (o teste HTTP × SQS usa de propósito grupos e dedup ids aleatórios).
+A identidade durável é o `messageId` do **envelope**, não o `MessageId` do SQS.
+
+**Consumidor:**
+
+- Long polling (`SQS_WAIT_TIME` 20s); visibilidade pedida em cada receive
+  (`SQS_VISIBILITY_TIMEOUT` 30s); processamento limitado a `SQS_PROCESS_TIMEOUT` (15s, menor
+  que a visibilidade); renovação da visibilidade antes de processar uma mensagem que esperou
+  no lote.
+- Mensagens agrupadas por `MessageGroupId`: uma goroutine por grupo, em ordem; até
+  `SQS_CONSUMER_CONCURRENCY` (4) grupos em paralelo. Se uma mensagem do grupo não conclui, as
+  seguintes do lote voltam com visibilidade 0, sem processar.
+- `DeleteMessage` **só depois do commit**: `PROCESSED`, `REJECTED` (rejeição de negócio é
+  terminal), `PENDING_REFERENCE` e replay.
+- **Inválidas** (JSON, tipo, `OPENING`, Money...) e **permanentes** (`KindInvalidInput`,
+  `MESSAGE_CONFLICT`, `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`): enviadas
+  **explicitamente** à DLQ na 1ª entrega (corpo original, mesmo grupo, `MessageDeduplicationId`
+  determinístico, atributos `dlqReason`, `dlqCode`, `dlqField`, `sourceQueue`,
+  `sourceMessageId`, `envelopeMessageId`, `receiveCount`, `attempts`, `consumerName`) e só
+  depois apagadas. Nada é gravado no banco.
+- **Transitórias** (`TEMPORARILY_UNAVAILABLE`, prazo, erro sem classe): `ChangeMessageVisibility`
+  com backoff `SQS_RETRY_BASE_DELAY · 2^(n−1)` (1s, teto 5m). Esgotadas `SQS_MAX_ATTEMPTS` (3)
+  tentativas → DLQ explícita (`max_receives`).
+- **Redrive nativo** (`maxReceiveCount=5`) é só rede de segurança (crash repetido, DLQ
+  indisponível). O start exige a `RedrivePolicy` e `SQS_MAX_ATTEMPTS < maxReceiveCount`, e
+  resolve a DLQ pela própria política. Motivo do envio explícito: na FIFO, devolver as
+  seguintes de um grupo também incrementa o `ApproximateReceiveCount` delas, e o redrive
+  nativo levaria mensagens válidas à DLQ junto com a venenosa.
+- **Acesso ao broker:** a aplicação usa credenciais próprias; cada fila tem `Policy` de recurso
+  restrita à conta e o usuário IAM `wallet-app` recebe só Receive/Delete/ChangeVisibility/
+  GetAttributes na entrada e SendMessage na DLQ e nos eventos. O LocalStack Community não
+  aplica IAM: o provisionamento documenta de forma executável o que a AWS exigiria. O
+  `providerId` do envelope é aceito porque o acesso à fila é controlado pelo broker; o domínio
+  continua validando provedor, carteira, jogador e referência.
+- **SIGTERM:** seção 15.
+
+## 13. Eventos de integração e contrato da fila de eventos
+
+Detalhes: ADR-012, ADR-024.
+
+- Tipos concretos, construídos só pelos construtores do domínio (tipo e `version` = 1 fixados
+  pelo payload): `WagerTransactionProcessed` (inclusive `LOSS` e `OPENING`),
+  `WagerTransactionRejected`, `WalletBalanceChanged` (só com lançamento) e
+  `WagerTransactionPendingReference` (só na transição para `PENDING_REFERENCE`).
+- Envelope `{eventId, eventType, aggregateId, correlationId, causationId?, occurredAt, version,
+  data}`; `eventId` UUIDv7; timestamps RFC 3339 UTC; dinheiro sempre em string decimal.
+  `WalletBalanceChanged.data`: `walletId`, `transactionId`, `direction`, `money`,
+  `balanceBefore`, `balanceAfter`, `walletVersion`. O payload é serializado uma vez e gravado
+  byte a byte (snapshot imutável).
+- **Roteamento em `wager-events.fifo`:** `MessageGroupId = aggregateId` (id da transação nos
+  eventos de transação; id da carteira em `WalletBalanceChanged`), `MessageDeduplicationId =
+  eventId`, corpo = snapshot; atributos `eventType` (String), `eventVersion` (Number), `eventId`
+  e `correlationId`.
+- **Consumo:** at-least-once; dedup do FIFO na janela de 5 min e, fora dela, por `eventId` no
+  consumidor. Ordem garantida só dentro do grupo; para relacionar transação e saldo, usar
+  `walletVersion` (monotônica por carteira) e `transactionId`.
+- `idempotencyKey`, `requestHash` e (em rejeições) `referenceTransactionId` nunca entram nos
+  eventos. `FAILED` não gera evento.
+
+## 14. Autenticação (OIDC) e autorização
+
+Detalhes: ADR-019, ADR-020, ADR-026, ADR-029.
+
+- **IdP:** Keycloak (realm `junglegaming`, provisionado no Compose por import). Serviços obtêm
+  tokens por `client_credentials`; a aplicação só **valida** tokens (sem senhas, sem emissão
+  própria).
+- **Validação local** de JWT por JWKS (sem introspecção por requisição): allowlist de
+  algoritmos assimétricos (`none`/`HS*` recusados), `kid` (e `alg`, se declarado) da chave,
+  `iss` exato, `aud` contendo `OIDC_AUDIENCE` (`wallet-api`), `exp` obrigatório, `exp`/`nbf`/
+  `iat` com tolerância `OIDC_CLOCK_SKEW` (30s), `typ=Bearer` se presente, token ≤ 16 KiB. JWKS
+  com cache, renovação por `kid` desconhecido (no máx. 1 busca a cada 10s) e por idade (10
+  min). Sem chaves utilizáveis (IdP fora) → 503, não 401. Trade-off: revogação só vale na
+  expiração do token (tokens curtos, 300s no realm).
+- **Principal:** `providerId` da claim `provider_id` (mapper hardcoded por client de provedor,
+  desacoplado do `client_id`); papéis de `realm_access.roles` ∪
+  `resource_access[OIDC_ROLES_CLIENT].roles`.
+- **Permissões:**
+  - `wallet-internal` (client `internal-service`): `POST /wallets`, `GET /wallets/{id}`,
+    `GET /wallets/{id}/ledger`, `POST /wallets/{id}/reconciliation` e `/metrics` (com
+    `METRICS_ACCESS=internal`, o padrão);
+  - `wager-provider` **e** `provider_id` (clients `provider-a`, `provider-b`): as três rotas de
+    transação, sempre com o `providerId` **da identidade**. O do corpo e o do path precisam
+    ser iguais byte a byte, senão 403 `PROVIDER_MISMATCH`. Por id, a transação de outro
+    provedor (ou interna) é 404 com corpo idêntico ao de um id inexistente. Replays de outro
+    provedor nunca devolvem dados;
+  - sem papel → 403 `FORBIDDEN`; o serviço interno não acessa transações e provedores não
+    acessam carteiras;
+  - público só `/health/live` e `/health/ready` (comparação exata do path).
+- **Acessos negados** não abrem transação e não produzem ledger, outbox nem transação
+  (testado contra o Keycloak real, ADR-029).
+- **Mensageria:** sem token; controle por credenciais/políticas do broker (seção 12).
+
+## 15. Uber Fx: composição, ciclo de vida e shutdown
+
+Detalhes: ADR-007, ADR-021, ADR-022, ADR-023, ADR-024, ADR-025, ADR-026.
+
+- **Composição** (`cmd/server.Options`): `fx.Supply(cfg)` + `logging`, `metrics`, `postgres`,
+  `app`, `auth`, `outboxpublisher`, `pendingworker`, `sqs` (cliente + consumidor),
+  `httpadapter`, `httpserver` e as ligações cruzadas (recorder de reconciliação, base do
+  backoff de pendências, `METRICS_ACCESS`, readiness `postgres`). Cada pacote expõe um
+  `fx.Module` com `fx.Provide`/`fx.Invoke`; o domínio e os casos de uso não importam Fx.
+- **Start:** a config é carregada e validada **antes** do `fx.New` (config inválida → exit 1
+  sem abrir conexões). O pool faz ping com backoff; o consumidor valida fila, `RedrivePolicy` e
+  `SQS_MAX_ATTEMPTS`; o servidor faz listen síncrono (porta ocupada falha o start).
+  `StartTimeout` = orçamento (`DATABASE_CONNECT_TIMEOUT` + 15s = 45s) + reserva de rollback
+  (= `StopTimeout`, 75s) = **120s** com os defaults; os OnStart que repetem desistem antes da
+  reserva para que o rollback consiga parar o que já subiu.
+- **Ordem de parada** (inversa do start, sequencial, verificada em teste):
+
+  | # | Componente | O que faz |
+  | --- | --- | --- |
+  | 1 | servidor HTTP | readiness DOWN, `HTTP_DRAIN_DELAY`, `Shutdown` (recusa conexões novas, drena as em voo), `Close` forçado no prazo |
+  | 2 | transporte do JWKS | fecha conexões ociosas com o IdP |
+  | 3 | consumidor SQS | para de buscar, espera o último long polling, conclui as em voo até `SQS_DRAIN_TIMEOUT`, libera o resto com visibilidade 0 |
+  | 4 | worker de pendências | para de reivindicar; itens em voo até `PENDING_WORKER_DRAIN_TIMEOUT`; os não iniciados voltam pelo lease |
+  | 5 | publisher da outbox | para de reivindicar, devolve (`Release`) os não iniciados, conclui envios até `OUTBOX_DRAIN_TIMEOUT` |
+  | 6 | cliente SQS | fecha conexões ociosas |
+  | 7 | pool pgx | `Close`, por último |
+
+  Dependências (pool, clientes) são construídas antes e paradas depois de quem as usa. O
+  worker para antes do publisher para que os eventos gravados na drenagem ainda saiam por
+  esta instância.
+- **`StopTimeout`** = soma dos orçamentos (os OnStop são sequenciais): `SHUTDOWN_TIMEOUT` 15s
+  + `sqs.StopBudget` = max(`SQS_DRAIN_TIMEOUT` 10s, `SQS_WAIT_TIME` 20s + 5s) = 25s +
+  `PENDING_WORKER_DRAIN_TIMEOUT` 10s + `OUTBOX_DRAIN_TIMEOUT` 10s + folga 15s = **75s**. No
+  Compose, `stop_grace_period: 90s`.
+- **Trabalho interrompido no prazo:** contexto cancelado → rollback da transação; a mensagem
+  SQS volta com visibilidade 0, o item do worker e o evento da outbox voltam quando o lease
+  expira. Nenhum caminho perde trabalho confirmado; no pior caso há reprocessamento,
+  absorvido pela idempotência.
+- **Sinais:** SIGINT/SIGTERM → parada limpa, exit 0; falha de start/stop ou
+  `fx.Shutdowner` com código (ex.: o `Serve` do HTTP morreu) → exit 1.
+
+## 16. Contrato HTTP: códigos e corpos
+
+Detalhes: ADR-019, ADR-020. Erros usam `{code, message, correlationId}` com mensagem
+genérica; toda resposta JSON leva `Cache-Control: no-store` e o `X-Correlation-ID`.
+
+| Situação | HTTP | Corpo / `code` |
+| --- | --- | --- |
+| Carteira aberta | 201 + `Location` | `{id, playerId, balance, version, createdAt, updatedAt}` |
+| Operação `PROCESSED` (nova ou replay) | 200 | `{transactionId, status, balance, idempotentReplay}` (+ `referenceTransactionId` em operações com referência) |
+| Processamento pendente `PENDING_REFERENCE` | 202 + `Location: /wagering/transactions/{id}` | `{transactionId, status, idempotentReplay}` |
+| Rejeição de negócio `REJECTED` (ou `FAILED`) | 422 | `{transactionId, status, failureCode, failureCategory, balance?, idempotentReplay}` |
+| Entrada inválida | 400 | `INVALID_REQUEST`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `INVALID_KIND`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `IDEMPOTENCY_KEY_REQUIRED`, `INVALID_IDEMPOTENCY_KEY`, `INVALID_PLAYER_ID`, `INVALID_INITIAL_BALANCE`, `INVALID_WALLET_ID`, `INVALID_TRANSACTION_ID`, `INVALID_PROVIDER_ID`, `INVALID_EXTERNAL_TRANSACTION_ID`, `INVALID_PAGE_LIMIT`, `INVALID_CURSOR`, `INVALID_CORRELATION_ID` |
+| Sem token, token inválido/expirado/de outro issuer ou audiência | 401 + `WWW-Authenticate: Bearer realm="wallet"` | `UNAUTHENTICATED` |
+| Sem papel / provedor divergente | 403 | `FORBIDDEN` / `PROVIDER_MISMATCH` |
+| Inexistente (ou de outro provedor) | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `ROUTE_NOT_FOUND` |
+| Método não suportado | 405 + `Allow` | `METHOD_NOT_ALLOWED` |
+| Conflito | 409 | `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `WALLET_ALREADY_EXISTS` |
+| Corpo grande demais (> 64 KiB) | 413 | `PAYLOAD_TOO_LARGE` |
+| `Content-Type` diferente de JSON | 415 | `UNSUPPORTED_MEDIA_TYPE` |
+| Indisponibilidade transitória (banco, commit ambíguo, prazo, IdP) | 503 + `Retry-After` | `TEMPORARILY_UNAVAILABLE` |
+| Erro inesperado / panic | 500 | `INTERNAL_ERROR` |
+
+As cinco situações exigidas são distinguíveis pelo status: entrada inválida (400), conflito
+(409), rejeição de negócio (422, com `failureCode`), pendente (202) e indisponibilidade
+transitória (503 + `Retry-After`; repetir com a mesma chave é seguro). Em `WALLET_NOT_FOUND`,
+`WALLET_PLAYER_MISMATCH` e `CURRENCY_MISMATCH` o 422 não leva `balance`. Health:
+`/health/live` 200 `{"status":"UP"}`; `/health/ready` 200 ou 503 com
+`{"status":"DOWN","checks":{"postgres":...,"sqs":...,"http-server":...}}`.
+
+## 17. Observabilidade
+
+Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
+
+- **Logs** JSON (`log/slog`) com `correlationId`, `messageId`, `transactionId`, `walletId` e
+  `providerId` na raiz; redação de chaves e padrões sensíveis (tokens, segredos, DSN, payloads)
+  e `config.Secret` para DSN e chave AWS. Nenhum corpo de requisição/mensagem é logado.
+- **Métricas** (namespace `wallet`, registry próprio, rótulos fechados):
+  `wager_transactions_total{source,type,status}`, `duplicates_total`, `retries_total`,
+  `dlq_messages_total`, `dlq_depth_messages`, `concurrency_conflicts_total`,
+  `outbox_pending_events`, `outbox_oldest_pending_age_seconds`,
+  `outbox_publish_delay_seconds`, `processing_duration_seconds`,
+  `http_request_duration_seconds`, `reconciliations_total` e
+  `reconciliation_divergences_total`. Sem valores monetários e sem IDs em rótulos.
+- **Reconciliação:** `POST /wallets/{id}/reconciliation` em `REPEATABLE READ READ ONLY`;
+  `difference = stored − calculated`; divergência → resposta, log WARN e métrica; nada é
+  corrigido.
+- **Health:** liveness sem dependências; readiness com `postgres` (ping), `sqs`
+  (`GetQueueAttributes`) e `http-server` (DOWN durante a parada).
+
+## 18. Interpretações adotadas, limitações, trade-offs e trabalho não concluído
+
+**Interpretações adotadas**
+
+- **Aceite síncrono.** Toda operação é concluída numa transação (`PROCESSED`, `REJECTED` ou
+  `PENDING_REFERENCE`), sem commit intermediário de `PENDING` (README §6.3 permite). O item 8
+  dos testes ("interromper após `PENDING`") é exercitado pelo equivalente: processo morto com o
+  lease de pendências gravado, retomado por outra instância. A retomada de `PENDING` órfão
+  existe e é testada, mas só seria alcançada por um aceite assíncrono futuro.
+- **Uma reversão bem-sucedida por referência, de qualquer tipo** (seção 9).
+- **`REFERENCE_NOT_FOUND`** também cobre a referência que existe mas não terminou dentro do
+  prazo (seção 8).
+- **`WIN` com referência** credita o próprio valor; a `BET` serve só de vínculo de rodada.
+- **Rejeições `INPUT` que dependem do banco** (`WALLET_NOT_FOUND`, `*_MISMATCH`) são
+  persistidas como `REJECTED` (com evento), para que o replay seja estável; por isso
+  `wager_transactions.wallet_id` não tem FK para `wallets`.
+- **422 para `REJECTED` e `FAILED`**: ambos são resultados definitivos e persistidos; `status`
+  e `failureCategory` os distinguem.
+- **Isolamento entre provedores:** a mesma `externalTransactionId`/chave em outro provedor é
+  outra operação (únicos escopados por provedor); transação alheia por id → 404, provedor
+  divergente no corpo/path → 403.
+- **Grupo dos eventos = `aggregateId`** (não `walletId`), com ordem entre grupos dada por
+  `walletVersion` (seção 13).
+- **Outbox sem DLQ**: retry indefinido com backoff, por não perda (seção 11).
+
+**Limitações e trade-offs**
+
+- **`FAILED` não é produzido por nenhum fluxo.** O estado, os códigos `PROCESSING_FAILED`/
+  `RETRIES_EXHAUSTED`, os CHECKs e o 422 existem, mas falhas transitórias esgotadas terminam
+  na DLQ (SQS) ou em 503 (HTTP) sem registro `FAILED`; a auditoria dessas falhas fica em logs,
+  métricas e na DLQ.
+- **Item envenenado no worker de pendências** (linha que não reidrata, erro permanente): volta
+  a cada `PENDING_WORKER_LEASE`, sem poison counter nem transição para `FAILED` (log WARN e
+  métrica `outcome="error"`).
+- **Pendências não são "acordadas"** quando a referência chega: a resolução espera o próximo
+  `next_attempt_at` (no máximo `PENDING_REFERENCE_RETRY_MAX_DELAY`, 1m).
+- **Revogação de token** só vale na expiração (validação local por JWKS).
+- **`POST /wallets` sem chave de idempotência:** um commit ambíguo (503) seguido de nova
+  tentativa devolve 409 `WALLET_ALREADY_EXISTS`; o cliente consulta a carteira. Sem risco
+  financeiro (UNIQUE da carteira e do OPENING).
+- **Outbox:** um evento que falha sempre bloqueia o seu agregado indefinidamente (visível em
+  métricas). Um agregado com fila longa avança um evento por ciclo (head-of-line).
+- **DLQ do SQS:** fora da janela de 5 min de deduplicação, uma falha de `DeleteMessage` depois
+  do envio à DLQ pode deixar uma cópia duplicada na DLQ (inofensiva no reprocessamento). Uma
+  válida pode chegar à DLQ pelo redrive nativo se acumular `maxReceiveCount` recebimentos sem
+  desconto (reinícios repetidos com a mensagem em voo); fica retida, não perdida.
+- **Parada de réplica ociosa** leva até `SQS_WAIT_TIME` (20s), porque o consumidor espera o
+  último long polling em vez de cancelá-lo (cancelar escondia mensagens liberadas).
+- **Desvio de relógio:** leases da outbox usam o relógio do banco; os do worker de pendências e
+  `created_at` usam o relógio da instância (um desvio só antecipa/atrasa uma reassunção,
+  sem duplicar efeito, por causa do fencing). A paginação do ledger usa `seq`, imune a desvio.
+- **Triggers podem ser desligados** pelo dono das tabelas ou superusuário; em produção a
+  aplicação deve usar um papel que não seja dono. `down` das migrations destrói dados.
+  Migrations não suportam `CREATE INDEX CONCURRENTLY`.
+- **LocalStack Community não aplica IAM**: as políticas do broker estão provisionadas, mas só
+  seriam aplicadas na AWS.
+- **Segredos de desenvolvimento** (clients do Keycloak, admin, senha do banco) são versionados
+  de propósito para o ambiente local.
+- **Reversão de devolução desfeita:** `REFUND` + `ROLLBACK(REFUND)` impede nova devolução da
+  mesma `BET` (seção 9).
+- **Testes multi-instância** usam um IdP de teste; o Keycloak real é coberto nos testes E2E
+  de autenticação, com uma instância (a validação é a mesma em todas).
+
+**Pendências abertas no código (não resolvidas nesta entrega)**
+
+- **`Money.UnmarshalJSON` permissivo** (`internal/domain/money.go`): usa `encoding/json` sobre
+  uma struct, então aceita chaves com outra caixa (`{"AMOUNT":...}`) e chaves duplicadas (fica
+  a última), e aceita valores negativos (usa `Parse`, não `ParseNonNegative`). **Nenhuma
+  entrada externa usa esse método**: HTTP e SQS decodificam Money por `strictjson.Money`, que
+  rejeita esses casos e exige valor não negativo (ADR-020/022). O método só serve a usos
+  internos/testes.
+- **Índice sem uso** `wallet_ledger_entries_wallet_page_idx` (`0003`, em `(wallet_id,
+  created_at, id)`): a paginação passou a usar `(wallet_id, seq)` na `0006`. Custo só de
+  escrita; remover numa migration futura.
+- **`tools.go`** ainda importa com `_` dependências que já são usadas diretamente (`aws-sdk`,
+  `uuid`, `pgxpool`). Inofensivo (build tag `tools`, fora do binário), mas é limpeza pendente
+  do ADR-001.
+- **Fora do escopo:** ledger de partidas dobradas, tracing (OpenTelemetry), dashboards e
+  testes de carga (diferenciais opcionais) não foram implementados. Coletor de estatísticas do
+  `pgxpool` não é exportado.
+
+---
+
+# Parte II — Registro de decisões (ADRs)
+
+Histórico incremental. As notas "Para a T23/T24" e "pendente" dentro dos ADRs foram
+resolvidas nas tarefas indicadas (ver Parte I e as notas de revisão de cada ADR).
 
 ## ADR-001 — Módulo, versão Go e dependências base (T01)
 
@@ -18,7 +698,11 @@ Cada decisão traz contexto, escolha e consequências. Atualizado a cada tarefa.
 - **Fixação antes do uso:** `tools.go` (build tag `tools`, raiz do módulo) importa as
   dependências com `_` para que `go mod tidy` não as remova enquanto ainda não são usadas
   pelo código de produção. Não entra no binário. Cada import deve ser removido quando a
-  dependência passar a ser usada diretamente.
+  dependência passar a ser usada diretamente. *(Estado na T28: os quatro imports restantes —
+  `aws-sdk-go-v2/config`, `service/sqs`, `uuid`, `pgxpool` — já são usados diretamente; a
+  remoção ficou pendente, seção 18.)*
+- **Dependências acrescentadas depois:** `github.com/go-jose/go-jose/v4` (JWKS próprio,
+  ADR-019), `go.uber.org/goleak` e `testcontainers-go` (só testes).
 
 ## ADR-002 — Layout de pacotes (hexagonal / ports & adapters) (T01)
 
@@ -28,13 +712,18 @@ internal/domain/            modelo puro: Money, Wallet, ledger, WagerTransaction
 internal/app/               casos de uso + portas (interfaces de repositório, tx, publisher)
 internal/adapters/http/     handlers net/http (package httpadapter, evita colisão com net/http)
 internal/adapters/postgres/ repositórios pgx, gerenciador de transações
-internal/adapters/sqs/      consumidor de entrada e publisher da outbox
+internal/adapters/sqs/      cliente SQS e consumidor de entrada
+internal/adapters/outboxpublisher/ publisher da outbox (T22; inicialmente previsto em sqs/)
 internal/adapters/auth/     verificação OIDC e autorização
 internal/adapters/pendingworker/ worker temporizado de referências pendentes e PENDING órfãos (T21)
 internal/platform/config/   configuração por variáveis de ambiente
 internal/platform/logging/  slog JSON
 internal/platform/metrics/  registro Prometheus
 ```
+
+*(Árvore completa e atual, com `cmd/migrate`, `migrations`, `http/server`, `http/apierror`,
+`strictjson`, `postgres/migrate`, `platform/startbudget`, `platform/failpoint`, `deploy` e
+`scripts`: Parte I, seção 1.)*
 
 Regras de dependência (direção única, de fora para dentro):
 
@@ -153,8 +842,9 @@ Regras de dependência (direção única, de fora para dentro):
 
 ## ADR-007 — Config, logging JSON e métricas (T09)
 
-Pacotes `internal/platform/{config,logging,metrics}`, cada um com um `fx.Module`. Ainda não
-conectados em `cmd/server` (T23); cada módulo tem teste de `fx.ValidateApp`.
+Pacotes `internal/platform/{config,logging,metrics}`, cada um com um `fx.Module` e teste de
+`fx.ValidateApp`. Conectados em `cmd/server` na T23 (ADR-025); lá a config é carregada antes
+do `fx.New` e injetada com `fx.Supply`, em vez de `config.Module`.
 
 - **Config (`config.Module` → `config.Config`):** somente variáveis de ambiente, com os nomes
   exatos de `.env.example`. `Load(lookup)` recebe a função de lookup (testável sem tocar no
@@ -682,7 +1372,7 @@ Pacote `internal/adapters/postgres` (`pool.go`, `tx.go`, `errors.go`, `module.go
     repositórios (T12/T13), pelo nome da constraint.
 - **Fx (`postgres.Module`):** provê `*DB` (com os hooks), `*pgxpool.Pool`, `*TxManager` e
   `Transactor`. Depende de `config.Config`; `*slog.Logger` e `*metrics.Metrics` são opcionais.
-  Não registra coletor de estatísticas do pgxpool (fica para T23, se for necessário).
+  Não registra coletor de estatísticas do pgxpool (não foi acrescentado na T23; seção 18).
 - **Testes:** os unitários usam `*pgconn.PgError` sintéticos, erros de contexto/rede e um `pgx.Tx`
   falso para commit, rollback (erro, panic, Goexit, ctx cancelado), commit ambíguo, retry, backoff
   e métricas. Os de integração (`-tags=integration`, mesmo setup da T10) cobrem commit, rollback
@@ -890,7 +1580,7 @@ Pacotes `internal/app` (`ports.go`, `errors.go`, `open_wallet.go`, `module.go`) 
   adapter garante essa igualdade, porque `app` não importa `platform`. O
   `postgres.Module` provê `*UnitOfWork` como `app.UnitOfWork`, e o `app.Module` provê
   `*OpenWallet` a partir dela, com `*slog.Logger` opcional. A composição em `cmd/server`
-  fica para a T23.
+  foi feita na T23 (ADR-025).
 - **Tradução de erros na borda do adapter (substitui a nota do ADR-014).** O caso de uso
   não conhece as sentinelas do adapter. `WalletStore.Insert` embrulha
   `postgres.ErrWalletAlreadyExists` (constraint `wallets_player_currency_key`) com
@@ -1024,7 +1714,7 @@ HTTP (T18) e SQS (T20), com as mesmas garantias de idempotência.
 - **Resultado (`WagerResult`):** `transactionId`, `walletId`, `kind`, `status`, `balance`,
   `failureCode`, `referenceTransactionId` e `idempotentReplay`.
   - `referenceTransactionId` só aparece em `PROCESSED`, porque numa rejeição poderia ser de
-    outra carteira (pendência T18/T20).
+    outra carteira (pendência T18/T20, respeitada pelo HTTP e pelo SQS).
   - `balance` é omitido em `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH` e
     `CURRENCY_MISMATCH`, mesma regra do evento (ADR-012).
 - **Inbox:**
@@ -1129,8 +1819,8 @@ Pacotes `internal/app` (`reconcile.go`, `queries.go`, portas em `ports.go`, erro
     auditável, fora do escopo.
   - A métrica entra por uma porta (`app.ReconciliationRecorder`, satisfeita por
     `*metrics.Metrics.Reconciliation`), porque `app` não importa `platform`. No Fx ela é
-    opcional; a composição (T23) deve prover `fx.Provide(func(m *metrics.Metrics)
-    app.ReconciliationRecorder { return m })` (fiação coberta por teste de integração).
+    opcional; a composição provê `fx.Provide(func(m *metrics.Metrics)
+    app.ReconciliationRecorder { return m })` desde a T23 (ADR-025; fiação coberta por teste).
   - Carteira inexistente → `404 WALLET_NOT_FOUND`; `walletId` nulo → `INVALID_WALLET_ID`.
 - **Consultas (`Queries`).**
   - Todas rodam numa transação **READ ONLY** (READ COMMITTED), sem lock e com retry
@@ -1239,7 +1929,7 @@ Config em `internal/platform/config` (variáveis `OIDC_*`).
   `{OIDC_ISSUER_URL}/.well-known/openid-configuration`, exigindo `issuer` igual ao
   configurado. Informado → usado direto; serve ao Docker Compose, em que o app alcança o
   Keycloak por `http://keycloak:8080` mas o `iss` dos tokens é o host público
-  (`KC_HOSTNAME`), situação que T24 precisa acertar.
+  (`KC_HOSTNAME`); resolvido na T24 (ADR-026, "Issuer OIDC").
 - **Principal.** `sub`, `azp` (client), `providerId` da claim `OIDC_PROVIDER_CLAIM`
   (default `provider_id`, mapper "hardcoded claim" em cada client de provedor no realm)
   e papéis = `realm_access.roles` ∪ `resource_access[OIDC_ROLES_CLIENT].roles` (default:
@@ -1288,7 +1978,8 @@ Config em `internal/platform/config` (variáveis `OIDC_*`).
   (0–2m). `auth.Settings.Validate` repete as regras para quem constrói sem env.
 - **Fx.** `auth.Module` provê `Settings`, `*Authenticator` e `*Authorizer` a partir de
   `config.Config`, com logger opcional. Config inválida faz `fx.New` falhar, e o start
-  não abre conexão com o IdP. Ainda não está ligado em `cmd/server` (T23).
+  não abre conexão com o IdP. Ligado em `cmd/server` na T23 (ADR-025), que também passou a
+  fechar o transporte HTTP do JWKS no OnStop.
 - **Testes.**
   - Unitários (`go test -race`): IdP falso com `httptest` e chaves RSA geradas no teste,
     cobrindo:
@@ -1315,9 +2006,9 @@ Config em `internal/platform/config` (variáveis `OIDC_*`).
     `KEYCLOAK_CLIENT_SECRET`, opcionais `KEYCLOAK_ISSUER`, `OIDC_AUDIENCE`,
     `KEYCLOAK_EXPECT_PROVIDER_ID`, `KEYCLOAK_EXPECT_ROLE`) e o valida por discovery + JWKS
     reais. Cobre middleware 200/401, assinatura adulterada e aud/iss errados. Sem
-    `KEYCLOAK_URL` faz `t.Skip` com mensagem explícita: nesta máquina não há
-    Docker/Keycloak. **Ele roda de verdade em T24/T27** com o Keycloak do Docker
-    Compose. O realm precisa ter: mapper de audiência `wallet-api` nos clients,
+    `KEYCLOAK_URL` faz `t.Skip` com mensagem explícita. Na T17 não havia Docker/Keycloak;
+    desde a T24/T27 ele roda contra o Keycloak do Docker Compose
+    (`make test-integration-compose`, ADR-026/029). O realm precisa ter: mapper de audiência `wallet-api` nos clients,
     hardcoded claim `provider_id` nos clients de provedor, papéis `wager-provider` e
     `wallet-internal`, e `iss` consistente com `OIDC_ISSUER_URL`.
 
@@ -1418,7 +2109,7 @@ T20).
   | Operação `PROCESSED` (nova ou replay) | 200 | `{transactionId, status, balance, idempotentReplay}` (+`referenceTransactionId` em reversões) |
   | `PENDING_REFERENCE` (nova ou replay) | 202 + `Location: /wagering/transactions/{id}` | `{transactionId, status, idempotentReplay}` |
   | Rejeição de negócio `REJECTED` ou falha permanente `FAILED` (nova ou replay) | 422 | `{transactionId, status, failureCode, failureCategory, balance?, idempotentReplay}` |
-  | Entrada inválida | 400 | `code` = `INVALID_REQUEST`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `INVALID_KIND`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `IDEMPOTENCY_KEY_REQUIRED`, `INVALID_IDEMPOTENCY_KEY`, `INVALID_PLAYER_ID`, `INVALID_INITIAL_BALANCE`, `INVALID_WALLET_ID`, `INVALID_TRANSACTION_ID`, `INVALID_PAGE_LIMIT`, `INVALID_CURSOR`, `INVALID_CORRELATION_ID` |
+  | Entrada inválida | 400 | `code` = `INVALID_REQUEST`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `INVALID_KIND`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `IDEMPOTENCY_KEY_REQUIRED`, `INVALID_IDEMPOTENCY_KEY`, `INVALID_PLAYER_ID`, `INVALID_INITIAL_BALANCE`, `INVALID_WALLET_ID`, `INVALID_TRANSACTION_ID`, `INVALID_EXTERNAL_TRANSACTION_ID`, `INVALID_PAGE_LIMIT`, `INVALID_CURSOR`, `INVALID_CORRELATION_ID` |
   | Sem token / token inválido ou expirado | 401 + `WWW-Authenticate` | `UNAUTHENTICATED` |
   | Sem papel / provedor divergente | 403 | `FORBIDDEN` / `PROVIDER_MISMATCH` |
   | Inexistente (ou de outro provedor) | 404 | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` |
@@ -1448,14 +2139,14 @@ T20).
   - `GET /health/ready`: roda as `ReadinessCheck` em paralelo, com 2s cada; um panic numa
     verificação vira DOWN. Todas UP → 200; alguma DOWN → 503 + `Retry-After` com
     `{"status":"DOWN","checks":{"postgres":"DOWN",...}}`. A causa vai só para o log WARN.
-  - As verificações entram pelo grupo Fx `readinessChecks`. **T23** deve contribuir
-    `postgres` (`db.Ping`) e `sqs`.
+  - As verificações entram pelo grupo Fx `readinessChecks`. Desde a T23 (ADR-025) são
+    `postgres` (`db.Ping`), `sqs` (consumidor) e `http-server` (drenagem).
   - **Decisão sobre `/metrics`:** por padrão exige o serviço interno
     (`MetricsInternal`). As métricas não têm valores monetários nem ids (ADR-007), mas
     expõem volume e taxas de negócio, e a API compartilha a porta com o tráfego externo.
     `MetricsAccess = MetricsPublic` torna o path público (exato), para um scraper sem
-    OAuth em rede privada. A escolha fica para a composição (T23/T24), mantendo o padrão
-    seguro.
+    OAuth em rede privada. Na composição (T23) a escolha vem de `METRICS_ACCESS`
+    (`internal`, padrão, ou `public`).
 - **Métricas de negócio do canal HTTP.**
   - `TransactionResult(http, kind, status)` para operações novas.
   - `Duplicate(http, idempotent_replay)` nos replays e `Duplicate(http,
@@ -1519,9 +2210,9 @@ T20).
 - **Prazo.** `SHUTDOWN_TIMEOUT` (default 15s) é o orçamento **total** do Stop do
   servidor, já com a espera de drenagem. Por isso `HTTP_DRAIN_DELAY < SHUTDOWN_TIMEOUT`,
   validado na config. Vale o prazo que vencer antes: `SHUTDOWN_TIMEOUT` ou o deadline do
-  ctx do OnStop. **Nota para a T23:** quando o ctx do OnStop vence, o Fx devolve
-  `ctx.Err()` por conta própria e pode abandonar o hook. A composição deve então usar
-  `fx.StopTimeout` maior que `SHUTDOWN_TIMEOUT` mais o tempo de parada dos workers.
+  ctx do OnStop. Quando o ctx do OnStop vence, o Fx devolve `ctx.Err()` por conta própria
+  e pode abandonar o hook. Por isso a composição (T23, ADR-025) usa `fx.StopTimeout` = soma
+  dos orçamentos de todos os componentes + folga (75s com os defaults).
 - **Timeouts do `http.Server`** (config, ADR-007):
 
   | Variável | Default |
@@ -1853,12 +2544,13 @@ o `*awssqs.Client` satisfaz e os testes unitários substituem por uma fila FIFO 
     Vazamentos com a tag: o `TestMain` de integração roda todos os testes do pacote
     (unitários e de integração) e, ao fim, falha se sobrar goroutine criada por eles
     (`goleak.Find` com `IgnoreCurrent` tirado antes de `m.Run`, `runWithLeakCheck`).
-    Nesta máquina há PostgreSQL (`TEST_DATABASE_URL`), mas não há Docker nem
-    LocalStack. Os testes de integração do SQS compilam (`go vet -tags=integration`) e
-    são pulados. O comportamento está provado pelos testes unitários com `-race`.
-- **Para a T23:** compor `config.Module`, `postgres.Module`, `app.Module` e `sqs.Module`.
-  Usar `fx.StopTimeout` > `SHUTDOWN_TIMEOUT` (HTTP) + `SQS_DRAIN_TIMEOUT` + folga para os
-  releases (5s por chamada): o Fx não espera um OnStop além do seu prazo.
+    Na T20 não havia Docker nem LocalStack nesta máquina e os testes de integração do SQS
+    só compilavam (pulados sem `SQS_ENDPOINT`). Desde a T24 eles rodam contra o LocalStack
+    do Compose (`make test-integration-compose`, ADR-026), o que revelou e corrigiu o
+    defeito de shutdown descrito acima.
+- **Composição (feita na T23, ADR-025):** `sqs.Module` junto de `postgres.Module` e
+  `app.Module`. A parcela do consumidor no `fx.StopTimeout` é `sqs.StopBudget` =
+  max(`SQS_DRAIN_TIMEOUT`, `SQS_WAIT_TIME` + 5s), revisada na T24.
 
 ## ADR-023 — Worker de referências pendentes e PENDING órfãos (T21)
 
@@ -1932,8 +2624,8 @@ Pacotes `internal/app/resume_wager.go` (caso de uso `ResumeWagerTransaction` e
     teto `PENDING_REFERENCE_RETRY_MAX_DELAY` e sem overflow. `attempts` é o valor já
     incrementado.
   - Nunca agenda depois do fim do TTL, para que a expiração aconteça no prazo.
-  - A primeira espera é a do aceite (`WithReferenceRetryDelay`, padrão 2s). A T23 deve
-    passar o mesmo `PENDING_REFERENCE_RETRY_BASE_DELAY`.
+  - A primeira espera é a do aceite (`WithReferenceRetryDelay`, padrão 2s). Desde a T23 a
+    composição passa o mesmo `PENDING_REFERENCE_RETRY_BASE_DELAY` (`app.ReferenceRetryDelay`).
   - Com os defaults (2s, teto 1m, 10 buscas, TTL 10m), a última busca acontece cerca de
     5 min depois do aceite.
 - **Eventos.**
@@ -2029,13 +2721,9 @@ Pacotes `internal/app/resume_wager.go` (caso de uso `ResumeWagerTransaction` e
       referências chegando em paralelo por instâncias diferentes. Cada pendência tem
       exatamente um lançamento e um `WagerTransactionProcessed`, nenhum `event_id`
       repetido, nenhum lease sobrando, e saldo = ledger.
-- **Para a T23:**
-  - Compor `pendingworker.Module` junto de `config.Module`, `postgres.Module` e
-    `app.Module`.
-  - Prover `app.WithReferenceRetryDelay(cfg.Workers.PendingReferenceRetryBaseDelay)` ao
-    `ProcessWagerTransaction`. Hoje `app.Module` usa o padrão de 2s, igual ao default da
-    config.
-  - O `fx.StopTimeout` precisa cobrir também `PENDING_WORKER_DRAIN_TIMEOUT`.
+- **Composição (feita na T23, ADR-025):** `pendingworker.Module` com `postgres.Module` e
+  `app.Module`; `app.ReferenceRetryDelay` vem de `PENDING_REFERENCE_RETRY_BASE_DELAY`; o
+  `fx.StopTimeout` inclui `PENDING_WORKER_DRAIN_TIMEOUT`.
 
 ## ADR-024 — Publisher da outbox (T22)
 
@@ -2187,16 +2875,15 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
     - métricas de backlog e atraso; composição Fx real com `goleak.VerifyNone`.
   - SQS real (LocalStack, pulado sem `SQS_ENDPOINT`): fila FIFO exclusiva, crash entre
     publicação e marcação, e na fila exatamente dois eventos em ordem, com
-    `MessageGroupId`, `MessageDeduplicationId`, corpo e atributos conferidos. Não foi
-    executado nesta máquina (sem Docker/LocalStack).
-- **Para a T23:** compor `outboxpublisher.Module` com `config.Module`, `postgres.Module` e
-  `sqs.ClientModule` (já incluído em `sqs.Module`). Prover `*metrics.Metrics` e
-  `*slog.Logger`. O `fx.StopTimeout` precisa cobrir também `OUTBOX_DRAIN_TIMEOUT`.
-- **Para a T24:** provisionar `wager-events.fifo` (`FifoQueue=true`,
-  `ContentBasedDeduplication=false`; a deduplicação é por `eventId`). Dar à aplicação
-  permissão de `sqs:SendMessage` nessa fila e aos consumidores de eventos
-  `ReceiveMessage`/`DeleteMessage`. Rodar `TestIntegrationRealSQSPublishDedupAndRouting`
-  com `SQS_ENDPOINT`.
+    `MessageGroupId`, `MessageDeduplicationId`, corpo e atributos conferidos. Na T22 não
+    havia LocalStack nesta máquina; desde a T24 roda em `make test-integration-compose`.
+- **Composição (feita na T23, ADR-025):** `outboxpublisher.Module` com `postgres.Module` e
+  `sqs.ClientModule` (já incluído em `sqs.Module`); o `fx.StopTimeout` inclui
+  `OUTBOX_DRAIN_TIMEOUT`.
+- **Provisionamento (feito na T24, ADR-026):** `wager-events.fifo` com `FifoQueue=true` e
+  `ContentBasedDeduplication=false` (deduplicação por `eventId`); a aplicação tem
+  `sqs:SendMessage` nessa fila; consumidores de eventos precisam de
+  `ReceiveMessage`/`DeleteMessage`.
 
 ## ADR-025 — Composição Fx da aplicação e ordem de parada (T23)
 
@@ -2247,14 +2934,14 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   goleak).
 - **`fx.StopTimeout`.** Como os OnStop rodam em sequência, o pior caso é a **soma** dos
   orçamentos: `SHUTDOWN_TIMEOUT` (servidor, já inclui `HTTP_DRAIN_DELAY`) +
-  `SQS_DRAIN_TIMEOUT` + `PENDING_WORKER_DRAIN_TIMEOUT` + `OUTBOX_DRAIN_TIMEOUT` + folga de 15s.
-  A folga cobre a liberação das mensagens SQS depois do estouro da drenagem (5s por chamada,
-  em paralelo), a última marcação da outbox (`OUTBOX_PUBLISH_TIMEOUT`) e o fechamento do pool
-  e dos clients. Com os defaults: 15 + 10 + 10 + 10 + 15 = **60s**. *(Revisado na T24: a
-  parcela do SQS passou a ser `sqs.StopBudget` = max(`SQS_DRAIN_TIMEOUT`, `SQS_WAIT_TIME` +
-  5s), porque o Stop espera o último long polling (ADR-022, "Shutdown"). Com os defaults:
-  15 + 25 + 10 + 10 + 15 = **75s**. A reserva de rollback passa a 75s e o `StartTimeout` a
-  120s.)* Se o ctx vencesse antes, o
+  `sqs.StopBudget` = max(`SQS_DRAIN_TIMEOUT`, `SQS_WAIT_TIME` + 5s) +
+  `PENDING_WORKER_DRAIN_TIMEOUT` + `OUTBOX_DRAIN_TIMEOUT` + folga de 15s. A folga cobre a
+  liberação das mensagens SQS depois do estouro da drenagem (5s por chamada, em paralelo), a
+  última marcação da outbox (`OUTBOX_PUBLISH_TIMEOUT`) e o fechamento do pool e dos clients.
+  Com os defaults: 15 + 25 + 10 + 10 + 15 = **75s**. *(Histórico: na T23 a parcela do SQS
+  era só `SQS_DRAIN_TIMEOUT`, total 60s, reserva 60s e `StartTimeout` 105s. Na T24 o Stop do
+  consumidor passou a esperar o último long polling (ADR-022, "Shutdown") e os valores foram
+  revistos para 75s / 75s / 120s.)* Se o ctx vencesse antes, o
   Fx abandonaria os hooks restantes e o pool/clients não fechariam em ordem. O orquestrador
   precisa dar ao processo pelo menos esse tempo entre SIGTERM e SIGKILL (no Compose,
   `stop_grace_period`, cujo default é 10s; T24).
@@ -2265,7 +2952,7 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   ao SQS) deixaria pool, worker e publisher rodando até o `os.Exit`. Por isso o prazo é
   dividido: **orçamento** (`StartBudget` = `DATABASE_CONNECT_TIMEOUT` + 15s, default 45s) +
   **reserva de rollback** (`StartReserve` = `StopTimeout`, o pior caso de parar o que já
-  iniciou; default 60s) = `StartTimeout` (default 105s). `cmd/server` fornece a reserva
+  iniciou; default 75s) = `StartTimeout` (default 120s). `cmd/server` fornece a reserva
   (`startbudget.Reserve`) ao grafo; `postgres.DB.Start` e `sqs.Consumer.Start` derivam um ctx
   com prazo = prazo(ctx) − reserva (`startbudget.Context`) e desistem nele, devolvendo o erro
   com a reserva inteira para o rollback. Os demais OnStart (listen do HTTP, goroutines dos
@@ -2418,7 +3105,7 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   `.gitattributes` força LF em `.sh`/`.conf`/`.json`/`.yml`/Dockerfile, que são montados em
   containers Linux a partir de um checkout Windows com `core.autocrlf=true`.
 - **Achado nos testes contra o LocalStack real (resolvido na T24).**
-  `TestIntegrationConsumerShutdownReleasesVisibility` (T20) falhava sempre nesta máquina. No `Stop`, o consumidor cancela no cliente o `ReceiveMessage` em long
+  `TestIntegrationConsumerShutdownReleasesVisibility` (T20) falhava sempre nesta máquina. Na versão da T20, o `Stop` do consumidor cancelava no cliente o `ReceiveMessage` em long
   polling, mas o servidor mantém a chamada até o fim do `WaitTime`. A mensagem liberada
   (visibilidade 0) é entregue a essa chamada abandonada e fica invisível pelo
   `VisibilityTimeout` inteiro (30s), o que estoura a espera do teste. Reproduzido só com
