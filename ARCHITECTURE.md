@@ -11,7 +11,7 @@ O documento tem duas partes:
   tarefa, com contexto, alternativas, testes e notas de revisão.
 
 **Referências ao enunciado.** O enunciado do desafio está em [`docs/DESAFIO.md`](docs/DESAFIO.md)
-(era o `README.md` até a T29, ADR-030). Neste documento, em `task_plan.md` e nos comentários do
+(era o `README.md` até a T29, ADR-030). Neste documento e nos comentários do
 código, "README §N" quer dizer a seção N **do enunciado**. O [`README.md`](README.md) atual é o
 da solução: execução, variáveis, filas, migrations, exemplos e testes.
 
@@ -3550,10 +3550,10 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   `README.md` da solução" explique pré-requisitos, variáveis, filas, migrations, execução,
   exemplos e testes. Até a T28 o `README.md` era o próprio enunciado. Ele foi movido sem
   alteração (`git mv README.md docs/DESAFIO.md`, blob idêntico) e o `README.md` passou a ser o
-  da solução, com link para o enunciado. Os "README §N" já espalhados pelo ARCHITECTURE.md, pelo
-  `task_plan.md` e por comentários do código continuam valendo como referências ao enunciado;
+  da solução, com link para o enunciado. Os "README §N" já espalhados pelo ARCHITECTURE.md e
+  por comentários do código continuam valendo como referências ao enunciado;
   em vez de reescrever dezenas de comentários, a convenção ficou registrada no topo deste
-  documento e do `task_plan.md`.
+  documento.
 - **Conteúdo.** Pré-requisitos (Go 1.25+, Docker Compose, gcc para `-race`, make opcional),
   variáveis (o `.env.example` já cobria todas as lidas por `internal/platform/config`; o
   README só agrupa e aponta para ele), filas e contratos de produtor (grupo `walletId`, dedup

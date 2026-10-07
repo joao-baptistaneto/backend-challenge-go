@@ -1,6 +1,5 @@
 # Só go.mod/go.sum, cmd/, internal/ e migrations/ entram no build.
 .git
-.claude
 .env
 .env.*
 bin
