@@ -5,12 +5,15 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 )
@@ -189,6 +192,16 @@ func TestRepositories_ValidateBeforeSQL(t *testing.T) {
 			_, err := wagers.GetClaimedForUpdate(ctx, q, unitWalletID, uuid.New())
 			return err
 		}(), ErrTxRequired},
+		"failure lock outside tx": {func() error {
+			_, err := wagers.LockClaimedForFailure(ctx, q, unitWalletID, uuid.New())
+			return err
+		}(), ErrTxRequired},
+		"record failure outside tx": {wagers.RecordResumeFailure(ctx, q, ResumeFailureParams{
+			ID: unitWalletID, Token: uuid.New(), Failures: 1, HoldUntil: unitT0,
+		}), ErrTxRequired},
+		"fail unreadable outside tx": {wagers.FailClaimedUnreadable(ctx, q, FailClaimedParams{
+			ID: unitWalletID, Token: uuid.New(), From: domain.WagerStatusPending, Code: domain.FailureCodeRetriesExhausted, Now: unitT0,
+		}), ErrTxRequired},
 		"claim zero now":    {claimErr(ClaimParams{Token: uuid.New(), Lease: time.Second, Limit: 1}), ErrInvalidClaim},
 		"claim nil token":   {claimErr(ClaimParams{Now: unitT0, Lease: time.Second, Limit: 1}), ErrInvalidClaim},
 		"claim short lease": {claimErr(ClaimParams{Now: unitT0, Token: uuid.New(), Lease: time.Microsecond, Limit: 1}), ErrInvalidClaim},
@@ -210,5 +223,60 @@ func TestRepositories_ValidateBeforeSQL(t *testing.T) {
 	// Sem movimento (LOSS): Update não executa SQL.
 	if err := wallets.Update(ctx, q, rehydratedWallet(t, "5.00", 2)); err != nil {
 		t.Fatalf("unchanged wallet: %v", err)
+	}
+}
+
+// fakeWagerRow devolve valores fixos para scanWager, na ordem de
+// wagerColumns.
+type fakeWagerRow []any
+
+func (r fakeWagerRow) Scan(dest ...any) error {
+	if len(dest) != len(r) {
+		return fmt.Errorf("fake row: %d destinations, %d values", len(dest), len(r))
+	}
+	for i, v := range r {
+		reflect.ValueOf(dest[i]).Elem().Set(reflect.ValueOf(v))
+	}
+	return nil
+}
+
+func pendingReferenceRow(currency string, round string) fakeWagerRow {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	text := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
+	return fakeWagerRow{
+		uuid.New(), "EXTERNAL", "ROLLBACK", "PENDING_REFERENCE", uuid.New(), uuid.New(), int64(1000), currency,
+		text("provider-a"), text("rb-1"), text("provider-a:rb-1"), text(strings.Repeat("ab", 32)), text(round), text("game-1"),
+		text("bet-1"), pgtype.UUID{}, pgtype.Text{}, pgtype.Int8{},
+		int32(1), pgtype.Timestamptz{Time: now, Valid: true}, now, now, pgtype.Timestamptz{},
+	}
+}
+
+// Toda falha de reidratação de uma linha lida — inclusive a do Money (moeda
+// bem formada para o CHECK, mas não suportada) — é marcada com
+// domain.ErrCorruptedWagerTransaction: é estado persistido inválido, não erro
+// de entrada (ValidationFailureCode não a mapeia), e o worker a encerra pelo
+// caminho sem agregado (T30, ADR-031).
+func TestScanWager_RehydrationErrorsAreCorrupted(t *testing.T) {
+	if _, err := scanWager(pendingReferenceRow("BRL", "round-1")); err != nil {
+		t.Fatalf("valid row: %v", err)
+	}
+	for name, row := range map[string]fakeWagerRow{
+		"unsupported currency": pendingReferenceRow("XYZ", "round-1"),
+		"control char":         pendingReferenceRow("BRL", "round-1\x01"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := scanWager(row)
+			if !errors.Is(err, domain.ErrCorruptedWagerTransaction) {
+				t.Fatalf("err = %v, want ErrCorruptedWagerTransaction", err)
+			}
+			if code, ok := domain.ValidationFailureCode(err); ok {
+				t.Fatalf("corrupted row mapped to input failure %s", code)
+			}
+		})
+	}
+	balance := pendingReferenceRow("XYZ", "round-1")
+	balance[17] = pgtype.Int8{Int64: 5, Valid: true}
+	if _, err := scanWager(balance); !errors.Is(err, domain.ErrCorruptedWagerTransaction) || !errors.Is(err, domain.ErrInvalidCurrency) {
+		t.Fatalf("balance_after err = %v", err)
 	}
 }

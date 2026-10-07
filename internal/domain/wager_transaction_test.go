@@ -891,6 +891,33 @@ func TestWagerTransaction_FailRequiresInfrastructureCode(t *testing.T) {
 	}
 }
 
+// ValidateFailTransition (T30) é a regra de Fail sem o agregado: para cada
+// estado e código, as duas concordam.
+func TestValidateFailTransition_AgreesWithFail(t *testing.T) {
+	now := testT0.Add(time.Minute)
+	for _, s := range allWagerStatuses {
+		for _, code := range AllFailureCodes() {
+			tx := refundIn(t, s)
+			failErr := tx.Fail(FailWagerParams{Code: code, Now: now})
+			valErr := ValidateFailTransition(s, code)
+			if (failErr == nil) != (valErr == nil) {
+				t.Fatalf("%s/%s: Fail err %v, ValidateFailTransition err %v", s, code, failErr, valErr)
+			}
+			if s.IsTerminal() {
+				assertErrs(t, valErr, ErrWagerTransactionTerminal, ErrWagerTransitionNotAllowed)
+			} else if code.Category() != FailureCategoryInfrastructure {
+				assertErrs(t, valErr, ErrInvalidFailureCode)
+			}
+		}
+	}
+	assertErrs(t, ValidateFailTransition("", FailureCodeRetriesExhausted), ErrWagerTransitionNotAllowed)
+	assertErrs(t, ValidateFailTransition("pending", FailureCodeRetriesExhausted), ErrWagerTransitionNotAllowed)
+	assertErrs(t, ValidateFailTransition(WagerStatusPending, "NOPE"), ErrInvalidFailureCode)
+	if err := ValidateFailTransition(WagerStatusPendingReference, FailureCodeRetriesExhausted); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWagerTransaction_UpdatedAtMonotonic(t *testing.T) {
 	tx := newExternal(t, WagerKindBet)
 	earlier := testT0.Add(-time.Hour) // relógio atrasado de outra instância

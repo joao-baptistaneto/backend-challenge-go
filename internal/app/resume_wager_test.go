@@ -34,7 +34,7 @@ func (c *testClock) Advance(d time.Duration) {
 }
 
 func testPolicy() app.PendingWagerPolicy {
-	return app.PendingWagerPolicy{MaxAttempts: 4, TTL: time.Hour, RetryBaseDelay: 2 * time.Second, RetryMaxDelay: 10 * time.Second}
+	return app.PendingWagerPolicy{MaxAttempts: 4, TTL: time.Hour, RetryBaseDelay: 2 * time.Second, RetryMaxDelay: 10 * time.Second, MaxResumeFailures: 3}
 }
 
 func newResume(t *testing.T, u app.UnitOfWork, clock *testClock, policy app.PendingWagerPolicy) *app.ResumeWagerTransaction {
@@ -90,7 +90,7 @@ func wagerByID(t *testing.T, u *memUoW, id uuid.UUID) *domain.WagerTransaction {
 }
 
 func TestPendingWagerPolicy_DelayAndValidate(t *testing.T) {
-	p := app.PendingWagerPolicy{MaxAttempts: 3, TTL: time.Minute, RetryBaseDelay: time.Second, RetryMaxDelay: 10 * time.Second}
+	p := app.PendingWagerPolicy{MaxAttempts: 3, TTL: time.Minute, RetryBaseDelay: time.Second, RetryMaxDelay: 10 * time.Second, MaxResumeFailures: 3}
 	want := map[int32]time.Duration{0: time.Second, 1: time.Second, 2: 2 * time.Second, 3: 4 * time.Second, 4: 8 * time.Second, 5: 10 * time.Second, 1 << 30: 10 * time.Second}
 	for attempts, d := range want {
 		if got := p.Delay(attempts); got != d {
@@ -105,10 +105,11 @@ func TestPendingWagerPolicy_DelayAndValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, bad := range map[string]app.PendingWagerPolicy{
-		"zero attempts": {MaxAttempts: 0, TTL: time.Minute, RetryBaseDelay: time.Second, RetryMaxDelay: time.Second},
-		"zero ttl":      {MaxAttempts: 1, RetryBaseDelay: time.Second, RetryMaxDelay: time.Second},
-		"zero base":     {MaxAttempts: 1, TTL: time.Minute, RetryMaxDelay: time.Second},
-		"max < base":    {MaxAttempts: 1, TTL: time.Minute, RetryBaseDelay: time.Minute, RetryMaxDelay: time.Second},
+		"zero attempts": {MaxAttempts: 0, TTL: time.Minute, RetryBaseDelay: time.Second, RetryMaxDelay: time.Second, MaxResumeFailures: 1},
+		"zero ttl":      {MaxAttempts: 1, RetryBaseDelay: time.Second, RetryMaxDelay: time.Second, MaxResumeFailures: 1},
+		"zero base":     {MaxAttempts: 1, TTL: time.Minute, RetryMaxDelay: time.Second, MaxResumeFailures: 1},
+		"max < base":    {MaxAttempts: 1, TTL: time.Minute, RetryBaseDelay: time.Minute, RetryMaxDelay: time.Second, MaxResumeFailures: 1},
+		"zero failures": {MaxAttempts: 1, TTL: time.Minute, RetryBaseDelay: time.Second, RetryMaxDelay: time.Second},
 	} {
 		if bad.Validate() == nil {
 			t.Errorf("%s: accepted", name)
@@ -239,7 +240,7 @@ func TestResumeWager_ExpiresByTTLAndCapsBackoffAtDeadline(t *testing.T) {
 	u := newMemUoW()
 	seedWallet(t, u, "100.00")
 	id := pendingRollback(t, u)
-	policy := app.PendingWagerPolicy{MaxAttempts: 100, TTL: 5 * time.Second, RetryBaseDelay: 2 * time.Second, RetryMaxDelay: time.Minute}
+	policy := app.PendingWagerPolicy{MaxAttempts: 100, TTL: 5 * time.Second, RetryBaseDelay: 2 * time.Second, RetryMaxDelay: time.Minute, MaxResumeFailures: 3}
 	clock := &testClock{now: fixedNow.Add(2 * time.Second)}
 	uc := newResume(t, u, clock, policy)
 

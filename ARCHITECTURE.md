@@ -7,7 +7,7 @@ O documento tem duas partes:
 - **Parte I — Síntese (seções 1 a 18).** Uma seção por tema exigido no enunciado, com o estado
   **atual** do código, valores padrão e links para os ADRs detalhados. Quando um ADR antigo
   diverge da Parte I (valores revisados depois, pendências já resolvidas), vale a Parte I.
-- **Parte II — Registro de decisões (ADR-001 a ADR-030).** Histórico incremental, um ADR por
+- **Parte II — Registro de decisões (ADR-001 a ADR-031).** Histórico incremental, um ADR por
   tarefa, com contexto, alternativas, testes e notas de revisão.
 
 **Referências ao enunciado.** O enunciado do desafio está em [`docs/DESAFIO.md`](docs/DESAFIO.md)
@@ -39,7 +39,7 @@ da solução: execução, variáveis, filas, migrations, exemplos e testes.
 18. [Interpretações adotadas, limitações, trade-offs e trabalho não concluído](#18-interpretações-adotadas-limitações-trade-offs-e-trabalho-não-concluído)
 
 **Parte II — Registro de decisões:** [ADR-001](#adr-001--módulo-versão-go-e-dependências-base-t01)
-a [ADR-030](#adr-030--readme-da-solução-e-verificação-final-t29).
+a [ADR-031](#adr-031--failed-por-esgotamento-no-worker-de-pendências-t30).
 
 **Mapa enunciado ([docs/DESAFIO.md](docs/DESAFIO.md)) → seção**
 
@@ -51,9 +51,9 @@ a [ADR-030](#adr-030--readme-da-solução-e-verificação-final-t29).
 | §4 Fx: módulos, `fx.Lifecycle`, prazos, shutdown, ordem de fechamento | 15 | 021, 022, 023, 024, 025 |
 | §6.1 representação e limites de `Money`, normalização antes do hash | 3, 5 | 004, 010 |
 | §6.2 estratégia de controle de concorrência | 6 | 005, 014, 017 |
-| §6.3 máquina de estados, transitório × permanente | 7 | 008, 013, 017 |
+| §6.3 máquina de estados, transitório × permanente | 7 | 008, 013, 017, 031 |
 | §7 combinações `REFUND`/`ROLLBACK` | 9 | 009, 011 |
-| §7 tentativas/TTL, referência pendente ou terminada sem sucesso | 8 | 009, 023 |
+| §7 tentativas/TTL, referência pendente ou terminada sem sucesso | 8 | 009, 023, 031 |
 | §7 `failureCode` estável, corrigível × definitivo | 10 | 008, 009 |
 | §9 algoritmo, campos e normalizações do hash; equivalência HTTP × SQS | 5 | 010, 020, 022 |
 | §9 códigos HTTP e corpos (inválido, conflito, rejeição, pendente, indisponível) | 16 | 020 |
@@ -213,8 +213,8 @@ Detalhes: ADR-011, ADR-013, ADR-014, ADR-016, ADR-018.
 - **Rollback e retry:** erro, panic ou `Goexit` em `fn` → ROLLBACK (com 5s próprios, mesmo com
   o ctx cancelado). Retry opt-in por chamada (`DefaultRetryPolicy`: 4 execuções, 10ms→250ms com
   jitter) só para SQLSTATE transitórios (`40001`, `40P01`, `55P03`, `57014`, `08xxx`,
-  `57P01-03`, `53300`) e, no `ProcessWagerTransaction`, para a duplicata perdedora de uma
-  corrida de UNIQUE (a nova tentativa vê a linha vencedora e devolve o replay). **Commit
+  `57P01-03`, `53000`, `53100`, `53200`, `53300`, `25006`) e, no `ProcessWagerTransaction`,
+  para a duplicata perdedora de uma corrida de UNIQUE (a nova tentativa vê a linha vencedora e devolve o replay). **Commit
   ambíguo** (`ErrCommitOutcomeUnknown`) nunca é repetido internamente: vira 503 / mensagem não
   apagada, e a nova tentativa externa passa pela idempotência.
 - **Mapeamento:** `Money` ↔ `BIGINT` + `CHAR(3)`; UUIDs ↔ `UUID`; valores vazios do domínio ↔
@@ -286,7 +286,7 @@ Detalhes: ADR-005, ADR-009, ADR-014, ADR-017, ADR-023, ADR-027, ADR-028.
 
 ## 7. Máquina de estados; falha transitória × permanente
 
-Detalhes: ADR-008, ADR-013, ADR-017.
+Detalhes: ADR-008, ADR-013, ADR-017, ADR-031.
 
 | De \ Para | `PENDING_REFERENCE` | `PROCESSED` | `REJECTED` | `FAILED` |
 | --- | --- | --- | --- | --- |
@@ -302,21 +302,54 @@ Detalhes: ADR-008, ADR-013, ADR-017.
   Um `PENDING` confirmado só existiria num aceite interrompido; o worker o retoma como órfão
   (`PENDING_ORPHAN_GRACE`).
 - **Transitório:** timeout, serialização, deadlock, lock timeout, conexão, `57P0x`, `53300`,
-  IdP sem chaves. **Não vira estado**: a transação faz rollback e é refeita (retry interno
+  recursos do servidor esgotados (`53000`, `53100` disco cheio, `53200` sem memória), escrita
+  em servidor somente leitura (`25006`, failover), IdP sem chaves. **Não vira estado**: a transação faz rollback e é refeita (retry interno
   limitado, reentrega SQS com backoff, nova chamada do provedor após 503, lease do worker). O
   registro continua inexistente, `PENDING` ou `PENDING_REFERENCE`.
 - **Permanente de negócio:** `REJECTED` com `failureCode` `INPUT` ou `BUSINESS`, persistido e
   com evento.
-- **Permanente de infraestrutura:** `FAILED` com código `INFRASTRUCTURE`
-  (`PROCESSING_FAILED`, `RETRIES_EXHAUSTED`) é suportado pelo domínio, pelo schema e pelo
-  contrato HTTP (422), mas **nenhum fluxo atual grava `FAILED`** (seção 18): transitórios
-  esgotados no SQS vão para a DLQ sem tocar no banco, e no HTTP o provedor recebe 503 e repete.
+- **Permanente de infraestrutura:** `FAILED RETRIES_EXHAUSTED`, gravado **só pelo worker de
+  pendências** (ADR-031) quando a retomada de um item falha sempre:
+  - **O que conta como falha:** todo erro da retomada que **não** é transitório. Ex.: a linha,
+    a carteira ou a referência não reidratam (`ErrCorrupted*`), violação de constraint, erro
+    de domínio inesperado, erro interno. **Não contam** `ErrUnavailable` (conexão, `57P0x`,
+    serialização, deadlock, lock/statement timeout, commit ambíguo, prazo) nem o cancelamento
+    do próprio ctx (shutdown, `PENDING_WORKER_PROCESS_TIMEOUT`). Assim, uma queda do
+    PostgreSQL só adia os itens (eles voltam pelo lease, como antes) e nunca leva um item bom a
+    `FAILED`.
+  - **Contagem e backoff:** numa transação curta e própria, com o fencing do lease
+    (`claimed_by = token`, `FOR NO KEY UPDATE`, sem reidratar), `resume_failures += 1` (coluna
+    operacional da `0009`, fora do agregado) e `claimed_until = agora +
+    PENDING_REFERENCE_RETRY_BASE_DELAY · 2^(falhas−1)` (teto `..._MAX_DELAY`). O próprio lease
+    é o backoff: `status`, `attempts` e `next_attempt_at` não mudam. Uma retomada que grava a
+    transição zera o contador (falhas **consecutivas**).
+  - **Esgotamento:** na falha de número `PENDING_WORKER_MAX_FAILURES` (padrão 5: com os
+    defaults, ~30s de 2s+4s+8s+16s) ou na primeira falha depois de `PENDING_REFERENCE_TTL`
+    desde a criação, uma **segunda** transação curta, depois do commit da contagem, grava
+    `FAILED RETRIES_EXHAUSTED`: pelo domínio (`WagerTransaction.Fail` + `Update`) quando a
+    linha reidrata; quando a própria linha não reidrata (por **qualquer** erro não transitório,
+    inclusive `Money` com moeda não suportada) ou a gravação pelo agregado falha,
+    numa transação nova, `domain.ValidateFailTransition(status, código)` valida a aresta e um
+    `UPDATE` com fencing grava só as colunas de resultado (os CHECKs de `FAILED` são a barreira
+    final). Como a contagem já foi confirmada, um erro ao gravar `FAILED` **não desfaz o
+    incremento**: o item volta depois do backoff (no máximo `..._MAX_DELAY`), conta de novo e
+    tenta outra vez; nunca fica preso abaixo do limite.
+    Sem lock de carteira, sem saldo, sem ledger e sem evento (seção 13); `resume_failures`
+    fica na linha para auditoria; log ERROR e `wager_transactions_total{source="worker",
+    status="FAILED"}`.
+  - **Replay** de uma operação `FAILED` (HTTP ou SQS) devolve o estado final: HTTP 422
+    `{status: FAILED, failureCode: RETRIES_EXHAUSTED, failureCategory: INFRASTRUCTURE}`; no
+    SQS a mensagem é concluída e apagada como as demais terminais. Operações que citam uma
+    referência `FAILED` são rejeitadas com `REFERENCE_NOT_PROCESSED` (seção 8).
+  - Fora do worker continua sem `FAILED`: transitórios esgotados no SQS vão para a DLQ sem
+    tocar no banco, e no HTTP o provedor recebe 503 e repete (não há linha pendente a encerrar,
+    porque o aceite é síncrono). `PROCESSING_FAILED` continua reservado (nenhum fluxo o grava).
 - Entradas inválidas que impedem construir a transação (parsing, `OPENING` externo) não criam
   linha nem evento: são 400 no HTTP e DLQ no SQS.
 
 ## 8. Referências pendentes: tentativas, backoff e TTL
 
-Detalhes: ADR-009, ADR-017, ADR-023.
+Detalhes: ADR-009, ADR-017, ADR-023, ADR-031.
 
 - Referência ausente → a operação é gravada `PENDING_REFERENCE` (`attempts = 1`,
   `next_attempt_at = agora + PENDING_REFERENCE_RETRY_BASE_DELAY`) com o evento
@@ -336,7 +369,11 @@ Detalhes: ADR-009, ADR-017, ADR-023.
 - **Referência terminada sem sucesso** (`REJECTED`/`FAILED`): rejeição imediata com
   `REFERENCE_NOT_PROCESSED`, sem esperar.
 - Defaults: base 2s, teto 1m, 10 buscas, TTL 10m (a última busca acontece ~5 min após o
-  aceite); poll 1s, lote 20, concorrência 4, lease 30s, prazo por item 5s.
+  aceite); poll 1s, lote 20, concorrência 4, lease 30s, prazo por item 5s,
+  5 falhas consecutivas não transitórias da retomada antes de `FAILED`.
+- **Item envenenado** (a retomada falha sempre, por erro não transitório): falhas contadas com
+  backoff no lease e, esgotado `PENDING_WORKER_MAX_FAILURES` ou o TTL, `FAILED
+  RETRIES_EXHAUSTED` sem evento e sem movimento (seção 7). Não bloqueia os demais itens do lote.
 - O replay de uma operação pendente devolve o estado atual (202 enquanto pendente; o estado
   final depois da resolução).
 
@@ -363,14 +400,14 @@ Detalhes: ADR-009, ADR-011.
 
 ## 10. `failureCode`s
 
-Detalhes: ADR-008, ADR-009. Contrato público estável (`domain.AllFailureCodes()`), com
+Detalhes: ADR-008, ADR-009, ADR-031. Contrato público estável (`domain.AllFailureCodes()`), com
 `failureCategory` no corpo e nos eventos.
 
 | Categoria | Significado | Códigos |
 | --- | --- | --- |
 | `INPUT` | corrigível: o provedor corrige e envia **uma nova** operação | `INVALID_REQUEST`, `INVALID_KIND`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH`, `CURRENCY_MISMATCH`, `REFERENCE_MISMATCH`, `AMOUNT_MISMATCH` |
 | `BUSINESS` | resultado definitivo | `INSUFFICIENT_FUNDS` (só `BET`), `REVERSAL_INSUFFICIENT_FUNDS` (só `ROLLBACK`), `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_REVERSIBLE`, `REFERENCE_NOT_PROCESSED`, `ALREADY_REVERSED` |
-| `INFRASTRUCTURE` | só em `FAILED` (não gravado hoje, seção 7) | `PROCESSING_FAILED`, `RETRIES_EXHAUSTED` |
+| `INFRASTRUCTURE` | só em `FAILED`: falha permanente de infraestrutura registrada para auditoria; não é corrigível pelo provedor nem resultado de negócio | `RETRIES_EXHAUSTED` (gravado pelo worker de pendências quando a retomada de um item falha `PENDING_WORKER_MAX_FAILURES` vezes seguidas ou depois do TTL, seção 7), `PROCESSING_FAILED` (reservado; nenhum fluxo grava) |
 
 Os códigos de `INPUT` de formato (`INVALID_*`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`)
 normalmente saem como **400 sem persistência** (validação antes da transação); os de carteira
@@ -475,7 +512,13 @@ Detalhes: ADR-012, ADR-024.
   consumidor. Ordem garantida só dentro do grupo; para relacionar transação e saldo, usar
   `walletVersion` (monotônica por carteira) e `transactionId`.
 - `idempotencyKey`, `requestHash` e (em rejeições) `referenceTransactionId` nunca entram nos
-  eventos. `FAILED` não gera evento.
+  eventos.
+- **`FAILED` não gera evento** (reavaliado na T30, ADR-031): o enunciado (§11) exige eventos
+  para conclusão, rejeição de negócio, saldo e espera por referência, e `FAILED` não é nenhum
+  deles. É um registro de auditoria de falha de infraestrutura, que pede ação de operação, não
+  de consumidores; fica visível na consulta da transação, no replay (422), no log ERROR e em
+  `wager_transactions_total{status="FAILED"}`. Um evento novo (`WagerTransactionFailed`)
+  ampliaria o contrato da fila sem consumidor que o exija; fica como evolução possível.
 
 ## 14. Autenticação (OIDC) e autorização
 
@@ -594,6 +637,11 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
   `outbox_publish_delay_seconds`, `processing_duration_seconds`,
   `http_request_duration_seconds`, `reconciliations_total` e
   `reconciliation_divergences_total`. Sem valores monetários e sem IDs em rótulos.
+- **Itens envenenados do worker de pendências** (ADR-031): cada falha contada sai em WARN
+  (`resumeFailures`, `heldUntil`) e em `processing_duration_seconds{source="worker",
+  outcome="error"}`; o encerramento sai em ERROR e em
+  `wager_transactions_total{source="worker",status="FAILED"}` (alerta recomendado: qualquer
+  incremento). `resume_failures` fica na linha para auditoria.
 - **Reconciliação:** `POST /wallets/{id}/reconciliation` em `REPEATABLE READ READ ONLY`;
   `difference = stored − calculated`; divergência → resposta, log WARN e métrica; nada é
   corrigido.
@@ -627,13 +675,29 @@ Detalhes: ADR-007 e as seções de logs/métricas de cada ADR.
 
 **Limitações e trade-offs**
 
-- **`FAILED` não é produzido por nenhum fluxo.** O estado, os códigos `PROCESSING_FAILED`/
-  `RETRIES_EXHAUSTED`, os CHECKs e o 422 existem, mas falhas transitórias esgotadas terminam
-  na DLQ (SQS) ou em 503 (HTTP) sem registro `FAILED`; a auditoria dessas falhas fica em logs,
-  métricas e na DLQ.
-- **Item envenenado no worker de pendências** (linha que não reidrata, erro permanente): volta
-  a cada `PENDING_WORKER_LEASE`, sem poison counter nem transição para `FAILED` (log WARN e
-  métrica `outcome="error"`).
+- **`FAILED` só no worker de pendências** (ADR-031). É o único lugar onde existe uma linha
+  confirmada e não terminal que pode falhar para sempre. Transitórios esgotados no SQS
+  continuam indo à DLQ sem tocar no banco, e no HTTP viram 503 (o aceite é síncrono: não há
+  linha a encerrar); a auditoria deles fica em logs, métricas e na DLQ. `PROCESSING_FAILED`
+  continua reservado.
+- **Erro não classificado conta como permanente.** A fronteira transitório × permanente é a
+  de `ErrUnavailable` (ADR-013). Um erro transitório que o adapter não reconheça seria contado;
+  com 5 falhas seguidas e backoff (~30s), uma falha curta e desconhecida não esgota o limite,
+  mas uma longa poderia. A contrapartida é a garantia de término de todo item envenenado.
+  Por isso disco/memória esgotados (`53000`, `53100`, `53200`) e escrita em servidor somente
+  leitura (`25006`, failover) passaram a ser transitórios: são condições do ambiente, não do
+  item (`53400`, limite de configuração, continua permanente).
+- **Contagem e encerramento em commits separados** (ADR-031). A contagem é confirmada antes
+  de tentar gravar `FAILED`, para que nenhum erro do encerramento desfaça o incremento (a causa
+  do loop infinito achado na avaliação da T30). Limite residual: se nem o `UPDATE` sem agregado
+  conseguir gravar `FAILED` (ex.: trigger ou CHECK recusando a linha), o item não termina
+  sozinho, mas não gira livre: volta no máximo a cada `PENDING_REFERENCE_MAX_DELAY`, sempre
+  contando, com log ERROR por rodada, sem mover saldo. Exige intervenção manual.
+- **Falha depois do TTL encerra na hora:** uma pendência que já passou de
+  `PENDING_REFERENCE_TTL` e falha por erro não transitório vira `FAILED` na primeira falha (o
+  prazo da operação já acabou; sem a falha ela teria virado `REJECTED REFERENCE_NOT_FOUND`).
+- **`FAILED` sem evento** (seção 13): consumidores da fila de eventos não ficam sabendo do
+  encerramento; operação acompanha pelo log ERROR e pela métrica.
 - **Pendências não são "acordadas"** quando a referência chega: a resolução espera o próximo
   `next_attempt_at` (no máximo `PENDING_REFERENCE_RETRY_MAX_DELAY`, 1m).
 - **Revogação de token** só vale na expiração (validação local por JWKS).
@@ -1304,7 +1368,7 @@ do `fx.New` e injetada com `fx.Supply`, em vez de `config.Module`.
   da carteira (T14). Saldo zero não gera eventos. OPENING nunca fica pendente nem é
   rejeitado.
 - **FAILED:** não gera evento de integração (não é rejeição de negócio); fica visível em
-  métricas, logs e na consulta da transação.
+  métricas, logs e na consulta da transação. *(Reavaliado e mantido na T30, ADR-031.)*
 - **PendingReference:** a política (T15/T21) é emitir na transição `PENDING` →
   `PENDING_REFERENCE` (`attempts = 1`); reagendamentos do worker não precisam emitir de
   novo. O domínio não impõe isso; `attempts` vai no payload.
@@ -1345,9 +1409,10 @@ Pacote `internal/adapters/postgres` (`pool.go`, `tx.go`, `errors.go`, `module.go
   `fn` é reexecutável: não pode ter efeito fora do banco e precisa recalcular tudo a partir do
   que lê no tx. Sem `WithRetry` há uma única tentativa. `DefaultRetryPolicy(op)` faz 4 execuções
   com backoff de 10ms, dobrando até 250ms, com equal jitter. Só se repete o que é
-  `IsRetryable`: `40001`, `40P01`, `55P03`, `57014`, `08xxx`, `57P01-03` e `53300` vindos do
-  servidor (inclusive no COMMIT, porque se o servidor respondeu, não confirmou), além de falha de
-  conexão antes do COMMIT. `RetryPolicy.RetryIf` amplia isso. Uso previsto na T15: corrida no
+  `IsRetryable`: `40001`, `40P01`, `55P03`, `57014`, `08xxx`, `57P01-03`, `53300` (e, desde
+  a T30, `53000`/`53100`/`53200` e `25006`, ADR-031) vindos do servidor (inclusive no
+  COMMIT, porque se o servidor respondeu, não confirmou), além de falha de conexão antes do
+  COMMIT. `RetryPolicy.RetryIf` amplia isso. Uso previsto na T15: corrida no
   UNIQUE de idempotência, em que a nova tentativa lê a linha vencedora e devolve o replay. Cada
   nova tentativa incrementa `wallet_retries_total{operation}` e, nos conflitos,
   `wallet_concurrency_conflicts_total{kind}` (serialization/deadlock/lock_timeout/unique), e
@@ -2688,7 +2753,9 @@ Pacotes `internal/app/resume_wager.go` (caso de uso `ResumeWagerTransaction` e
 - **Limitações.**
   - Um item que falha sempre (ex.: dado corrompido que não reidrata) volta a cada lease,
     sem limite, com log WARN e métrica `outcome="error"`. Não há poison counter nem
-    transição para `FAILED`.
+    transição para `FAILED`. *(Resolvido na T30, ADR-031: falhas não transitórias
+    consecutivas são contadas em `resume_failures` com backoff no lease, e o item vira
+    `FAILED RETRIES_EXHAUSTED` ao esgotar `PENDING_WORKER_MAX_FAILURES` ou o TTL.)*
   - Pendências não são "acordadas" quando a referência chega: a resolução espera o próximo
     `next_attempt_at`, que é no máximo `RETRY_MAX_DELAY` depois. O índice
     `wager_transactions_reference_external_idx` permite acrescentar isso depois.
@@ -3455,3 +3522,156 @@ O repositório da T13 ganhou três mudanças: o claim com ordem por agregado, `R
   `CGO_ENABLED=1 go test -race -count=1 ./...`; integração completa contra o Compose
   (`-race -tags=integration -p 1 -count=1 ./...`, nenhum teste pulado) e multi-instância/falhas
   (`-tags=integration,multiinstance`, ~2 min) passando. Nenhuma mudança de código Go.
+
+## ADR-031 — FAILED por esgotamento no worker de pendências (T30)
+
+- **Contexto.** A revisão final (lacunas L1+L2) apontou que `WagerTransaction.Fail` não tinha
+  chamador em produção e que um item do worker de pendências que falha sempre (ex.: linha que
+  não reidrata) voltava a cada `PENDING_WORKER_LEASE` para sempre: TTL e máximo de tentativas
+  só eram avaliados quando `Resume` chegava à decisão, e um erro antes disso só gerava log e
+  métrica.
+- **Decisão: o que conta como falha.** `Resume` classifica o erro (`classify`); não contam
+  `ErrUnavailable` (todas as falhas transitórias do ADR-013: conexão, `57P0x`, `53300`,
+  serialização, deadlock, lock/statement timeout, commit ambíguo, prazo) e o cancelamento do
+  ctx do próprio worker (shutdown ou `PENDING_WORKER_PROCESS_TIMEOUT`). Esses erros não dizem
+  nada sobre o item; contá-los faria uma queda do PostgreSQL levar itens bons a `FAILED`. Eles
+  continuam como antes: rollback, retry interno limitado e retorno pelo lease. Todo o resto
+  conta: `ErrCorrupted*` (linha, carteira ou referência), violação de constraint, erro de
+  domínio inesperado em `DecideWager`/`ApplyWagerDecision`, erro interno. Alternativa
+  descartada: contar tudo e confiar num limite alto. Ela não distingue "o banco caiu" de "o
+  item é ruim". Outra alternativa descartada: contar só reidratação. Ela deixaria em loop os
+  outros erros permanentes.
+- **Decisão: onde fica o contador.** Coluna nova `wager_transactions.resume_failures INTEGER NOT
+  NULL DEFAULT 0 CHECK (>= 0)` (migration `0009`, sem editar as antigas; ADD COLUMN com default
+  constante não reescreve a tabela). `attempts` não foi reaproveitado: ele conta **buscas de
+  referência** (ADR-008), aparece no evento `WagerTransactionPendingReference` e tem CHECKs
+  próprios (`attempts > 0` exige referência e proíbe `PENDING`). Misturar os dois mudaria a
+  política de `REFERENCE_NOT_FOUND` e quebraria o PENDING órfão. Como `claimed_by`/
+  `claimed_until` (0007), `resume_failures` é dado operacional do worker, fora do agregado: o
+  domínio não o lê nem o valida.
+- **Decisão: contagem e backoff.** Depois do rollback da retomada, roda uma transação curta e
+  própria só para contar (`handleFailure` → `countFailure`, `Retry: true`, reexecutável), e
+  ela é **confirmada antes** de qualquer tentativa de encerramento (passo 3):
+  1. `LockClaimedForFailure`: `SELECT status, created_at, resume_failures ... WHERE id = $1 AND
+     claimed_by = $token FOR NO KEY UPDATE`. É o mesmo fencing do `GetClaimedForUpdate`, mas
+     **sem reidratar**, para funcionar justamente na linha corrompida. Se o lease foi perdido,
+     a falha não é registrada: o dono atual decide.
+  2. `RecordResumeFailure`: `resume_failures = n`, `claimed_until = agora + Delay(n)`
+     (`PENDING_REFERENCE_RETRY_BASE_DELAY · 2^(n−1)`, teto `..._MAX_DELAY`). **O backoff é o
+     próprio lease**: o `ClaimDue` só devolve a linha depois dele, o token continua valendo e
+     nenhuma coluna do agregado muda (`status`, `attempts`, `next_attempt_at`, `updated_at`).
+     Alternativa descartada: reagendar `next_attempt_at`. Ele é do domínio, está limitado ao
+     TTL e não existe em `PENDING`.
+  3. Esgotado (`n >= PENDING_WORKER_MAX_FAILURES` ou `agora >= created_at + TTL`),
+     `failExhausted` grava `FAILED` numa **segunda** transação curta (com o mesmo token; o
+     lease foi estendido no passo 2). Se a linha reidrata: `GetClaimedForUpdate` →
+     `WagerTransaction.Fail(RETRIES_EXHAUSTED)` → `Update`. Se a própria linha não reidrata
+     por **qualquer** erro não transitório (não só `ErrCorruptedWagerTransaction`), ou se
+     `Fail`/`Update` falham de forma não transitória, o encerramento é refeito numa transação
+     **nova** (a anterior pode ter sido abortada pelo servidor): `LockClaimedForFailure` relê
+     o estado e a aresta é validada por
+     `domain.ValidateFailTransition(status, código)`. É uma função nova do domínio, com a
+     mesma regra de `Fail`: estado conhecido, não terminal, com aresta para `FAILED`, e código
+     `INFRASTRUCTURE`. Depois, `FailClaimedUnreadable` roda um `UPDATE ... WHERE id AND
+     claimed_by = token AND status = $from`, que grava só as colunas de resultado no formato
+     exigido pelos CHECKs de `FAILED`: `failure_code`, `balance_after`/`next_attempt_at` NULL
+     e `completed_at = updated_at = max(updated_at, agora)`. Erros transitórios do
+     encerramento seguem o retry do `UnitOfWork` e, esgotado, a próxima rodada.
+  - **Por que dois commits** (correção na avaliação da T30). Na primeira versão, contagem e
+    `FAILED` estavam na mesma transação, e só `ErrCorruptedWagerTransaction` levava ao caminho
+    sem agregado. Uma linha com `currency = 'XYZ'` (passa no CHECK `^[A-Z]{3}$`, mas o domínio
+    não suporta) falhava em `moneyFromColumns`, cujo erro o `scanWager` não marcava como
+    corrompido. No esgotamento, `GetClaimedForUpdate` devolvia esse erro, a transação inteira
+    fazia rollback (inclusive o incremento), e o contador ficava em `MAX−1` para sempre (loop
+    infinito). Correções: (a) `scanWager` marca **toda** falha de reidratação, inclusive a do
+    `Money`, com `ErrCorruptedWagerTransaction` (isso também impede que o replay de uma linha
+    assim vire `400 INVALID_CURRENCY`, como se fosse erro de entrada); (b) o caminho sem
+    agregado cobre qualquer erro não transitório; (c) a contagem é confirmada antes do
+    encerramento. A garantia passa a ser: **toda rodada com erro não transitório avança o
+    contador de forma durável**, e a rodada de esgotamento termina em `FAILED`. Limite
+    residual, documentado na seção 18: se nem o `UPDATE` sem agregado puder gravar `FAILED`
+    (ex.: trigger/CHECK recusando a linha), o item continua `PENDING*`, volta no máximo a cada
+    `PENDING_REFERENCE_MAX_DELAY`, conta de novo e loga ERROR. Não move saldo e exige
+    intervenção manual. Alternativa descartada: `SAVEPOINT` dentro da mesma transação. Ela
+    exigiria ampliar a porta `Tx` só para isso, e um commit separado dá a mesma durabilidade.
+    O custo é uma janela em que a linha já tem `resume_failures >= MAX` mas ainda não é
+    `FAILED`: se o processo morrer ali, a próxima rodada conta de novo e encerra.
+  - **Decisão: SQLSTATEs de recurso e somente leitura** (observação da avaliação). `53000`,
+    `53100` (disco cheio), `53200` (sem memória) e `25006` (escrita em servidor somente
+    leitura, típico de failover) passaram a ser transitórios em `postgres.TransientReasonOf`
+    (razões `insufficient_resources` e `read_only`). Antes, contavam como falha permanente: um
+    disco cheio por ~30s levaria itens bons a `FAILED`. Agora fazem rollback, entram no retry
+    limitado (nada foi confirmado) e, no HTTP/SQS, viram 503/reentrega. `53400`
+    (`configuration_limit_exceeded`) continua permanente.
+  - `Update` zera `resume_failures` em toda transição gravada, exceto em `FAILED`, onde o valor
+    fica para auditoria. Por isso o limite conta falhas **consecutivas**.
+  - **Lock e fencing:** a transação de falha trava só a própria linha (`FOR NO KEY UPDATE`, que
+    não conflita com o `KEY SHARE` da FK de quem insere uma reversão citando a linha). Não
+    trava a carteira, porque `FAILED` não movimenta saldo. Com uma única trava não há ciclo de
+    espera. `Update` e `FailClaimedUnreadable` só gravam a linha travada por este token, como
+    no contrato dos ADR-014/023.
+- **Decisão: TTL.** Usa o mesmo `PENDING_REFERENCE_TTL` desde `created_at` (vale também para
+  `PENDING` órfão). Uma falha depois dele já encerra, porque o prazo da operação acabou.
+- **Decisão: código e evento.** O código é sempre `RETRIES_EXHAUSTED`: a retomada foi tentada e
+  as tentativas esgotaram. `PROCESSING_FAILED` continua reservado. **Sem evento na outbox:** o
+  enunciado §11 lista os eventos exigidos (processado, rejeição de negócio, saldo, espera por
+  referência), e `FAILED` ("falha permanente de infraestrutura registrada para auditoria",
+  §6.3) não é nenhum deles. Emitir `WagerTransactionRejected` para `FAILED` mentiria sobre a
+  natureza da falha. Um tipo novo (`WagerTransactionFailed`) ampliaria o contrato da fila sem
+  um consumidor que o exija. A escolha mantém a coerência com o ADR-012 e a seção 13. A
+  visibilidade vem de log ERROR, `wager_transactions_total{source="worker",status="FAILED"}`,
+  consulta e replay.
+- **Replay.** Nada mudou nos adapters: `ProcessWagerTransaction` devolve o estado persistido
+  (`IdempotentReplay`); o HTTP já mapeava `FAILED` para 422 (`failureCategory:
+  INFRASTRUCTURE`), e o consumidor SQS trata `FAILED` como terminal (conclui a inbox e apaga a
+  mensagem). Reversões que citam uma referência `FAILED` recebem `REFERENCE_NOT_PROCESSED`
+  (ADR-009).
+- **Resultado de `Resume`.** Há dois desfechos novos. `ResumeDeferred` vem **com** o erro
+  original e traz `ResumeFailures`/`HeldUntil`. `ResumeFailed` vem com erro nil (estado
+  terminal, como `ResumeExpired`) e leva a causa em `Cause`. O worker loga WARN/ERROR e
+  registra as métricas.
+- **Configuração.** `PENDING_WORKER_MAX_FAILURES` (padrão 5, faixa 1..1000) chega a
+  `app.PendingWagerPolicy.MaxResumeFailures` via `config.PendingWorkerConfig.MaxFailures` e
+  `pendingworker.PolicyFrom`. Ela está documentada no `.env.example` e no README §2. Com os
+  defaults, um item envenenado termina em ~30s (2s+4s+8s+16s de backoff).
+- **Testes.**
+  - Domínio: `TestValidateFailTransition_AgreesWithFail` (para todo estado × código,
+    `ValidateFailTransition` e `Fail` concordam).
+  - Unitários (`internal/app/resume_wager_failure_test.go`, UnitOfWork em memória com linhas
+    "envenenadas"):
+    - linha ilegível → backoff 2s/4s (não reivindicada antes do prazo) → `FAILED` pelo caminho
+      sem agregado, sem efeitos, nunca mais reivindicada, e o replay devolve `FAILED`;
+    - erro permanente com linha legível → `FAILED` pelo domínio;
+    - transitórios e cancelamento não contam, e o item se resolve quando a infraestrutura volta;
+    - uma retomada bem-sucedida zera o contador;
+    - uma falha depois do TTL encerra na hora;
+    - o dono antigo do lease não registra a falha;
+    - linha ilegível por erro **não marcado** como corrompido → `FAILED` pelo caminho sem
+      agregado, contando 1, 2, 3 de forma durável (`TestResumeWager_AnyUnreadableErrorEndsFailed`);
+    - `Update` de `FAILED` recusado (erro permanente) → `FAILED` pelo caminho sem agregado
+      (`TestResumeWager_AggregateFailWriteErrorFallsBack`);
+    - nem o caminho sem agregado grava (erro permanente e depois transitório) → o contador
+      avança a cada rodada (2, 3), o item fica retido pelo backoff e encerra (4) quando a
+      gravação volta (`TestResumeWager_FailWriteErrorKeepsCountDurable`).
+  - Adapter: `TestScanWager_RehydrationErrorsAreCorrupted` (moeda não suportada em `amount` e
+    em `balance_after`, e caractere de controle, saem com `ErrCorruptedWagerTransaction` e não
+    são mapeados por `ValidationFailureCode`); `TestTransientClassification` cobre
+    `53000`/`53100`/`53200`/`25006` (transitórios) e `53400` (permanente).
+  - Worker: `TestWorker_DeferredAndFailedOutcomes` (métrica `FAILED`; o ciclo não para).
+  - Integração (`internal/adapters/pendingworker/worker_failure_integration_test.go`, PostgreSQL
+    real, worker rodando):
+    - linha inserida com `round_id` contendo caractere de controle, ou com `currency = 'XYZ'`
+      (passam nos CHECKs, não reidratam; subtestes) → `FAILED RETRIES_EXHAUSTED`, `resume_failures = 3`, sem lease, sem ledger e
+      sem outbox, inalterada depois. Um `ROLLBACK` saudável do mesmo ciclo é resolvido, e
+      `assertReconciled` e `ReconcileWallet` confirmam a consistência;
+    - `REFUND` aceito normalmente cuja referência chega corrompida → `FAILED` pelo domínio
+      (`attempts` preservado, só o evento `PendingReference` original), e o replay devolve
+      `FAILED`;
+    - fencing por token alheio, retenção pelo backoff no `ClaimDue` e contador zerado depois
+      de uma retomada bem-sucedida.
+  - Schema: o CHECK `wager_transactions_resume_failures_non_negative` recusa valor negativo, e
+    `FAILED` com contador é aceito. `TestDownSteps` passa a reverter 6 migrations (0009..0004)
+    e o `migrate_test` conhece a `0009`.
+- **Fora do escopo.** O wake-up de pendências quando a referência chega fica na T31. Um
+  operador que corrige um dado corrompido antes do esgotamento só precisa esperar o backoff:
+  a próxima retomada bem-sucedida zera o contador.

@@ -175,6 +175,26 @@ func (s wagerStore) GetClaimedForUpdate(ctx context.Context, id, token uuid.UUID
 	return t, notFound(err)
 }
 
+func (s wagerStore) LockClaimedForFailure(ctx context.Context, id, token uuid.UUID) (app.ResumeFailureState, error) {
+	st, err := s.u.wagers.LockClaimedForFailure(ctx, s.q, id, token)
+	if err != nil {
+		return app.ResumeFailureState{}, notFound(err)
+	}
+	return app.ResumeFailureState{Status: st.Status, CreatedAt: st.CreatedAt, Failures: st.Failures}, nil
+}
+
+func (s wagerStore) RecordResumeFailure(ctx context.Context, p app.RecordResumeFailureParams) error {
+	return notFound(s.u.wagers.RecordResumeFailure(ctx, s.q, ResumeFailureParams{
+		ID: p.ID, Token: p.Token, Failures: p.Failures, HoldUntil: p.HoldUntil,
+	}))
+}
+
+func (s wagerStore) FailClaimedUnreadable(ctx context.Context, p app.FailClaimedParams) error {
+	return notFound(s.u.wagers.FailClaimedUnreadable(ctx, s.q, FailClaimedParams{
+		ID: p.ID, Token: p.Token, From: p.From, Code: p.Code, Now: p.Now,
+	}))
+}
+
 func (s wagerStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error) {
 	t, err := s.u.wagers.GetByID(ctx, s.q, id)
 	return t, notFound(err)

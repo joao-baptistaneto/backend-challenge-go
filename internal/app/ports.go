@@ -145,6 +145,25 @@ type WagerTransactionStore interface {
 	// reivindicada por token (fencing). Reassumida por outro token (lease
 	// expirado) ou inexistente: erro que casa com ErrRecordNotFound.
 	GetClaimedForUpdate(ctx context.Context, id, token uuid.UUID) (*domain.WagerTransaction, error)
+	// LockClaimedForFailure trava a linha SE ela ainda estiver reivindicada
+	// por token (mesmo fencing de GetClaimedForUpdate) e devolve o estado
+	// operacional usado pela contagem de falhas da retomada, SEM reidratar o
+	// agregado (funciona na linha que não reidrata). Perdeu o lease ou
+	// inexistente: ErrRecordNotFound. (T30, ADR-031.)
+	LockClaimedForFailure(ctx context.Context, id, token uuid.UUID) (ResumeFailureState, error)
+	// RecordResumeFailure grava o contador de falhas consecutivas e estende o
+	// lease até p.HoldUntil (backoff), sem tocar em colunas do agregado.
+	// Contrato: depois de LockClaimedForFailure na mesma transação. Sem a
+	// linha reivindicada por p.Token: ErrRecordNotFound.
+	RecordResumeFailure(ctx context.Context, p RecordResumeFailureParams) error
+	// FailClaimedUnreadable grava FAILED com p.Code numa linha reivindicada
+	// sem passar pelo agregado, validando a transição com
+	// domain.ValidateFailTransition; mantém o contador de falhas e solta o
+	// lease. Uso: linha que não reidrata (qualquer erro não transitório de
+	// GetClaimedForUpdate) ou cuja gravação pelo agregado (WagerTransaction.Fail
+	// + Update, o caminho normal) falhou de forma não transitória (ADR-031).
+	// Sem a linha reivindicada em p.From: ErrRecordNotFound.
+	FailClaimedUnreadable(ctx context.Context, p FailClaimedParams) error
 	// GetByID lê pelo id interno. Inexistente: ErrRecordNotFound.
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error)
 	// GetByProviderIdempotencyKey lê por (providerId, idempotencyKey).
@@ -171,6 +190,39 @@ type ClaimDueParams struct {
 	// OrphanGrace é a idade mínima de um PENDING (sem nextAttemptAt) para ser
 	// retomado como órfão.
 	OrphanGrace time.Duration
+}
+
+// ResumeFailureState é o estado operacional de uma linha reivindicada
+// (WagerTransactionStore.LockClaimedForFailure).
+type ResumeFailureState struct {
+	Status    domain.WagerStatus
+	CreatedAt time.Time
+	// Failures são as falhas consecutivas não transitórias da retomada já
+	// registradas.
+	Failures int32
+}
+
+// RecordResumeFailureParams são os parâmetros de
+// WagerTransactionStore.RecordResumeFailure.
+type RecordResumeFailureParams struct {
+	ID    uuid.UUID
+	Token uuid.UUID
+	// Failures é o novo valor do contador.
+	Failures int32
+	// HoldUntil é o novo fim do lease (backoff até a próxima retomada).
+	HoldUntil time.Time
+}
+
+// FailClaimedParams são os parâmetros de
+// WagerTransactionStore.FailClaimedUnreadable.
+type FailClaimedParams struct {
+	ID    uuid.UUID
+	Token uuid.UUID
+	// From é o estado lido por LockClaimedForFailure.
+	From domain.WagerStatus
+	// Code é um código INFRASTRUCTURE.
+	Code domain.FailureCode
+	Now  time.Time
 }
 
 // ClaimedWager é uma transação reivindicada por ClaimDue.

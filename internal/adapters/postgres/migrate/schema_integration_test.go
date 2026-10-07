@@ -204,6 +204,9 @@ func TestWagerTransactionsCheckConstraints(t *testing.T) {
 		r    row
 	}{
 		{"pending BET", f.externalRow(w)},
+		{"FAILED keeps resume_failures (T30)", f.externalRow(w).with(row{
+			"status": "FAILED", "failure_code": "RETRIES_EXHAUSTED", "completed_at": t0, "resume_failures": int32(5),
+		})},
 		{"LOSS zero processed", processed(f.externalRow(w).with(row{"kind": "LOSS", "amount": int64(0)}), 7_500)},
 		{"WIN without reference", processed(f.externalRow(w).with(row{"kind": "WIN"}), 10_000)},
 		{"WIN with resolved reference", processed(f.externalRow(w).with(row{
@@ -341,6 +344,7 @@ func TestWagerTransactionsCheckConstraints(t *testing.T) {
 		{"unknown kind", f.externalRow(w).with(row{"kind": "bet"}), "wager_transactions_kind_valid"},
 		{"unknown origin", f.externalRow(w).with(row{"origin": "OTHER"}), "wager_transactions_origin_valid"},
 		{"lowercase currency", f.externalRow(w).with(row{"currency": "brl"}), "wager_transactions_currency_format"},
+		{"negative resume_failures", f.externalRow(w).with(row{"resume_failures": int32(-1)}), "wager_transactions_resume_failures_non_negative"},
 	}
 	for _, tt := range invalid {
 		t.Run("invalid/"+tt.name, func(t *testing.T) {

@@ -1038,6 +1038,31 @@ func (t *WagerTransaction) Fail(p FailWagerParams) error {
 	})
 }
 
+// ValidateFailTransition valida a transição from -> FAILED com code sem o
+// agregado: from precisa ser um estado conhecido e não terminal com aresta para
+// FAILED, e code precisa ser um código conhecido da categoria INFRASTRUCTURE.
+// Existe para o único caso em que a transação não pode ser reidratada (linha
+// persistida que viola as invariantes do domínio, ErrCorruptedWagerTransaction):
+// o worker de pendências (T30, ADR-031) ainda precisa encerrá-la como FAILED
+// RETRIES_EXHAUSTED, e a regra da transição continua sendo do domínio. Com o
+// agregado em mãos, use Fail (que aplica esta mesma regra e revalida todas as
+// invariantes).
+func ValidateFailTransition(from WagerStatus, code FailureCode) error {
+	if !from.IsValid() {
+		return fmt.Errorf("%w: unknown status %q", ErrWagerTransitionNotAllowed, from)
+	}
+	if from.IsTerminal() {
+		return fmt.Errorf("%w: %s -> %s", ErrWagerTransactionTerminal, from, WagerStatusFailed)
+	}
+	if !CanTransitionWagerStatus(from, WagerStatusFailed) {
+		return fmt.Errorf("%w: %s -> %s", ErrWagerTransitionNotAllowed, from, WagerStatusFailed)
+	}
+	if !code.IsValid() || code.Category() != FailureCategoryInfrastructure {
+		return fmt.Errorf("%w: %w: FAILED requires an INFRASTRUCTURE code, got %q", ErrInvalidWagerTransaction, ErrInvalidFailureCode, code)
+	}
+	return nil
+}
+
 // transition valida a aresta da máquina de estados (antes de validar
 // parâmetros, para que "não inicializada" e "terminal" tenham precedência),
 // aplica mutate numa cópia, revalida todas as invariantes e só então substitui o

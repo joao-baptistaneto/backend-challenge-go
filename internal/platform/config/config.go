@@ -96,6 +96,7 @@ const (
 	EnvPendingWorkerProcessTimeout    = "PENDING_WORKER_PROCESS_TIMEOUT"
 	EnvPendingWorkerDrainTimeout      = "PENDING_WORKER_DRAIN_TIMEOUT"
 	EnvPendingOrphanGrace             = "PENDING_ORPHAN_GRACE"
+	EnvPendingWorkerMaxFailures       = "PENDING_WORKER_MAX_FAILURES"
 )
 
 // Ambientes aceitos em APP_ENV.
@@ -187,11 +188,13 @@ const (
 	DefaultPendingWorkerProcessTimeout    = 5 * time.Second
 	DefaultPendingWorkerDrainTimeout      = 10 * time.Second
 	DefaultPendingOrphanGrace             = 30 * time.Second
+	DefaultPendingWorkerMaxFailures       = 5
 
 	maxPendingDelay             = 24 * time.Hour
 	maxPendingWorkerBatchSize   = 1000
 	maxPendingWorkerConcurrency = 100
 	maxPendingWorkerLease       = 24 * time.Hour
+	maxPendingWorkerMaxFailures = 1000
 )
 
 // Defaults de autorização (ARCHITECTURE.md, ADR-019). Os nomes são os
@@ -403,6 +406,10 @@ type PendingWorkerConfig struct {
 	// OrphanGrace é a idade mínima de um PENDING (sem next_attempt_at) para
 	// ser retomado como órfão.
 	OrphanGrace time.Duration
+	// MaxFailures é o número de falhas consecutivas NÃO transitórias da
+	// retomada de um item que o encerram como FAILED RETRIES_EXHAUSTED (T30,
+	// ADR-031).
+	MaxFailures int
 }
 
 // LookupFunc tem a mesma assinatura de os.LookupEnv.
@@ -669,6 +676,7 @@ func (p *parser) pendingWorker() PendingWorkerConfig {
 	c.ProcessTimeout = p.positiveDuration(EnvPendingWorkerProcessTimeout, DefaultPendingWorkerProcessTimeout)
 	c.DrainTimeout = p.positiveDuration(EnvPendingWorkerDrainTimeout, DefaultPendingWorkerDrainTimeout)
 	c.OrphanGrace = p.durationRange(EnvPendingOrphanGrace, DefaultPendingOrphanGrace, 0, maxPendingDelay)
+	c.MaxFailures = p.intRange(EnvPendingWorkerMaxFailures, DefaultPendingWorkerMaxFailures, 1, maxPendingWorkerMaxFailures)
 	// Um item precisa caber no lease; senão outra instância o reassume no
 	// meio do processamento (o fencing impede efeito duplicado, mas o
 	// trabalho seria perdido).

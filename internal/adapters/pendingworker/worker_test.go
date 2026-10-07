@@ -211,6 +211,32 @@ func TestWorker_ItemErrorsDoNotStopTheCycle(t *testing.T) {
 	}
 }
 
+// T30: falha contada (DEFERRED, com erro) e item encerrado (FAILED, sem
+// erro) não param o ciclo; FAILED entra em wager_transactions_total.
+func TestWorker_DeferredAndFailedOutcomes(t *testing.T) {
+	calls := 0
+	f := &fakeResumer{resume: func(context.Context, uuid.UUID) (app.ResumeResult, error) {
+		calls++
+		if calls == 1 {
+			return app.ResumeResult{Outcome: app.ResumeDeferred, ResumeFailures: 1, HeldUntil: time.Now().Add(time.Second)},
+				errors.New("corrupted row")
+		}
+		return app.ResumeResult{Outcome: app.ResumeFailed, Kind: domain.WagerKindRollback, Status: domain.WagerStatusFailed,
+			FailureCode: domain.FailureCodeRetriesExhausted, ResumeFailures: 5, Cause: errors.New("corrupted row")}, nil
+	}}
+	f.push(2)
+	cfg := testConfig()
+	cfg.Concurrency = 1
+	m := newMetrics(t)
+	w, _ := New(cfg, f, WithMetrics(m))
+	if n, err := w.RunOnce(t.Context()); err != nil || n != 2 || f.resumedCount() != 2 {
+		t.Fatalf("RunOnce = %d, %v (resumed %d)", n, err, f.resumedCount())
+	}
+	if got := testutil.ToFloat64(m.TransactionsTotal.WithLabelValues(metrics.SourceWorker, "ROLLBACK", "FAILED")); got != 1 {
+		t.Fatalf("failed metric = %v", got)
+	}
+}
+
 func TestWorker_ClaimErrorRetriesNextCycle(t *testing.T) {
 	f := &fakeResumer{claimErr: errors.New("db down")}
 	w, _ := New(testConfig(), f)

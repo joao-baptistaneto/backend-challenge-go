@@ -447,3 +447,15 @@ func (fakeWagers) ClaimDue(context.Context, app.ClaimDueParams) ([]app.ClaimedWa
 func (fakeWagers) GetClaimedForUpdate(context.Context, uuid.UUID, uuid.UUID) (*domain.WagerTransaction, error) {
 	return nil, errUnexpectedCall
 }
+
+func (fakeWagers) LockClaimedForFailure(context.Context, uuid.UUID, uuid.UUID) (app.ResumeFailureState, error) {
+	return app.ResumeFailureState{}, errUnexpectedCall
+}
+
+func (fakeWagers) RecordResumeFailure(context.Context, app.RecordResumeFailureParams) error {
+	return errUnexpectedCall
+}
+
+func (fakeWagers) FailClaimedUnreadable(context.Context, app.FailClaimedParams) error {
+	return errUnexpectedCall
+}

@@ -84,6 +84,7 @@ func validEnv() map[string]string {
 		EnvPendingWorkerProcessTimeout:    "5s",
 		EnvPendingWorkerDrainTimeout:      "10s",
 		EnvPendingOrphanGrace:             "30s",
+		EnvPendingWorkerMaxFailures:       "5",
 	}
 }
 
@@ -155,7 +156,7 @@ func TestLoadDefaults(t *testing.T) {
 		EnvSQSVisibilityTimeout, EnvSQSProcessTimeout, EnvSQSRetryBaseDelay, EnvSQSRetryMaxDelay,
 		EnvSQSDrainTimeout, EnvSQSMaxAttempts, EnvPendingReferenceRetryBaseDelay, EnvPendingReferenceRetryMaxDelay,
 		EnvPendingWorkerPollInterval, EnvPendingWorkerBatchSize, EnvPendingWorkerConcurrency, EnvPendingWorkerLease,
-		EnvPendingWorkerProcessTimeout, EnvPendingWorkerDrainTimeout, EnvPendingOrphanGrace,
+		EnvPendingWorkerProcessTimeout, EnvPendingWorkerDrainTimeout, EnvPendingOrphanGrace, EnvPendingWorkerMaxFailures,
 		EnvOutboxConcurrency, EnvOutboxPublishTimeout, EnvOutboxDrainTimeout, EnvOutboxRetryBaseDelay,
 		EnvOutboxRetryMaxDelay, EnvMetricsAccess,
 	} {
@@ -377,6 +378,8 @@ func TestLoadInvalid(t *testing.T) {
 		{"pending process inválido", func(e map[string]string) { e[EnvPendingWorkerProcessTimeout] = "x" }, EnvPendingWorkerProcessTimeout},
 		{"pending drain zero", func(e map[string]string) { e[EnvPendingWorkerDrainTimeout] = "0s" }, EnvPendingWorkerDrainTimeout},
 		{"pending grace negativa", func(e map[string]string) { e[EnvPendingOrphanGrace] = "-1s" }, EnvPendingOrphanGrace},
+		{"pending max failures zero", func(e map[string]string) { e[EnvPendingWorkerMaxFailures] = "0" }, EnvPendingWorkerMaxFailures},
+		{"pending max failures grande", func(e map[string]string) { e[EnvPendingWorkerMaxFailures] = "1001" }, EnvPendingWorkerMaxFailures},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -604,6 +607,6 @@ func defaultPendingWorker() PendingWorkerConfig {
 		PollInterval: DefaultPendingWorkerPollInterval, BatchSize: DefaultPendingWorkerBatchSize,
 		Concurrency: DefaultPendingWorkerConcurrency, Lease: DefaultPendingWorkerLease,
 		ProcessTimeout: DefaultPendingWorkerProcessTimeout, DrainTimeout: DefaultPendingWorkerDrainTimeout,
-		OrphanGrace: DefaultPendingOrphanGrace,
+		OrphanGrace: DefaultPendingOrphanGrace, MaxFailures: DefaultPendingWorkerMaxFailures,
 	}
 }

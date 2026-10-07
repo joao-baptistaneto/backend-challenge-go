@@ -30,6 +30,19 @@ type memUoW struct {
 	// failInsertOnce devolve este erro no primeiro Insert de transação.
 	failInsertOnce error
 	txErr          error
+	// poison simula linhas que não reidratam (T30): GetByID e
+	// GetClaimedForUpdate da transação devolvem o erro.
+	poison map[uuid.UUID]error
+	// walletErr, se definido, é devolvido por Wallets.GetForUpdate.
+	walletErr error
+	// unreadableFailed conta as chamadas de FailClaimedUnreadable confirmadas
+	// ou não (o adapter é exercitado na integração).
+	unreadableFailed int
+	// failUpdateErr, se definido, é devolvido por Transactions.Update ao
+	// gravar FAILED (falha da gravação pelo agregado).
+	failUpdateErr error
+	// failUnreadableErr, se definido, é devolvido por FailClaimedUnreadable.
+	failUnreadableErr error
 }
 
 type memInbox struct {
@@ -46,6 +59,8 @@ type memState struct {
 	inbox   map[string]memInbox
 	// claims é o lease do worker (T21) por transação.
 	claims map[uuid.UUID]memClaim
+	// failures é resume_failures (T30) por transação.
+	failures map[uuid.UUID]int32
 }
 
 func cloneWallet(w *domain.Wallet) *domain.Wallet {
@@ -65,7 +80,10 @@ func cloneWager(t *domain.WagerTransaction) *domain.WagerTransaction {
 }
 
 func (s memState) clone() memState {
-	c := memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}}
+	c := memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}, failures: map[uuid.UUID]int32{}}
+	for k, v := range s.failures {
+		c.failures[k] = v
+	}
 	for k, v := range s.claims {
 		c.claims[k] = v
 	}
@@ -84,7 +102,10 @@ func (s memState) clone() memState {
 }
 
 func newMemUoW() *memUoW {
-	return &memUoW{state: memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}}}
+	return &memUoW{
+		state:  memState{wallets: map[uuid.UUID]*domain.Wallet{}, inbox: map[string]memInbox{}, claims: map[uuid.UUID]memClaim{}, failures: map[uuid.UUID]int32{}},
+		poison: map[uuid.UUID]error{},
+	}
 }
 
 func (u *memUoW) WithinTx(ctx context.Context, opts app.TxOptions, fn app.TxFunc) error {
@@ -137,6 +158,9 @@ func (s memWallets) Insert(_ context.Context, w *domain.Wallet) error {
 }
 
 func (s memWallets) GetForUpdate(_ context.Context, id uuid.UUID) (*domain.Wallet, error) {
+	if s.u.walletErr != nil {
+		return nil, s.u.walletErr
+	}
 	w, ok := s.s.wallets[id]
 	if !ok {
 		return nil, app.ErrRecordNotFound
@@ -173,6 +197,9 @@ func (s memWagers) Insert(_ context.Context, t *domain.WagerTransaction) error {
 
 // Update espelha o adapter: só linhas não terminais, e solta o lease.
 func (s memWagers) Update(_ context.Context, t *domain.WagerTransaction) error {
+	if s.u.failUpdateErr != nil && t.Status() == domain.WagerStatusFailed {
+		return s.u.failUpdateErr
+	}
 	for i, w := range s.s.wagers {
 		if w.ID() != t.ID() {
 			continue
@@ -182,6 +209,9 @@ func (s memWagers) Update(_ context.Context, t *domain.WagerTransaction) error {
 		}
 		s.s.wagers[i] = cloneWager(t)
 		delete(s.s.claims, t.ID())
+		if t.Status() != domain.WagerStatusFailed {
+			delete(s.s.failures, t.ID()) // falhas consecutivas zeradas
+		}
 		return nil
 	}
 	return app.ErrRecordNotFound
@@ -222,7 +252,65 @@ func (s memWagers) GetClaimedForUpdate(_ context.Context, id, token uuid.UUID) (
 	if c, ok := s.s.claims[id]; !ok || c.token != token {
 		return nil, app.ErrRecordNotFound
 	}
+	if err := s.u.poison[id]; err != nil {
+		return nil, err
+	}
 	return s.find(func(w *domain.WagerTransaction) bool { return w.ID() == id })
+}
+
+// Contagem de falhas da retomada (T30): espelha o adapter, sem reidratar
+// (ignora poison) e com o mesmo fencing.
+
+func (s memWagers) claimedRow(id, token uuid.UUID) (int, bool) {
+	if c, ok := s.s.claims[id]; !ok || c.token != token {
+		return 0, false
+	}
+	for i, w := range s.s.wagers {
+		if w.ID() == id {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (s memWagers) LockClaimedForFailure(_ context.Context, id, token uuid.UUID) (app.ResumeFailureState, error) {
+	i, ok := s.claimedRow(id, token)
+	if !ok {
+		return app.ResumeFailureState{}, app.ErrRecordNotFound
+	}
+	w := s.s.wagers[i]
+	return app.ResumeFailureState{Status: w.Status(), CreatedAt: w.CreatedAt(), Failures: s.s.failures[id]}, nil
+}
+
+func (s memWagers) RecordResumeFailure(_ context.Context, p app.RecordResumeFailureParams) error {
+	i, ok := s.claimedRow(p.ID, p.Token)
+	if !ok || s.s.wagers[i].IsTerminal() {
+		return app.ErrRecordNotFound
+	}
+	s.s.failures[p.ID] = p.Failures
+	s.s.claims[p.ID] = memClaim{token: p.Token, until: p.HoldUntil}
+	return nil
+}
+
+func (s memWagers) FailClaimedUnreadable(_ context.Context, p app.FailClaimedParams) error {
+	if s.u.failUnreadableErr != nil {
+		return s.u.failUnreadableErr
+	}
+	i, ok := s.claimedRow(p.ID, p.Token)
+	if !ok || s.s.wagers[i].Status() != p.From {
+		return app.ErrRecordNotFound
+	}
+	if err := domain.ValidateFailTransition(p.From, p.Code); err != nil {
+		return err
+	}
+	c := cloneWager(s.s.wagers[i])
+	if err := c.Fail(domain.FailWagerParams{Code: p.Code, Now: p.Now}); err != nil {
+		return err
+	}
+	s.s.wagers[i] = c
+	delete(s.s.claims, p.ID)
+	s.u.unreadableFailed++
+	return nil
 }
 
 func (s memWagers) find(match func(*domain.WagerTransaction) bool) (*domain.WagerTransaction, error) {
@@ -235,6 +323,9 @@ func (s memWagers) find(match func(*domain.WagerTransaction) bool) (*domain.Wage
 }
 
 func (s memWagers) GetByID(_ context.Context, id uuid.UUID) (*domain.WagerTransaction, error) {
+	if err := s.u.poison[id]; err != nil {
+		return nil, err
+	}
 	return s.find(func(w *domain.WagerTransaction) bool { return w.ID() == id })
 }
 

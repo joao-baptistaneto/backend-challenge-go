@@ -49,6 +49,10 @@ const (
 	CodeCrashShutdown         = "57P02"
 	CodeCannotConnectNow      = "57P03"
 	CodeTooManyConnections    = "53300"
+	CodeInsufficientResources = "53000"
+	CodeDiskFull              = "53100"
+	CodeOutOfMemory           = "53200"
+	CodeReadOnlyTransaction   = "25006"
 	CodeUniqueViolation       = "23505"
 	CodeCheckViolation        = "23514"
 	CodeForeignKeyViolation   = "23503"
@@ -182,6 +186,13 @@ const (
 	ReasonConnection    TransientReason = "connection"
 	ReasonTimeout       TransientReason = "timeout"
 	ReasonCommitUnknown TransientReason = "commit_unknown"
+	// ReasonResources: o servidor ficou sem disco ou memória (53000, 53100,
+	// 53200). Nada foi gravado e a condição é do ambiente, não do item.
+	ReasonResources TransientReason = "insufficient_resources"
+	// ReasonReadOnly: escrita recusada por um servidor somente leitura
+	// (25006), típico de failover em andamento (conexão ainda no antigo
+	// primário rebaixado ou numa réplica).
+	ReasonReadOnly TransientReason = "read_only"
 )
 
 // TransientError embrulha uma falha transitória com sua causa.
@@ -286,6 +297,13 @@ func transientReasonForCode(code string) (TransientReason, bool) {
 		// Cancelamento pelo ctx do cliente não chega aqui como PgError: o
 		// pgx devolve o erro de contexto, tratado antes.
 		return ReasonQueryCanceled, true
+	case CodeInsufficientResources, CodeDiskFull, CodeOutOfMemory:
+		// Ambiente sem recurso: transitório (ADR-031). Contá-lo como falha
+		// permanente levaria itens bons a FAILED durante um disco cheio.
+		// 53400 (configuration_limit_exceeded) continua permanente.
+		return ReasonResources, true
+	case CodeReadOnlyTransaction:
+		return ReasonReadOnly, true
 	case CodeAdminShutdown, CodeCrashShutdown, CodeCannotConnectNow, CodeTooManyConnections:
 		return ReasonConnection, true
 	}

@@ -51,7 +51,7 @@ No Docker Compose os valores ficam em `docker-compose.yml` (`x-app-env`). Princi
 | Consumidor SQS | `SQS_CONSUMER_NAME`, `SQS_CONSUMER_CONCURRENCY`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_RETRY_BASE_DELAY`, `SQS_RETRY_MAX_DELAY`, `SQS_DRAIN_TIMEOUT`, `SQS_MAX_ATTEMPTS` |
 | OIDC | `OIDC_ISSUER_URL`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_PROVIDER_CLAIM`, `OIDC_PROVIDER_ROLE`, `OIDC_INTERNAL_ROLE`, `OIDC_ROLES_CLIENT`, `OIDC_CLOCK_SKEW` |
 | Outbox | `OUTBOX_POLL_INTERVAL`, `OUTBOX_BATCH_SIZE`, `OUTBOX_LEASE`, `OUTBOX_CONCURRENCY`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_DRAIN_TIMEOUT`, `OUTBOX_RETRY_BASE_DELAY`, `OUTBOX_RETRY_MAX_DELAY` |
-| Pendências | `PENDING_REFERENCE_MAX_ATTEMPTS`, `PENDING_REFERENCE_TTL`, `PENDING_REFERENCE_RETRY_BASE_DELAY`, `PENDING_REFERENCE_RETRY_MAX_DELAY`, `PENDING_WORKER_*`, `PENDING_ORPHAN_GRACE` |
+| Pendências | `PENDING_REFERENCE_MAX_ATTEMPTS`, `PENDING_REFERENCE_TTL`, `PENDING_REFERENCE_RETRY_BASE_DELAY`, `PENDING_REFERENCE_RETRY_MAX_DELAY`, `PENDING_WORKER_*` (inclusive `PENDING_WORKER_MAX_FAILURES`, padrão 5: falhas consecutivas não transitórias da retomada de um item antes de `FAILED RETRIES_EXHAUSTED`, ARCHITECTURE §7), `PENDING_ORPHAN_GRACE` |
 | Migrations (`cmd/migrate`) | `DATABASE_URL`, `MIGRATE_TIMEOUT` (padrão 2m) |
 | Testes (não lidas pela aplicação) | `TEST_DATABASE_URL`, `SQS_ENDPOINT`, `KEYCLOAK_URL`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` (ver [§7](#7-testes)) |
 
@@ -258,7 +258,7 @@ Com a AWS CLI no host, o equivalente é `aws --endpoint-url http://localhost:456
 Outros endpoints: `GET /health/live`, `GET /health/ready` (públicos) e `GET /metrics`
 (Prometheus; token do serviço interno, salvo `METRICS_ACCESS=public`). Códigos HTTP e corpos de
 erro: ARCHITECTURE §16 (400 entrada inválida, 401/403, 404, 409 conflito de idempotência, 422
-rejeição com `failureCode`, 202 `PENDING_REFERENCE`, 503 + `Retry-After`).
+rejeição com `failureCode` — também `FAILED` com `RETRIES_EXHAUSTED`, inclusive no replay —, 202 `PENDING_REFERENCE`, 503 + `Retry-After`).
 
 ## 7. Testes
 

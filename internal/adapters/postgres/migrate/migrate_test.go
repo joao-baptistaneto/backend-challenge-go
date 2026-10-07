@@ -25,6 +25,7 @@ func TestLoadEmbeddedMigrations(t *testing.T) {
 		"add_wallet_ledger_entries_seq",
 		"add_wager_transactions_claim",
 		"add_outbox_claim_indexes",
+		"add_wager_transactions_resume_failures",
 	}
 	if len(migs) != len(wantNames) {
 		t.Fatalf("got %d migrations, want %d", len(migs), len(wantNames))

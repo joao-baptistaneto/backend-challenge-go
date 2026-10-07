@@ -183,7 +183,7 @@ func TestIntegrationProcessWager_ConcurrentReversalsRaceReference(t *testing.T) 
 		t.Fatal(err)
 	}
 	policy := app.PendingWagerPolicy{MaxAttempts: 50, TTL: time.Minute,
-		RetryBaseDelay: time.Millisecond, RetryMaxDelay: 5 * time.Millisecond}
+		RetryBaseDelay: time.Millisecond, RetryMaxDelay: 5 * time.Millisecond, MaxResumeFailures: 3}
 	resume, err := app.NewResumeWagerTransaction(e.uow, policy)
 	if err != nil {
 		t.Fatal(err)

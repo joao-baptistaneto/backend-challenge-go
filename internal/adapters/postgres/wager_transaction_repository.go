@@ -29,7 +29,13 @@ import (
 //     wager_transactions_guard_update é a barreira final. Quem atualiza deve
 //     ter lido a linha sob lock (GetByIDForUpdate, GetClaimedForUpdate ou o
 //     lock da carteira, que serializa as operações da mesma carteira). Update
-//     também solta o lease do worker (claimed_by/claimed_until = NULL).
+//     também solta o lease do worker (claimed_by/claimed_until = NULL) e zera
+//     resume_failures, salvo ao gravar FAILED (o contador fica para
+//     auditoria; T30, ADR-031).
+//   - LockClaimedForFailure, RecordResumeFailure e FailClaimedUnreadable (T30,
+//     ADR-031) registram falhas não transitórias da retomada sem reidratar a
+//     linha (o item envenenado pode ser justamente uma linha que não
+//     reidrata), sempre com o fencing do lease (claimed_by = token).
 //   - ClaimDue (T21, ADR-023) grava um lease na linha (claimed_by =
 //     token, claimed_until = now + lease) num único comando, escolhendo as
 //     linhas com FOR NO KEY UPDATE SKIP LOCKED: várias instâncias pegam lotes
@@ -97,7 +103,8 @@ func (WagerTransactionRepository) Update(ctx context.Context, q Querier, tx *dom
 	tag, err := q.Exec(ctx, `UPDATE wager_transactions
 SET status = $2, reference_transaction_id = $3, failure_code = $4, balance_after = $5,
     attempts = $6, next_attempt_at = $7, updated_at = $8, completed_at = $9,
-    claimed_by = NULL, claimed_until = NULL
+    claimed_by = NULL, claimed_until = NULL,
+    resume_failures = CASE WHEN $2 = 'FAILED' THEN resume_failures ELSE 0 END
 WHERE id = $1 AND status IN ('PENDING', 'PENDING_REFERENCE')`,
 		tx.ID(), tx.Status().String(), nullUUID(tx.ReferenceTransactionID()), nullText(tx.FailureCode().String()),
 		balanceAfter, tx.Attempts(), nullTime(tx.NextAttemptAt()), tx.UpdatedAt(), nullTime(tx.CompletedAt()))
@@ -304,6 +311,134 @@ WHERE id = $1 AND claimed_by = $2
 FOR NO KEY UPDATE`, id, token)
 }
 
+// ResumeFailureState é o estado operacional de uma linha reivindicada, lido
+// sem reidratar o agregado (T30, ADR-031).
+type ResumeFailureState struct {
+	Status    domain.WagerStatus
+	CreatedAt time.Time
+	// Failures é resume_failures: falhas consecutivas não transitórias da
+	// retomada.
+	Failures int32
+}
+
+// LockClaimedForFailure trava (FOR NO KEY UPDATE) a linha só se ela ainda
+// estiver reivindicada por token (mesmo fencing de GetClaimedForUpdate) e
+// devolve status, created_at e resume_failures SEM reidratar: precisa
+// funcionar justamente na linha que não reidrata (item envenenado). Perdeu o
+// lease ou inexistente: ErrNotFound. Exige pgx.Tx.
+func (WagerTransactionRepository) LockClaimedForFailure(ctx context.Context, q Querier, id, token uuid.UUID) (ResumeFailureState, error) {
+	const op = "postgres: travar transação reivindicada para registrar falha"
+	if err := requireTx(op, q); err != nil {
+		return ResumeFailureState{}, err
+	}
+	if token == uuid.Nil {
+		return ResumeFailureState{}, fmt.Errorf("%s: %w: token nulo", op, ErrInvalidClaim)
+	}
+	var (
+		st     ResumeFailureState
+		status string
+	)
+	err := q.QueryRow(ctx, `SELECT status, created_at, resume_failures FROM wager_transactions
+WHERE id = $1 AND claimed_by = $2
+FOR NO KEY UPDATE`, id, token).Scan(&status, &st.CreatedAt, &st.Failures)
+	if err != nil {
+		return ResumeFailureState{}, mapReadError(op, err)
+	}
+	st.Status = domain.WagerStatus(status)
+	return st, nil
+}
+
+// ResumeFailureParams são os parâmetros de RecordResumeFailure.
+type ResumeFailureParams struct {
+	ID    uuid.UUID
+	Token uuid.UUID
+	// Failures é o novo valor de resume_failures (>= 0).
+	Failures int32
+	// HoldUntil é o novo fim do lease: o backoff até a próxima retomada.
+	HoldUntil time.Time
+}
+
+// RecordResumeFailure grava resume_failures = p.Failures e claimed_until =
+// p.HoldUntil numa linha não terminal ainda reivindicada por p.Token. Não
+// toca em status, attempts, next_attempt_at nem updated_at (colunas do
+// agregado): o backoff da falha é o próprio lease, que mantém o fencing e
+// impede ClaimDue de devolver a linha antes do prazo. Sem linha afetada
+// (lease perdido ou terminal): ErrNotFound. Contrato: chamar depois de
+// LockClaimedForFailure na mesma transação.
+func (WagerTransactionRepository) RecordResumeFailure(ctx context.Context, q Querier, p ResumeFailureParams) error {
+	const op = "postgres: registrar falha de retomada"
+	if err := requireTx(op, q); err != nil {
+		return err
+	}
+	switch {
+	case p.Token == uuid.Nil:
+		return fmt.Errorf("%s: %w: token nulo", op, ErrInvalidClaim)
+	case p.Failures < 0:
+		return fmt.Errorf("%s: %w: falhas negativas %d", op, ErrInvalidClaim, p.Failures)
+	case p.HoldUntil.IsZero():
+		return fmt.Errorf("%s: %w: fim do lease zero", op, ErrInvalidClaim)
+	}
+	tag, err := q.Exec(ctx, `UPDATE wager_transactions
+SET resume_failures = $3, claimed_until = $4
+WHERE id = $1 AND claimed_by = $2 AND status IN ('PENDING', 'PENDING_REFERENCE')`,
+		p.ID, p.Token, p.Failures, p.HoldUntil)
+	if err != nil {
+		return mapWriteError(op, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%s: %w: transação %s não está reivindicada por este token", op, ErrNotFound, p.ID)
+	}
+	return nil
+}
+
+// FailClaimedParams são os parâmetros de FailClaimedUnreadable.
+type FailClaimedParams struct {
+	ID    uuid.UUID
+	Token uuid.UUID
+	// From é o estado lido por LockClaimedForFailure (condição do UPDATE).
+	From domain.WagerStatus
+	// Code é o código INFRASTRUCTURE gravado.
+	Code domain.FailureCode
+	Now  time.Time
+}
+
+// FailClaimedUnreadable grava FAILED numa linha reivindicada por p.Token que
+// NÃO pode ser reidratada (domain.ErrCorruptedWagerTransaction), sem passar
+// pelo agregado. A transição é validada pelo domínio
+// (domain.ValidateFailTransition) aqui e no chamador; o UPDATE só muda as
+// colunas de resultado com a forma exigida pelos CHECKs de FAILED
+// (failure_code, balance_after NULL, next_attempt_at NULL, completed_at =
+// updated_at = max(updated_at, Now)), solta o lease e mantém resume_failures
+// para auditoria. Linhas que reidratam usam GetClaimedForUpdate + Fail +
+// Update; este caminho também é o fallback quando essa gravação falha de forma
+// não transitória (ADR-031). Sem linha afetada (lease perdido, estado mudou):
+// ErrNotFound.
+func (WagerTransactionRepository) FailClaimedUnreadable(ctx context.Context, q Querier, p FailClaimedParams) error {
+	const op = "postgres: gravar FAILED em transação ilegível"
+	if err := requireTx(op, q); err != nil {
+		return err
+	}
+	if p.Token == uuid.Nil || p.Now.IsZero() {
+		return fmt.Errorf("%s: %w: token nulo ou instante zero", op, ErrInvalidClaim)
+	}
+	if err := domain.ValidateFailTransition(p.From, p.Code); err != nil {
+		return fmt.Errorf("%s: %w: %w", op, ErrInvalidAggregate, err)
+	}
+	tag, err := q.Exec(ctx, `UPDATE wager_transactions
+SET status = 'FAILED', failure_code = $4, balance_after = NULL, next_attempt_at = NULL,
+    updated_at = GREATEST(updated_at, $5), completed_at = GREATEST(updated_at, $5),
+    claimed_by = NULL, claimed_until = NULL
+WHERE id = $1 AND claimed_by = $2 AND status = $3`,
+		p.ID, p.Token, p.From.String(), p.Code.String(), p.Now.UTC())
+	if err != nil {
+		return mapWriteError(op, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%s: %w: transação %s não está reivindicada por este token em %s", op, ErrNotFound, p.ID, p.From)
+	}
+	return nil
+}
+
 // balanceAfterColumn devolve balance_after (NULL quando ausente). Presente,
 // precisa ser Money válido na moeda da operação.
 func balanceAfterColumn(tx *domain.WagerTransaction) (pgtype.Int8, error) {
@@ -366,12 +501,12 @@ func scanWager(row pgx.Row) (*domain.WagerTransaction, error) {
 	}
 	money, err := moneyFromColumns("amount", amount, currency)
 	if err != nil {
-		return nil, fmt.Errorf("reidratar transação %s: %w", id, err)
+		return nil, corruptedWager(id, err)
 	}
 	var balance domain.Money
 	if balanceAfter.Valid {
 		if balance, err = moneyFromColumns("balance_after", balanceAfter.Int64, currency); err != nil {
-			return nil, fmt.Errorf("reidratar transação %s: %w", id, err)
+			return nil, corruptedWager(id, err)
 		}
 	}
 	tx, err := domain.RehydrateWagerTransaction(domain.RehydrateWagerTransactionParams{
@@ -399,7 +534,20 @@ func scanWager(row pgx.Row) (*domain.WagerTransaction, error) {
 		CompletedAt:                    timeOrZero(completedAt),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("reidratar transação %s: %w", id, err)
+		return nil, corruptedWager(id, err)
 	}
 	return tx, nil
+}
+
+// corruptedWager marca QUALQUER falha de reidratação de uma linha lida
+// (inclusive a do Money: moeda que passa no CHECK do banco mas o domínio não
+// suporta) com domain.ErrCorruptedWagerTransaction. Assim quem lê distingue
+// "a linha persistida é inválida" de erro de entrada (ValidationFailureCode
+// não a confunde com INVALID_CURRENCY) e o worker encerra o item envenenado
+// pelo caminho sem agregado (T30, ADR-031) em vez de repetir para sempre.
+func corruptedWager(id uuid.UUID, err error) error {
+	if errors.Is(err, domain.ErrCorruptedWagerTransaction) {
+		return fmt.Errorf("reidratar transação %s: %w", id, err)
+	}
+	return fmt.Errorf("reidratar transação %s: %w: %w", id, domain.ErrCorruptedWagerTransaction, err)
 }

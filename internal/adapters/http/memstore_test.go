@@ -317,3 +317,15 @@ func (memWagers) ClaimDue(context.Context, app.ClaimDueParams) ([]app.ClaimedWag
 func (memWagers) GetClaimedForUpdate(context.Context, uuid.UUID, uuid.UUID) (*domain.WagerTransaction, error) {
 	return nil, errors.New("mem: claimed lock not used by the HTTP API")
 }
+
+func (memWagers) LockClaimedForFailure(context.Context, uuid.UUID, uuid.UUID) (app.ResumeFailureState, error) {
+	return app.ResumeFailureState{}, errors.New("mem: failure lock not used by the HTTP API")
+}
+
+func (memWagers) RecordResumeFailure(context.Context, app.RecordResumeFailureParams) error {
+	return errors.New("mem: resume failure not used by the HTTP API")
+}
+
+func (memWagers) FailClaimedUnreadable(context.Context, app.FailClaimedParams) error {
+	return errors.New("mem: fail unreadable not used by the HTTP API")
+}

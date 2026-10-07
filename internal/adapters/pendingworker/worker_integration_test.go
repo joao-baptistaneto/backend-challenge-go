@@ -34,7 +34,7 @@ type instance struct {
 const testReferenceDelay = 50 * time.Millisecond
 
 func fastPolicy() app.PendingWagerPolicy {
-	return app.PendingWagerPolicy{MaxAttempts: 1000, TTL: time.Minute, RetryBaseDelay: testReferenceDelay, RetryMaxDelay: 200 * time.Millisecond}
+	return app.PendingWagerPolicy{MaxAttempts: 1000, TTL: time.Minute, RetryBaseDelay: testReferenceDelay, RetryMaxDelay: 200 * time.Millisecond, MaxResumeFailures: 3}
 }
 
 func fastConfig() Config {

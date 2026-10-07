@@ -14,9 +14,12 @@
 //   - Um item cujo lease já não cobre um processamento completo
 //     (ProcessTimeout) não é iniciado: volta para outra instância quando o
 //     lease expirar, em vez de ser processado em cima da expiração.
-//   - Falhas de um item (transitórias ou não) não derrubam o ciclo: o lease
-//     continua gravado e o item volta quando ele expirar. Falha no claim
-//     (banco indisponível) espera PollInterval e tenta de novo.
+//   - Falhas de um item não derrubam o ciclo. Transitórias: o lease continua
+//     gravado e o item volta quando ele expirar. Não transitórias (T30,
+//     ADR-031): o caso de uso conta a falha e retém o item com backoff
+//     exponencial; esgotado PENDING_WORKER_MAX_FAILURES (ou o TTL), grava
+//     FAILED RETRIES_EXHAUSTED, então um item envenenado sempre termina. Falha
+//     no claim (banco indisponível) espera PollInterval e tenta de novo.
 //   - Shutdown (Stop): para de reivindicar e de iniciar itens; os itens em voo
 //     terminam até DrainTimeout (ou o prazo do OnStop). Estourado, o contexto
 //     do processamento é cancelado (rollback; o lease expira e outra instância
@@ -301,11 +304,25 @@ func (w *Worker) process(ctx context.Context, c app.ClaimedWager, token uuid.UUI
 			outcome = metrics.OutcomeTransient
 		}
 		w.observe(outcome, elapsed)
-		w.logger.WarnContext(ctx, "retomada falhou; o item volta quando o lease expirar",
-			slog.String("transactionId", c.ID.String()), slog.String("status", string(c.Status)), logging.Err(err))
+		attrs := []any{slog.String("transactionId", c.ID.String()), slog.String("status", string(c.Status)), logging.Err(err)}
+		if res.Outcome == app.ResumeDeferred {
+			w.logger.WarnContext(ctx, "retomada falhou; falha contada, o item volta depois do backoff",
+				append(attrs, slog.Int("resumeFailures", int(res.ResumeFailures)), slog.Time("heldUntil", res.HeldUntil))...)
+			return
+		}
+		w.logger.WarnContext(ctx, "retomada falhou; o item volta quando o lease expirar", attrs...)
 		return
 	}
 	switch res.Outcome {
+	case app.ResumeFailed:
+		// Falhas não transitórias esgotadas: FAILED RETRIES_EXHAUSTED (T30).
+		w.observe(metrics.OutcomeError, elapsed)
+		if w.metrics != nil {
+			w.metrics.TransactionResult(metrics.SourceWorker, res.Kind.String(), res.Status.String())
+		}
+		w.logger.ErrorContext(ctx, "item envenenado encerrado como FAILED",
+			slog.String("transactionId", c.ID.String()), slog.String("failureCode", res.FailureCode.String()),
+			slog.Int("resumeFailures", int(res.ResumeFailures)), logging.Err(res.Cause))
 	case app.ResumeResolved, app.ResumeExpired:
 		outcome := metrics.OutcomeSuccess
 		if res.Status == domain.WagerStatusRejected {

@@ -25,10 +25,11 @@ func ConfigFrom(c config.Config) Config {
 // backoff) a partir da configuração da aplicação.
 func PolicyFrom(c config.Config) app.PendingWagerPolicy {
 	return app.PendingWagerPolicy{
-		MaxAttempts:    c.Workers.PendingReferenceMaxAttempts,
-		TTL:            c.Workers.PendingReferenceTTL,
-		RetryBaseDelay: c.Workers.PendingReferenceRetryBaseDelay,
-		RetryMaxDelay:  c.Workers.PendingReferenceRetryMaxDelay,
+		MaxAttempts:       c.Workers.PendingReferenceMaxAttempts,
+		TTL:               c.Workers.PendingReferenceTTL,
+		RetryBaseDelay:    c.Workers.PendingReferenceRetryBaseDelay,
+		RetryMaxDelay:     c.Workers.PendingReferenceRetryMaxDelay,
+		MaxResumeFailures: c.Workers.PendingWorker.MaxFailures,
 	}
 }
 

@@ -21,7 +21,7 @@ func fxConfig() config.Config {
 	c.Workers.PendingReferenceRetryMaxDelay = 10 * time.Second
 	c.Workers.PendingWorker = config.PendingWorkerConfig{
 		PollInterval: 10 * time.Millisecond, BatchSize: 5, Concurrency: 2, Lease: time.Minute,
-		ProcessTimeout: time.Second, DrainTimeout: time.Second, OrphanGrace: time.Second,
+		ProcessTimeout: time.Second, DrainTimeout: time.Second, OrphanGrace: time.Second, MaxFailures: 3,
 	}
 	return c
 }
@@ -35,7 +35,8 @@ func TestModuleValidateApp(t *testing.T) {
 func TestPolicyAndConfigFrom(t *testing.T) {
 	c := fxConfig()
 	p := PolicyFrom(c)
-	if p.MaxAttempts != 5 || p.TTL != time.Minute || p.RetryBaseDelay != time.Second || p.RetryMaxDelay != 10*time.Second {
+	if p.MaxAttempts != 5 || p.TTL != time.Minute || p.RetryBaseDelay != time.Second || p.RetryMaxDelay != 10*time.Second ||
+		p.MaxResumeFailures != 3 {
 		t.Fatalf("policy = %+v", p)
 	}
 	wc := ConfigFrom(c)
