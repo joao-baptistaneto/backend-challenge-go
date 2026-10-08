@@ -1,8 +1,8 @@
 -- 0004: inbox do consumidor SQS (README §6.5 e §10). ADR-011.
 --
 -- O registro e a conclusão compartilham a transação SQL das alterações de
--- domínio (T15/T20). (consumer_name, message_id) é a identidade durável da
--- mensagem; request_hash (SHA-256 hex do JSON canônico, T08) detecta reentrega
+-- domínio (ADR-017/ADR-022). (consumer_name, message_id) é a identidade durável da
+-- mensagem; request_hash (SHA-256 hex do JSON canônico, ADR-010) detecta reentrega
 -- com o mesmo messageId e conteúdo diferente.
 
 CREATE TABLE inbox (

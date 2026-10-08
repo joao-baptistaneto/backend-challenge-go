@@ -1,6 +1,6 @@
 // Package apierror define o corpo JSON padronizado das respostas de erro da
 // API HTTP (ARCHITECTURE.md, ADR-019). É compartilhado pelo middleware de
-// autenticação (internal/adapters/auth) e pelos handlers (T18), para que todo
+// autenticação (internal/adapters/auth) e pelos handlers (ADR-020), para que todo
 // erro tenha o mesmo formato independentemente de onde foi produzido.
 package apierror
 

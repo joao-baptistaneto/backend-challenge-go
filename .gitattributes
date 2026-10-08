@@ -7,7 +7,7 @@
 Dockerfile text eol=lf
 # Código Go sempre em LF: com core.autocrlf=true o checkout em CRLF faz o
 # `gofmt -l .` listar todos os arquivos, embora o conteúdo versionado esteja
-# formatado (T29).
+# formatado (ADR-030).
 *.go   text eol=lf
 *.sql  text eol=lf
 go.mod text eol=lf

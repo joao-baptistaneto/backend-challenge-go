@@ -2,7 +2,7 @@
 
 package app_test
 
-// Integração do caso de uso ProcessWagerTransaction (T15) com o adapter
+// Integração do caso de uso ProcessWagerTransaction (ADR-017) com o adapter
 // postgres real: cada tipo de operação, replay, conflitos, concorrência
 // (duplicatas e débitos na mesma carteira), rejeições persistidas, referência
 // ausente, atomicidade e inbox no mesmo commit.
@@ -566,7 +566,7 @@ func TestIntegrationProcessWager_RejectionsPersisted(t *testing.T) {
 
 // ROLLBACK (e REFUND) antes da transação original: PENDING_REFERENCE + evento,
 // sem movimento. A referência chegando depois é processada normalmente; a
-// pendência continua para o worker (T21), e o replay a devolve.
+// pendência continua para o worker (ADR-023), e o replay a devolve.
 func TestIntegrationProcessWager_ReversalBeforeReference(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)

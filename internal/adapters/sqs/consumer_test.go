@@ -369,7 +369,7 @@ func TestConsumerTransientFailuresExhaustToDLQ(t *testing.T) {
 	}
 }
 
-// Achado da avaliação: com o redrive nativo, a seguinte de uma mensagem
+// Achado de revisão: com o redrive nativo, a seguinte de uma mensagem
 // venenosa no mesmo MessageGroupId subia o ApproximateReceiveCount junto com
 // ela e ia para a DLQ sem ser processada. Agora a venenosa vai à DLQ por
 // envio explícito na primeira entrega e o grupo segue.

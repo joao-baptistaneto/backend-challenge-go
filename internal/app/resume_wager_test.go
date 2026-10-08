@@ -13,7 +13,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 )
 
-// Testes unitários de ResumeWagerTransaction (T21) sobre a UnitOfWork em
+// Testes unitários de ResumeWagerTransaction (ADR-023) sobre a UnitOfWork em
 // memória (process_wager_test.go), que espelha claim, fencing e Update.
 
 type testClock struct {

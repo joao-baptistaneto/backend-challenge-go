@@ -1,4 +1,4 @@
--- 0008: índices do claim da outbox com ordem por agregado (T22). ADR-024.
+-- 0008: índices do claim da outbox com ordem por agregado. ADR-024.
 --
 -- O claim do publisher (OutboxRepository.Claim) mudou em dois pontos:
 --   * percorre os não publicados em ORDER BY seq (não por next_attempt_at);

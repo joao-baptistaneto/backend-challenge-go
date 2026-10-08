@@ -1,5 +1,5 @@
 -- 0009: contador de falhas consecutivas da retomada pelo worker de pendências
--- (T30). ADR-031.
+-- (ADR-031).
 --
 -- resume_failures conta as retomadas (ResumeWagerTransaction.Resume) que
 -- falharam por erro NÃO transitório desde a última retomada bem-sucedida. É um

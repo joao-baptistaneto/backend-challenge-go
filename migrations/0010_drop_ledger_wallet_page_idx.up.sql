@@ -1,4 +1,4 @@
--- 0010: remove o índice sem uso wallet_ledger_entries_wallet_page_idx (T33).
+-- 0010: remove o índice sem uso wallet_ledger_entries_wallet_page_idx (ADR-034).
 -- ADR-011 (revisão), ADR-014.
 --
 -- O índice (wallet_id, created_at, id) foi criado na 0003 para a paginação

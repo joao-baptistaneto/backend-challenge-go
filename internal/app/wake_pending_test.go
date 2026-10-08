@@ -9,7 +9,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 )
 
-// Wake-up de pendências quando a referência chega (T31, ADR-032), sobre a
+// Wake-up de pendências quando a referência chega (ADR-032), sobre a
 // UnitOfWork em memória (process_wager_test.go), que espelha o adapter.
 
 // A referência gravada num estado terminal acorda, na mesma transação, a

@@ -255,7 +255,7 @@ func pendingReferenceRow(currency string, round string) fakeWagerRow {
 // bem formada para o CHECK, mas não suportada) — é marcada com
 // domain.ErrCorruptedWagerTransaction: é estado persistido inválido, não erro
 // de entrada (ValidationFailureCode não a mapeia), e o worker a encerra pelo
-// caminho sem agregado (T30, ADR-031).
+// caminho sem agregado (ADR-031).
 func TestScanWager_RehydrationErrorsAreCorrupted(t *testing.T) {
 	if _, err := scanWager(pendingReferenceRow("BRL", "round-1")); err != nil {
 		t.Fatalf("valid row: %v", err)

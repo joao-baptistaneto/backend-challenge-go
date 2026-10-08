@@ -2,7 +2,7 @@
 
 package pendingworker
 
-// Infraestrutura dos testes de integração do worker (T21). Mesmo padrão dos
+// Infraestrutura dos testes de integração do worker (ADR-023). Mesmo padrão dos
 // demais pacotes: TEST_DATABASE_URL (precisa de CREATE/DROP DATABASE) ou,
 // na ausência, PostgreSQL real via testcontainers; um banco novo e exclusivo
 // por teste, com todas as migrations aplicadas. Ao fim, falha se sobrar

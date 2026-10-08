@@ -198,7 +198,7 @@ const (
 )
 
 // Defaults de autorização (ARCHITECTURE.md, ADR-019). Os nomes são os
-// provisionados no realm do Keycloak (T24).
+// provisionados no realm do Keycloak (ADR-026).
 const (
 	DefaultOIDCProviderClaim = "provider_id"
 	DefaultOIDCProviderRole  = "wager-provider"
@@ -277,7 +277,7 @@ func (c AWSConfig) HasStaticCredentials() bool {
 
 // SQSConfig agrupa as URLs das filas. Todas são FIFO.
 //
-// A fila de eventos de saída padronizada é "wager-events.fifo" (T22,
+// A fila de eventos de saída padronizada é "wager-events.fifo" (ADR-024,
 // ADR-024; antes .env.example citava "wallet-events.fifo"). O nome é
 // configuração, não código: este pacote só exige uma URL FIFO válida.
 type SQSConfig struct {
@@ -407,7 +407,7 @@ type PendingWorkerConfig struct {
 	// ser retomado como órfão.
 	OrphanGrace time.Duration
 	// MaxFailures é o número de falhas consecutivas NÃO transitórias da
-	// retomada de um item que o encerram como FAILED RETRIES_EXHAUSTED (T30,
+	// retomada de um item que o encerram como FAILED RETRIES_EXHAUSTED (ADR-031,
 	// ADR-031).
 	MaxFailures int
 }

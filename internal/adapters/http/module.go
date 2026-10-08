@@ -59,7 +59,7 @@ func NewHandlerFx(p Params) (http.Handler, error) {
 // Module provê o http.Handler nomeado "apiHandler". Depende dos casos de
 // uso (app.Module), de *auth.Authenticator e *auth.Authorizer (auth.Module);
 // métricas, logger, MetricsAccess e verificações de prontidão são opcionais.
-// O servidor e seu ciclo de vida ficam em httpserver.Module (T19, ADR-021).
+// O servidor e seu ciclo de vida ficam em httpserver.Module (ADR-021).
 var Module = fx.Module("http",
 	fx.Provide(fx.Annotate(NewHandlerFx, fx.ResultTags(`name:"`+HandlerName+`"`))),
 )

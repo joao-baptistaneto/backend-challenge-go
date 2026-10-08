@@ -14,7 +14,7 @@ import (
 )
 
 // Caso de uso ResumeWagerTransaction: retomada durável de transações não
-// terminais pelo worker (ARCHITECTURE.md, ADR-023, T21).
+// terminais pelo worker (ARCHITECTURE.md, ADR-023).
 //
 // Decisões:
 //
@@ -57,7 +57,7 @@ import (
 //     PENDING → PENDING_REFERENCE gera WagerTransactionPendingReference; o
 //     reagendamento não gera evento (ADR-012). correlationId = id da
 //     transação e causationId = token do claim (rastreável até o lote).
-//   - Falhas (T30, ADR-031). Transitórias (ErrUnavailable: conexão,
+//   - Falhas (ADR-031). Transitórias (ErrUnavailable: conexão,
 //     serialização, deadlock, timeout/prazo; e cancelamento) fazem rollback
 //     (retry limitado do UnitOfWork) e NÃO contam: esgotado o retry, o lease
 //     continua gravado e o item volta quando ele expirar, como antes, então
@@ -85,7 +85,7 @@ const (
 	DefaultPendingReferenceTTL         = 10 * time.Minute
 	DefaultPendingReferenceMaxDelay    = time.Minute
 	// DefaultPendingWorkerMaxFailures é o padrão de falhas consecutivas não
-	// transitórias da retomada antes de FAILED (T30).
+	// transitórias da retomada antes de FAILED (ADR-031).
 	DefaultPendingWorkerMaxFailures = 5
 )
 
@@ -103,7 +103,7 @@ type PendingWagerPolicy struct {
 	// MaxResumeFailures é o número de falhas consecutivas NÃO transitórias
 	// da retomada de um item que o leva a FAILED RETRIES_EXHAUSTED (>= 1).
 	// O backoff entre elas usa RetryBaseDelay/RetryMaxDelay (Delay). O TTL
-	// também encerra: uma falha depois dele já é a última. (T30, ADR-031.)
+	// também encerra: uma falha depois dele já é a última. (ADR-031.)
 	MaxResumeFailures int
 }
 
@@ -186,11 +186,11 @@ const (
 	ResumeSkipped ResumeOutcome = "SKIPPED"
 	// ResumeDeferred: a retomada falhou por erro não transitório; a falha foi
 	// contada (ResumeFailures) e o item fica retido até HeldUntil (backoff).
-	// Resume devolve este resultado JUNTO com o erro original (T30).
+	// Resume devolve este resultado JUNTO com o erro original (ADR-031).
 	ResumeDeferred ResumeOutcome = "DEFERRED"
 	// ResumeFailed: falhas não transitórias esgotadas (MaxResumeFailures ou
 	// TTL); a transação foi gravada FAILED RETRIES_EXHAUSTED. Terminal: Resume
-	// devolve erro nil e a causa em Cause (T30).
+	// devolve erro nil e a causa em Cause (ADR-031).
 	ResumeFailed ResumeOutcome = "FAILED"
 )
 
@@ -305,7 +305,7 @@ func (uc *ResumeWagerTransaction) Resume(ctx context.Context, id, token uuid.UUI
 }
 
 // countsAsResumeFailure decide se o erro de uma retomada conta para o limite
-// de falhas (T30, ADR-031). Não contam: cancelamento/prazo do próprio ctx
+// de falhas (ADR-031). Não contam: cancelamento/prazo do próprio ctx
 // (shutdown, ProcessTimeout) e falhas transitórias de infraestrutura
 // (ErrUnavailable: conexão, serialização, deadlock, lock/statement timeout,
 // commit ambíguo). Elas não dizem nada sobre o item e, contadas, uma queda do

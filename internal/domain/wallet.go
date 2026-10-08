@@ -27,7 +27,7 @@ import (
 //     alteram a versão.
 //   - Concorrência: o agregado NÃO é seguro para uso concorrente em memória; ele
 //     vive dentro de uma única transação SQL. A coordenação entre escritores é
-//     feita no banco, por carteira (T12): SELECT ... FOR UPDATE da linha da
+//     feita no banco, por carteira (ADR-014): SELECT ... FOR UPDATE da linha da
 //     carteira (pessimista) + UPDATE ... WHERE id = $1 AND version =
 //     PersistedVersion() (otimista, defesa em profundidade). Se o UPDATE afetar
 //     0 linhas, houve escrita concorrente e a operação é refeita — uma
@@ -47,7 +47,7 @@ import (
 var (
 	// ErrInsufficientFunds indica débito que deixaria o saldo negativo. A
 	// distinção entre aposta (INSUFFICIENT_FUNDS) e reversão
-	// (REVERSAL_INSUFFICIENT_FUNDS) é feita pelas regras de operação (T06).
+	// (REVERSAL_INSUFFICIENT_FUNDS) é feita pelas regras de operação (ADR-009).
 	ErrInsufficientFunds = errors.New("wallet: insufficient funds")
 	// ErrUninitializedWallet indica uso do zero-value (ou nil) de Wallet.
 	ErrUninitializedWallet = errors.New("wallet: uninitialized wallet")
@@ -64,7 +64,7 @@ var (
 const InitialWalletVersion int64 = 1
 
 // newLedgerEntryID gera o id do lançamento. UUIDv7 é ordenável por tempo, o que
-// favorece índices e a paginação keyset do ledger (T12). É variável de pacote
+// favorece índices e a paginação keyset do ledger (ADR-014). É variável de pacote
 // apenas para permitir testar a falha do gerador.
 var newLedgerEntryID = uuid.NewV7
 
@@ -90,7 +90,7 @@ type Wallet struct {
 type NewWalletParams struct {
 	// ID da carteira (gerado pelo caso de uso, ex.: UUIDv7).
 	ID uuid.UUID
-	// PlayerID do jogador. (PlayerID, moeda) é único — garantido pelo schema (T10).
+	// PlayerID do jogador. (PlayerID, moeda) é único — garantido pelo schema (ADR-011).
 	PlayerID uuid.UUID
 	// InitialBalance define moeda e saldo inicial; deve ser >= 0.
 	InitialBalance Money
@@ -107,7 +107,7 @@ type NewWalletParams struct {
 // Se InitialBalance > 0, devolve também o lançamento CREDIT de abertura
 // (balanceBefore 0, balanceAfter InitialBalance), sem incrementar a versão. Se
 // InitialBalance == 0, o lançamento é nil: abertura com saldo zero não gera
-// OPENING, ledger nem eventos financeiros (T14).
+// OPENING, ledger nem eventos financeiros (ADR-016).
 func NewWallet(p NewWalletParams) (*Wallet, *WalletLedgerEntry, error) {
 	if p.ID == uuid.Nil {
 		return nil, nil, fmt.Errorf("%w: nil wallet id", ErrInvalidWallet)

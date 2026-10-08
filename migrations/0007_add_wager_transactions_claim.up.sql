@@ -1,5 +1,5 @@
 -- 0007: lease persistido do worker de referências pendentes e PENDING órfãos
--- (T21). ADR-023.
+-- (ADR-023).
 --
 -- O worker reivindica linhas vencidas num comando curto (UPDATE ... FROM
 -- (SELECT ... FOR NO KEY UPDATE SKIP LOCKED)) e as processa depois, uma a uma,

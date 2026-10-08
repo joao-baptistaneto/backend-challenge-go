@@ -22,7 +22,7 @@ import (
 //     rejeições já decididas. As unicidades de idempotência viram sentinelas
 //     (ErrDuplicateExternalTransaction, ErrDuplicateIdempotencyKey,
 //     ErrOpeningAlreadyExists, ErrReferenceAlreadyReversed); o caso de uso
-//     (T15) relê a linha vencedora e devolve replay ou conflito.
+//     (ADR-017) relê a linha vencedora e devolve replay ou conflito.
 //   - Update grava só as colunas de resultado e agendamento, e só se a linha
 //     ainda não é terminal (WHERE status IN ('PENDING','PENDING_REFERENCE')).
 //     Transação já terminal devolve ErrTransactionFinalized; o trigger
@@ -31,12 +31,12 @@ import (
 //     lock da carteira, que serializa as operações da mesma carteira). Update
 //     também solta o lease do worker (claimed_by/claimed_until = NULL) e zera
 //     resume_failures, salvo ao gravar FAILED (o contador fica para
-//     auditoria; T30, ADR-031).
-//   - LockClaimedForFailure, RecordResumeFailure e FailClaimedUnreadable (T30,
+//     auditoria; ADR-031).
+//   - LockClaimedForFailure, RecordResumeFailure e FailClaimedUnreadable (ADR-031,
 //     ADR-031) registram falhas não transitórias da retomada sem reidratar a
 //     linha (o item envenenado pode ser justamente uma linha que não
 //     reidrata), sempre com o fencing do lease (claimed_by = token).
-//   - ClaimDue (T21, ADR-023) grava um lease na linha (claimed_by =
+//   - ClaimDue (ADR-023) grava um lease na linha (claimed_by =
 //     token, claimed_until = now + lease) num único comando, escolhendo as
 //     linhas com FOR NO KEY UPDATE SKIP LOCKED: várias instâncias pegam lotes
 //     disjuntos sem esperar umas pelas outras, e um worker que morre não perde
@@ -153,7 +153,7 @@ func (WagerTransactionRepository) GetByProviderIdempotencyKey(ctx context.Contex
 
 // ListByProviderReference lista, em ordem de criação, as operações do
 // provedor que citam referenceExternalTransactionId, em qualquer estado. É a
-// lista de reversões existentes que DecideWager (T06) recebe.
+// lista de reversões existentes que DecideWager (ADR-009) recebe.
 func (WagerTransactionRepository) ListByProviderReference(ctx context.Context, q Querier, providerID, referenceExternalTransactionID string) ([]*domain.WagerTransaction, error) {
 	return listWagers(ctx, q, "postgres: listar transações por referência",
 		`SELECT `+wagerColumns+` FROM wager_transactions
@@ -181,12 +181,12 @@ WHERE w.id = due.id AND w.status = 'PENDING_REFERENCE'`
 // WakePendingReferences antecipa para now (nunca antes de created_at) o
 // next_attempt_at das transações PENDING_REFERENCE do provedor providerID que
 // citam externalTransactionID e cujo next_attempt_at ainda está no futuro
-// (T31, ADR-032). Devolve quantas linhas foram acordadas.
+// (ADR-032). Devolve quantas linhas foram acordadas.
 //
 //   - Só next_attempt_at muda: attempts, updated_at, o lease (claimed_by,
 //     claimed_until) e resume_failures ficam intactos. Uma linha reivindicada
 //     continua do worker que a reivindicou (fencing) e uma linha retida pelo
-//     backoff de falhas (T30, claimed_until no futuro) continua retida —
+//     backoff de falhas (ADR-031, claimed_until no futuro) continua retida —
 //     ClaimDue exige o lease vencido.
 //   - Isolamento por provedor: o filtro é (provider_id, reference_external_
 //     transaction_id), o mesmo par do índice parcial
@@ -367,7 +367,7 @@ FOR NO KEY UPDATE`, id, token)
 }
 
 // ResumeFailureState é o estado operacional de uma linha reivindicada, lido
-// sem reidratar o agregado (T30, ADR-031).
+// sem reidratar o agregado (ADR-031).
 type ResumeFailureState struct {
 	Status    domain.WagerStatus
 	CreatedAt time.Time
@@ -599,7 +599,7 @@ func scanWager(row pgx.Row) (*domain.WagerTransaction, error) {
 // suporta) com domain.ErrCorruptedWagerTransaction. Assim quem lê distingue
 // "a linha persistida é inválida" de erro de entrada (ValidationFailureCode
 // não a confunde com INVALID_CURRENCY) e o worker encerra o item envenenado
-// pelo caminho sem agregado (T30, ADR-031) em vez de repetir para sempre.
+// pelo caminho sem agregado (ADR-031) em vez de repetir para sempre.
 func corruptedWager(id uuid.UUID, err error) error {
 	if errors.Is(err, domain.ErrCorruptedWagerTransaction) {
 		return fmt.Errorf("reidratar transação %s: %w", id, err)

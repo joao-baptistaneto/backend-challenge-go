@@ -2,7 +2,7 @@
 
 package postgres_test
 
-// Integração dos repositórios de wallet, ledger e transação (T12) contra
+// Integração dos repositórios de wallet, ledger e transação (ADR-014) contra
 // PostgreSQL real (TEST_DATABASE_URL ou testcontainers; banco novo por teste,
 // ver main_integration_test.go).
 
@@ -78,7 +78,7 @@ func (r repos) within(t *testing.T, fn func(ctx context.Context, tx pgx.Tx) erro
 	return r.tm.WithinTx(t.Context(), fn)
 }
 
-// openWallet abre uma carteira como o caso de uso OpenWallet faria (T14):
+// openWallet abre uma carteira como o caso de uso OpenWallet faria (ADR-016):
 // carteira, OPENING e lançamento de abertura no mesmo commit.
 func (r repos) openWallet(t *testing.T, balance string, now time.Time) *domain.Wallet {
 	t.Helper()

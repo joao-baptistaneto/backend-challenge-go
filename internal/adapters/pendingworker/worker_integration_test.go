@@ -2,7 +2,7 @@
 
 package pendingworker
 
-// Integração do worker de pendências (T21) contra PostgreSQL real:
+// Integração do worker de pendências (ADR-023) contra PostgreSQL real:
 // resolução após a chegada da referência, expiração, sobrevivência a
 // restart (inclusive crash com lease gravado e PENDING órfão) e várias
 // instâncias concorrentes sem duplicidade. Cada "instância" tem pool,

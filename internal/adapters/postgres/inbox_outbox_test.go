@@ -49,7 +49,7 @@ func TestExponentialDelay(t *testing.T) {
 	}
 }
 
-// Pendência da T11: sem MaxDelay o backoff estourava int64 por volta da 41ª
+// Regressão (ADR-013): sem MaxDelay o backoff estourava int64 por volta da 41ª
 // tentativa e rand.Int64N entrava em panic.
 func TestRetryBackoffWithoutMaxDelayDoesNotOverflow(t *testing.T) {
 	t.Parallel()

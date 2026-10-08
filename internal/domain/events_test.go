@@ -671,7 +671,7 @@ func TestIntegrationEvents_InvalidInput(t *testing.T) {
 	}
 }
 
-// TestWalletBalanceChanged_ABA cobre a pendência da T07: a carteira é
+// TestWalletBalanceChanged_ABA cobre o caso ABA (ADR-012): a carteira é
 // movimentada de novo e volta ao mesmo saldo (A-B-A). O saldo bate com o
 // balanceAfter do primeiro lançamento, mas a versão não. O construtor precisa
 // recusar, em vez de emitir a walletVersion errada.

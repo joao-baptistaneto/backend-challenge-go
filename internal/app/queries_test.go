@@ -19,9 +19,9 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 )
 
-// Testes unitários de ReconcileWallet e Queries (T16) sobre a memUoW.
+// Testes unitários de ReconcileWallet e Queries (ADR-018) sobre a memUoW.
 
-// --- leituras da memUoW (T16) -------------------------------------------------
+// --- leituras da memUoW (ADR-018) -------------------------------------------------
 
 func (s memWallets) Get(_ context.Context, id uuid.UUID) (*domain.Wallet, error) {
 	w, ok := s.s.wallets[id]

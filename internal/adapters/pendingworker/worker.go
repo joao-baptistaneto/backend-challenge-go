@@ -1,6 +1,6 @@
 // Package pendingworker é o adapter de entrada temporizado que retoma
 // transações pendentes: referências ainda indisponíveis (PENDING_REFERENCE) e
-// PENDING órfãos (ARCHITECTURE.md, ADR-023, T21).
+// PENDING órfãos (ARCHITECTURE.md, ADR-023).
 //
 // Decisões:
 //
@@ -15,7 +15,7 @@
 //     (ProcessTimeout) não é iniciado: volta para outra instância quando o
 //     lease expirar, em vez de ser processado em cima da expiração.
 //   - Falhas de um item não derrubam o ciclo. Transitórias: o lease continua
-//     gravado e o item volta quando ele expirar. Não transitórias (T30,
+//     gravado e o item volta quando ele expirar. Não transitórias (ADR-031,
 //     ADR-031): o caso de uso conta a falha e retém o item com backoff
 //     exponencial; esgotado PENDING_WORKER_MAX_FAILURES (ou o TTL), grava
 //     FAILED RETRIES_EXHAUSTED, então um item envenenado sempre termina. Falha
@@ -251,7 +251,7 @@ func (w *Worker) runCycle(ctx, procCtx context.Context) (int, bool, error) {
 	if len(claimed) == 0 {
 		return 0, false, nil
 	}
-	// Teste de recuperação (T26, ADR-028): crash com o lote reivindicado
+	// Teste de recuperação (ADR-028): crash com o lote reivindicado
 	// (lease gravado) e nenhuma retomada iniciada. No build normal é vazia.
 	failpoint.Hit(failpoint.PendingAfterClaim)
 	// Prazo para iniciar um item: o lease precisa cobrir um processamento
@@ -315,7 +315,7 @@ func (w *Worker) process(ctx context.Context, c app.ClaimedWager, token uuid.UUI
 	}
 	switch res.Outcome {
 	case app.ResumeFailed:
-		// Falhas não transitórias esgotadas: FAILED RETRIES_EXHAUSTED (T30).
+		// Falhas não transitórias esgotadas: FAILED RETRIES_EXHAUSTED (ADR-031).
 		w.observe(metrics.OutcomeError, elapsed)
 		if w.metrics != nil {
 			w.metrics.TransactionResult(metrics.SourceWorker, res.Kind.String(), res.Status.String())

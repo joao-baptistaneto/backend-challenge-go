@@ -2,7 +2,7 @@
 
 package app_test
 
-// Integração da reconciliação e das consultas (T16) com o adapter postgres
+// Integração da reconciliação e das consultas (ADR-018) com o adapter postgres
 // real: caso consistente e divergente sem alteração de dados, transação
 // REPEATABLE READ + READ ONLY de fato (escrita recusada, snapshot estável sob
 // commit concorrente), métrica e log de divergência, consultas com
@@ -511,7 +511,7 @@ func TestIntegrationQueries_TransactionsIsolatedByProvider(t *testing.T) {
 }
 
 // Composição Fx: o metrics.Module fornece *metrics.Metrics como
-// ReconciliationRecorder (fiação prevista para cmd/server, T23).
+// ReconciliationRecorder (fiação prevista para cmd/server, ADR-025).
 func TestIntegrationReconcile_FxComposition(t *testing.T) {
 	t.Parallel()
 	dsn := migratedDSN(t)

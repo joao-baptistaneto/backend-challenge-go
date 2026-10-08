@@ -2,7 +2,7 @@
 
 package pendingworker
 
-// Integração do limite de falhas da retomada (T30, ADR-031) contra
+// Integração do limite de falhas da retomada (ADR-031) contra
 // PostgreSQL real: itens envenenados terminam FAILED RETRIES_EXHAUSTED (sem
 // loop infinito, sem mexer em saldo, ledger ou outbox), um item saudável do
 // mesmo lote é resolvido normalmente, o replay devolve o estado final e a

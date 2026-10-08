@@ -131,7 +131,7 @@
     {
       "clientId": "e2e-short-lived",
       "name": "E2E: token de vida curta",
-      "description": "DEV/TESTE ONLY (T27, ADR-029): sem papéis da aplicação; token de acesso de 5s para testar expiração com token real.",
+      "description": "DEV/TESTE ONLY (ADR-029): sem papéis da aplicação; token de acesso de 5s para testar expiração com token real.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
@@ -163,7 +163,7 @@
     {
       "clientId": "e2e-other-audience",
       "name": "E2E: audiência errada",
-      "description": "DEV/TESTE ONLY (T27, ADR-029): papel wager-provider e provider_id, mas SEM o mapper de audiência wallet-api; a API deve recusar o token (401).",
+      "description": "DEV/TESTE ONLY (ADR-029): papel wager-provider e provider_id, mas SEM o mapper de audiência wallet-api; a API deve recusar o token (401).",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,

@@ -1,6 +1,6 @@
 // Package outboxpublisher é o worker que publica a transactional outbox na
 // fila FIFO de eventos de integração (wager-events.fifo). ARCHITECTURE.md,
-// ADR-024, T22.
+// ADR-024.
 //
 // Decisões:
 //
@@ -339,7 +339,7 @@ func (p *Publisher) runCycle(ctx, procCtx context.Context) (int, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
-	// Teste de recuperação (T26, ADR-028): crash com o lote reivindicado e
+	// Teste de recuperação (ADR-028): crash com o lote reivindicado e
 	// nada enviado. No build normal é uma função vazia.
 	failpoint.Hit(failpoint.OutboxAfterClaim)
 	// Um item só começa se envio e marcação ainda couberem no lease. claimedAt
@@ -441,7 +441,7 @@ func (p *Publisher) publish(ctx context.Context, m postgres.OutboxMessage) {
 		p.failed(ctx, m, err, start)
 		return
 	}
-	// Teste de recuperação (T26, ADR-028): crash entre a publicação e a
+	// Teste de recuperação (ADR-028): crash entre a publicação e a
 	// marcação. No build normal é uma função vazia.
 	failpoint.Hit(failpoint.OutboxAfterSend)
 	publishedAt := p.now()

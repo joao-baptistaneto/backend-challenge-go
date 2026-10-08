@@ -2,7 +2,7 @@
 
 package outboxpublisher
 
-// Infraestrutura dos testes de integração do publisher (T22).
+// Infraestrutura dos testes de integração do publisher (ADR-024).
 //
 //   - PostgreSQL (sempre): TEST_DATABASE_URL (precisa de CREATE/DROP
 //     DATABASE) ou, na ausência, container real via testcontainers. Um banco

@@ -13,11 +13,11 @@ import (
 )
 
 // Decisão arquitetural (ADR-012 em ARCHITECTURE.md): eventos de integração
-// tipados, publicados via transactional outbox (T13/T22).
+// tipados, publicados via transactional outbox (ADR-015/ADR-024).
 //
 //   - Envelope: {eventId, eventType, aggregateId, correlationId, causationId?,
 //     occurredAt, version, data}. eventId é UUIDv7 gerado no construtor e é a
-//     identidade estável do evento: o publisher (T22) o usa como
+//     identidade estável do evento: o publisher (ADR-024) o usa como
 //     MessageDeduplicationId e republicações preservam o mesmo id, porque o
 //     payload é lido da outbox e nunca reconstruído.
 //   - Tipo e versão: cada tipo de data (sealed, EventData) declara seu
@@ -45,7 +45,7 @@ import (
 //   - Dados sensíveis: idempotencyKey e requestHash nunca entram nos eventos
 //     (são detalhes de transporte/idempotência). WagerTransactionRejected nunca
 //     carrega referenceTransactionId: em REFERENCE_MISMATCH ele é o id interno
-//     de uma transação de OUTRA carteira/jogador (ressalva da T06), e nos demais
+//     de uma transação de OUTRA carteira/jogador (ressalva das regras de reversão, ADR-009), e nos demais
 //     códigos a referência externa (do próprio provedor) basta. Rejeições
 //     WALLET_NOT_FOUND, WALLET_PLAYER_MISMATCH e CURRENCY_MISMATCH nunca levam
 //     saldo, mesmo que a transação tenha um, para não expor a carteira de outro
@@ -437,7 +437,7 @@ func NewWagerTransactionRejectedEvent(tx *WagerTransaction, meta EventMetadata) 
 
 // NewWagerTransactionPendingReferenceEvent cria WagerTransactionPendingReference
 // a partir de uma transação PENDING_REFERENCE. occurredAt = UpdatedAt (instante
-// do registro da espera). Política da aplicação (T15/T21): emitir na transição
+// do registro da espera). Política da aplicação (ADR-017/ADR-023): emitir na transição
 // PENDING -> PENDING_REFERENCE (attempts = 1); reagendamentos do worker não
 // precisam emitir de novo. O domínio não impõe isso, e attempts vai no payload
 // para que o consumidor distinga.

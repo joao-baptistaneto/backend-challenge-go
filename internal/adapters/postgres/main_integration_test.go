@@ -2,7 +2,7 @@
 
 package postgres_test
 
-// Infraestrutura dos testes de integração do pool/TxManager (T11). Mesmo
+// Infraestrutura dos testes de integração do pool/TxManager (ADR-013). Mesmo
 // padrão de internal/adapters/postgres/migrate: TEST_DATABASE_URL (precisa de
 // CREATE/DROP DATABASE) ou, na ausência, PostgreSQL real via testcontainers;
 // um banco novo e exclusivo por teste, com todas as migrations aplicadas.

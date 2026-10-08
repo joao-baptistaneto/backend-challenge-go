@@ -2,7 +2,7 @@
 --
 -- Money: BIGINT em centavos (escala fixa 2) + CHAR(3) ISO 4217. Nenhum tipo de
 -- ponto flutuante é usado no schema.
--- Concorrência: SELECT ... FOR UPDATE + UPDATE ... WHERE version = $old (T12). O
+-- Concorrência: SELECT ... FOR UPDATE + UPDATE ... WHERE version = $old (ADR-014). O
 -- trigger abaixo garante no banco que toda mudança de saldo incrementa a versão
 -- em exatamente 1 (e que a versão não muda sem mudança de saldo), de modo que um
 -- UPDATE que "esqueça" a versão não passa e o controle otimista continua válido.
@@ -30,7 +30,7 @@ CREATE TABLE wallets (
 
 -- Guarda de UPDATE: identidade imutável, versão acoplada ao saldo e updated_at
 -- monotônico. SQLSTATE 23001 (restrict_violation) com nome de constraint
--- explícito, para que a camada de persistência (T11) classifique o erro.
+-- explícito, para que a camada de persistência (ADR-013) classifique o erro.
 CREATE FUNCTION wallets_guard_update() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN

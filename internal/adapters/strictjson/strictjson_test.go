@@ -135,7 +135,7 @@ const jsonBackslash = "\x5c"
 func esc(hex string) string { return jsonBackslash + "u" + hex }
 
 // TestMoneyObjectRules fixa as regras de objeto equivalentes às de
-// domain.Money.UnmarshalJSON (T32, ADR-033; casos espelhados de
+// domain.Money.UnmarshalJSON (ADR-033; casos espelhados de
 // TestJSONUnmarshalStrict e TestJSONUnmarshalEscapes): caixa exata, sem
 // repetição (inclusive via escape), sem extras, ambos obrigatórios, escapes
 // aceitos. Diferença deliberada: aqui negativos são rejeitados

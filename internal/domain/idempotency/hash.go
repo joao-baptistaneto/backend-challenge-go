@@ -1,5 +1,5 @@
 // Package idempotency calcula o hash canônico dos campos de negócio de uma
-// operação de provedor (T08). A mesma função é usada pela entrada HTTP
+// operação de provedor (ADR-010). A mesma função é usada pela entrada HTTP
 // (POST /wagering/transactions) e pelo consumidor SQS (WagerTransactionRequested),
 // de modo que a mesma operação produz o mesmo RequestHash nas duas origens.
 //

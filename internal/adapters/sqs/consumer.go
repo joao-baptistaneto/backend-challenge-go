@@ -38,7 +38,7 @@ import (
 //     (domain.ParseExternalWagerKind).
 //  2. ProcessWagerTransaction.Execute com Inbox{consumerName, messageId do
 //     envelope}: inbox, efeitos financeiros, ledger, outbox e conclusão da
-//     inbox no MESMO commit (T15).
+//     inbox no MESMO commit (ADR-017).
 //  3. Resultado confirmado (PROCESSED, REJECTED, PENDING_REFERENCE ou replay)
 //     → DeleteMessage, só depois do commit. Rejeição de negócio é resultado
 //     persistido: a mensagem é apagada.
@@ -774,7 +774,7 @@ func (c *Consumer) handleMessage(m types.Message) bool {
 		if res.FailureCode != "" {
 			attrs = append(attrs, slog.String("failureCode", res.FailureCode.String()))
 		}
-		// Teste de recuperação (T26, ADR-028): crash depois do commit e
+		// Teste de recuperação (ADR-028): crash depois do commit e
 		// antes do DeleteMessage. No build normal é uma função vazia.
 		failpoint.Hit(failpoint.SQSConsumerAfterCommit)
 		if derr := c.delete(m); derr != nil {

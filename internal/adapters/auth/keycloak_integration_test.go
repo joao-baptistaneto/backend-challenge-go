@@ -16,8 +16,8 @@ package auth
 //	KEYCLOAK_EXPECT_PROVIDER_ID  providerId esperado no token (opcional)
 //	KEYCLOAK_EXPECT_ROLE         papel esperado no token (opcional)
 //
-// Nesta máquina não há Docker/Keycloak: o teste faz Skip. Ele é executado de
-// verdade em T24/T27 com o Keycloak do Docker Compose (realm importado com os
+// Sem KEYCLOAK_URL (sem Docker/Keycloak) o teste faz Skip. Ele é executado de
+// verdade com o Keycloak do Docker Compose (ADR-026/ADR-029; realm importado com os
 // clients provider-a, provider-b e internal-service).
 
 import (
@@ -37,7 +37,7 @@ import (
 func TestKeycloakClientCredentialsToken(t *testing.T) {
 	base := strings.TrimSuffix(os.Getenv("KEYCLOAK_URL"), "/")
 	if base == "" {
-		t.Skip("KEYCLOAK_URL não definido: sem Keycloak disponível. Este teste roda em T24/T27 " +
+		t.Skip("KEYCLOAK_URL não definido: sem Keycloak disponível. Este teste roda " +
 			"com o Keycloak do Docker Compose (defina KEYCLOAK_URL, KEYCLOAK_REALM, " +
 			"KEYCLOAK_CLIENT_ID e KEYCLOAK_CLIENT_SECRET)")
 	}

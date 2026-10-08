@@ -62,7 +62,7 @@ func TestAllRequiredMetricsAreRegistered(t *testing.T) {
 	m.AllowQueues("wager-transactions-dlq.fifo")
 	m.AllowRoutes("/wagering/transactions")
 
-	// Cada item exigido pela T09 / README §12.
+	// Cada item exigido pelo ADR-007 / README §12.
 	m.TransactionResult(SourceHTTP, "BET", "PROCESSED")
 	m.TransactionResult(SourceSQS, "WIN", "REJECTED")
 	m.Duplicate(SourceHTTP, DuplicateReplay)
@@ -163,7 +163,7 @@ func seriesCount(t *testing.T, reg prometheus.Gatherer) map[string]int {
 	return out
 }
 
-// Regressão (avaliação T09): qualquer string virava rótulo (1000 métodos
+// Regressão (revisão): qualquer string virava rótulo (1000 métodos
 // arbitrários = 1000 séries).
 func TestArbitraryLabelInputHasBoundedCardinality(t *testing.T) {
 	reg, m := newTestMetrics(t)

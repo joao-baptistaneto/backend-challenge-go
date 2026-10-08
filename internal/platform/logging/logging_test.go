@@ -209,7 +209,7 @@ func TestConfigSecretNeverLeaks(t *testing.T) {
 	}
 }
 
-// Regressão (avaliação T09): valores KindAny eram serializados sem redação.
+// Regressão (revisão): valores KindAny eram serializados sem redação.
 func TestNestedValuesAreRedacted(t *testing.T) {
 	type creds struct {
 		User     string
@@ -302,7 +302,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 	return u
 }
 
-// Regressão (avaliação T09): texto de erros, mensagens, URLs e Bearer com
+// Regressão (revisão): texto de erros, mensagens, URLs e Bearer com
 // whitespace diferente de espaço vazavam.
 func TestStringsErrorsAndMessagesAreScrubbed(t *testing.T) {
 	cases := map[string]func(l *slog.Logger){
@@ -503,7 +503,7 @@ func TestFxEventLoggerWritesJSON(t *testing.T) {
 	}
 }
 
-// Regressão (avaliação T09, não bloqueantes): []byte saía em base64 sem
+// Regressão (revisão, não bloqueantes): []byte saía em base64 sem
 // redação; "Basic <cred>" no meio do texto vazava; JSON escapado dentro de
 // string não era reconhecido; config.Secret como chave de map saía em claro.
 func TestRedactionEdgeCases(t *testing.T) {
@@ -544,5 +544,154 @@ func TestRedactionEdgeCases(t *testing.T) {
 		if m[k] != want {
 			t.Errorf("%s = %#v, want %#v", k, m[k], want)
 		}
+	}
+}
+
+// duplicateKey devolve erro se line não for um único objeto JSON ou se algum
+// objeto repetir chave (json.Unmarshal aceitaria em silêncio, ficando com a
+// última ocorrência — por isso a varredura por tokens).
+func duplicateKey(line string) error {
+	dec := json.NewDecoder(strings.NewReader(line))
+	if err := scanJSONValue(dec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("conteúdo após o valor: %v", err)
+	}
+	return nil
+}
+
+func scanJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch d {
+	case '{':
+		keys := map[string]bool{}
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			k := kt.(string)
+			if keys[k] {
+				return fmt.Errorf("chave duplicada %q", k)
+			}
+			keys[k] = true
+			if err := scanJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := scanJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("delimitador inesperado %v", d)
+	}
+	_, err = dec.Token() // '}' ou ']'
+	return err
+}
+
+func assertNoDuplicateKeys(t *testing.T, line string) {
+	t.Helper()
+	if err := duplicateKey(line); err != nil {
+		t.Fatalf("%v: %s", err, line)
+	}
+}
+
+func TestDuplicateKeyChecker(t *testing.T) {
+	for _, ok := range []string{`{"a":1,"b":{"a":2},"c":[{"a":1},{"a":2}]}`, `{"a":{"b":[1,[2]],"c":{}},"d":null}`} {
+		if err := duplicateKey(ok); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{`{"a":1,"a":1}`, `{"g":{"x":1,"x":2}}`, `{"l":[{"y":1,"y":1}]}`, `{"a":1}{}`} {
+		if err := duplicateKey(bad); err == nil {
+			t.Errorf("%s: duplicata não detectada", bad)
+		}
+	}
+}
+
+func TestNoDuplicateKeys(t *testing.T) {
+	ctx := WithCorrelationID(context.Background(), "c-ctx")
+	ctx = WithProviderID(ctx, "p-ctx")
+	ctx = WithWalletID(ctx, "w-ctx")
+
+	cases := []struct {
+		name string
+		log  func(l *slog.Logger)
+		want map[string]any // chaves da raiz esperadas
+	}{
+		{
+			// Caso real: caso de uso loga correlationId/providerId que o
+			// middleware HTTP também pôs no contexto. O explícito prevalece.
+			name: "registro repete IDs do contexto",
+			log: func(l *slog.Logger) {
+				l.InfoContext(ctx, "x", CorrelationID("c-ctx"), ProviderID("p-explicit"), "k", 1)
+			},
+			want: map[string]any{KeyCorrelationID: "c-ctx", KeyProviderID: "p-explicit", KeyWalletID: "w-ctx", "k": float64(1)},
+		},
+		{
+			name: "With repete IDs do contexto",
+			log: func(l *slog.Logger) {
+				l.With(CorrelationID("c-with"), "component", "a").InfoContext(ctx, "x", "component", "b")
+			},
+			want: map[string]any{KeyCorrelationID: "c-with", KeyProviderID: "p-ctx", "component": "a"},
+		},
+		{
+			name: "With encadeado e registro repetem a mesma chave",
+			log: func(l *slog.Logger) {
+				l.With("a", 1).With("a", 2, "b", 3).InfoContext(context.Background(), "x", "a", 4, "b", 5, "c", 6, "c", 7)
+			},
+			want: map[string]any{"a": float64(1), "b": float64(3), "c": float64(6)},
+		},
+		{
+			name: "grupo sem chave (inline) repete chave",
+			log: func(l *slog.Logger) {
+				l.InfoContext(ctx, "x", slog.Group("", CorrelationID("c-inline"), "z", 1), "z", 2)
+			},
+			want: map[string]any{KeyCorrelationID: "c-inline", KeyProviderID: "p-ctx", "z": float64(1)},
+		},
+		{
+			// Dentro de um grupo as chaves de ID não colidem com as da raiz:
+			// o contexto continua injetando na raiz; dentro do grupo a
+			// deduplicação vale por nível.
+			name: "WithGroup isola o nível",
+			log: func(l *slog.Logger) {
+				l.With(ProviderID("p-root")).WithGroup("g").With("a", 1, CorrelationID("c-g")).
+					InfoContext(ctx, "x", "a", 2, CorrelationID("c-g2"), "b", 3)
+			},
+			want: map[string]any{KeyCorrelationID: "c-ctx", KeyProviderID: "p-root", KeyWalletID: "w-ctx",
+				"g": map[string]any{"a": float64(1), KeyCorrelationID: "c-g", "b": float64(3)}},
+		},
+		{
+			name: "grupos aninhados",
+			log: func(l *slog.Logger) {
+				l.WithGroup("g").With("a", 1).WithGroup("h").With("a", 2).InfoContext(ctx, "x", "a", 3, "a", 4)
+			},
+			want: map[string]any{KeyCorrelationID: "c-ctx",
+				"g": map[string]any{"a": float64(1), "h": map[string]any{"a": float64(2)}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tc.log(New(&buf, Options{}))
+			assertNoDuplicateKeys(t, strings.TrimSpace(buf.String()))
+			m := decodeOne(t, &buf)
+			for k, v := range tc.want {
+				if fmt.Sprint(m[k]) != fmt.Sprint(v) {
+					t.Errorf("%s = %v, want %v (%v)", k, m[k], v, m)
+				}
+			}
+		})
 	}
 }

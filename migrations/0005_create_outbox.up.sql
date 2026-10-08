@@ -1,7 +1,7 @@
 -- 0005: transactional outbox (README §6.5 e §11). ADR-011.
 --
 -- Eventos são gravados na mesma transação SQL que os originou e publicados
--- depois do commit por um worker (T22). Disputa entre publishers: claim em lote
+-- depois do commit por um worker (ADR-024). Disputa entre publishers: claim em lote
 -- com FOR UPDATE SKIP LOCKED + lease (locked_until/locked_by); lease vencido é
 -- reassumido por outra instância. Backoff exponencial via attempts/next_attempt_at.
 --
@@ -11,7 +11,7 @@
 --  * event_id: identidade estável do evento = MessageDeduplicationId; preservada
 --    em republicações.
 --  * payload: tipo JSON (não JSONB) para guardar o snapshot byte a byte, sem
---    reordenação de chaves; valores monetários são strings decimais (T07).
+--    reordenação de chaves; valores monetários são strings decimais (ADR-012).
 
 CREATE TABLE outbox (
     seq             BIGINT GENERATED ALWAYS AS IDENTITY,

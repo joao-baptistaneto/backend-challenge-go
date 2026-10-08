@@ -2,7 +2,7 @@
 
 package main
 
-// Testes E2E de autenticação/autorização contra o Keycloak real (T27,
+// Testes E2E de autenticação/autorização contra o Keycloak real (ADR-029,
 // ADR-029; README "Autenticação e autorização"). A aplicação completa
 // (cmd/server.Options) sobe com a configuração OIDC de produção apontando
 // para o realm importado do Docker Compose: OIDC_ISSUER_URL =

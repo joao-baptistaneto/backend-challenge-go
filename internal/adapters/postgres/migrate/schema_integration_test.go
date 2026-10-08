@@ -2,7 +2,7 @@
 
 package migrate_test
 
-// Testes das constraints, índices e triggers do schema (T10). Cada caso de
+// Testes das constraints, índices e triggers do schema (ADR-011). Cada caso de
 // CHECK é construído para violar exatamente uma constraint, de modo que o nome
 // reportado pelo PostgreSQL seja determinístico.
 
@@ -204,7 +204,7 @@ func TestWagerTransactionsCheckConstraints(t *testing.T) {
 		r    row
 	}{
 		{"pending BET", f.externalRow(w)},
-		{"FAILED keeps resume_failures (T30)", f.externalRow(w).with(row{
+		{"FAILED keeps resume_failures (ADR-031)", f.externalRow(w).with(row{
 			"status": "FAILED", "failure_code": "RETRIES_EXHAUSTED", "completed_at": t0, "resume_failures": int32(5),
 		})},
 		{"LOSS zero processed", processed(f.externalRow(w).with(row{"kind": "LOSS", "amount": int64(0)}), 7_500)},

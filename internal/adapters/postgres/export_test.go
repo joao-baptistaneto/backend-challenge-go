@@ -7,5 +7,5 @@ import "github.com/junglegaming/backend-challenge-go/internal/app"
 func QuerierOf(tx app.Tx) Querier { return tx.(txStores).q }
 
 // WakePendingReferencesSQL expõe, só para testes, o comando de
-// WakePendingReferences (verificação do plano/índice, T31).
+// WakePendingReferences (verificação do plano/índice, ADR-032).
 const WakePendingReferencesSQL = wakePendingReferencesSQL

@@ -1,6 +1,6 @@
 // Package sqs implementa, com aws-sdk-go-v2/sqs, o consumidor da fila de
-// entrada wager-transactions.fifo (T20, ARCHITECTURE.md ADR-022) e o cliente
-// compartilhado com o publisher da outbox (T22).
+// entrada wager-transactions.fifo (ARCHITECTURE.md, ADR-022) e o cliente
+// compartilhado com o publisher da outbox (ADR-024).
 //
 //   - DecodeEnvelope: envelope WagerTransactionRequested decodificado de forma
 //     estrita (internal/adapters/strictjson), com as regras do HTTP.

@@ -21,15 +21,15 @@ import (
 //   - ApplyWagerDecision aplica a decisão: Wallet.Debit/Credit e a transição da
 //     WagerTransaction. Opera sobre cópias e só substitui carteira e transação
 //     quando ambas as mudanças valem (atomicidade de falha em memória; a
-//     atomicidade durável é a transação SQL do caso de uso, T15). Recusa decisão
+//     atomicidade durável é a transação SQL do caso de uso, ADR-017). Recusa decisão
 //     obsoleta (ErrStaleWagerDecision) se a carteira mudou desde DecideWager.
-//   - Concorrência: o caso de uso (T15/T21) chama as duas etapas dentro da
+//   - Concorrência: o caso de uso (ADR-017/ADR-023) chama as duas etapas dentro da
 //     transação SQL, com a linha da carteira travada (SELECT ... FOR UPDATE,
 //     ADR-005). Referência e reversões pertencem obrigatoriamente à MESMA
 //     carteira (senão REFERENCE_MISMATCH), então o lock da carteira também
 //     serializa todas as reversões de uma referência: o snapshot lido é atual.
 //     A defesa final contra reversão dupla é o índice único parcial do schema
-//     (T10), que espelha a política abaixo.
+//     (ADR-011), que espelha a política abaixo.
 //   - Ordem de avaliação (determinística; o primeiro critério que falha decide):
 //     1. entrada inválida (programação) -> erro ErrInvalidWagerRuleInput;
 //     2. carteira: inexistente (WALLET_NOT_FOUND), de outro jogador
@@ -426,7 +426,7 @@ type ApplyWagerDecisionParams struct {
 	// Decision deve ter sido produzida por DecideWager para Transaction.
 	Decision WagerDecision
 	// NextAttemptAt é o próximo instante de busca da referência (backoff da
-	// aplicação, T21). Obrigatório em AWAIT_REFERENCE e >= Now.
+	// aplicação, ADR-023). Obrigatório em AWAIT_REFERENCE e >= Now.
 	NextAttemptAt time.Time
 	// Now é o instante da aplicação (injetado; nada de relógio global).
 	Now time.Time

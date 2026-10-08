@@ -174,23 +174,92 @@ func (ids IDs) attrs() []slog.Attr {
 	return out
 }
 
-// contextHandler injeta os IDs do contexto em cada registro.
+// contextHandler injeta os IDs do contexto em cada registro e garante que
+// nenhum objeto JSON emitido tenha chaves duplicadas.
 //
 // Os IDs são adicionados no nível raiz do JSON mesmo quando o logger foi
 // derivado com WithGroup, porque são chaves de correlação que ferramentas de
 // busca esperam sempre no mesmo caminho. Para isso o handler guarda as
 // operações WithAttrs/WithGroup e só as reaplica em Handle, depois dos IDs.
-// Quando o contexto não traz IDs, usa o handler derivado pré-computado, sem
-// custo extra por registro.
+// Quando não há nada a injetar nem a descartar, usa o handler derivado
+// pré-computado, sem custo extra por registro.
+//
+// Chaves duplicadas: o slog.JSONHandler não deduplica, e JSON com chave
+// repetida é ambíguo para os consumidores de log (cada parser escolhe uma
+// ocorrência). A regra adotada, por nível (raiz ou grupo aberto com
+// WithGroup), é "o primeiro atributo explícito vence":
+//
+//   - atributos explícitos (With e do próprio registro) prevalecem sobre os
+//     IDs do contexto: o ID do contexto só é injetado se a chave ainda não
+//     existir na raiz. É o caso comum — um caso de uso loga correlationId/
+//     providerId explicitamente e o middleware HTTP também os pôs no contexto;
+//     o valor é o mesmo, então nada se perde;
+//   - entre explícitos, vale a primeira ocorrência na ordem de emissão
+//     (With antes do registro; no registro, a ordem dos atributos). Repetições
+//     posteriores da mesma chave no mesmo nível são descartadas.
+//
+// A deduplicação olha as chaves de cada nível; atributos sem chave que
+// carregam um grupo (inlined pelo slog) contam com as chaves internas. Grupos
+// passados como valor (slog.Group) com chave repetida também são descartados
+// por inteiro; o conteúdo interno de um grupo-valor não é reexaminado.
 type contextHandler struct {
 	root    slog.Handler // handler raiz (sem grupos/atributos derivados)
 	derived slog.Handler // root com ops já aplicadas
 	ops     []handlerOp
+	// rootKeys: chaves já emitidas na raiz via With (antes de qualquer grupo).
+	rootKeys keySet
+	// levelKeys: chaves já emitidas via With no nível corrente (o grupo mais
+	// interno aberto, ou a raiz quando não há grupo — então é igual a rootKeys).
+	levelKeys keySet
+	grouped   bool // há ao menos um WithGroup aplicado
 }
 
 type handlerOp struct {
 	group string      // não vazio → WithGroup
-	attrs []slog.Attr // senão → WithAttrs
+	attrs []slog.Attr // senão → WithAttrs (já deduplicados)
+}
+
+// keySet é imutável após construído (cópia na derivação).
+type keySet map[string]struct{}
+
+func (s keySet) has(k string) bool { _, ok := s[k]; return ok }
+
+func (s keySet) clone(extra int) keySet {
+	out := make(keySet, len(s)+extra)
+	for k := range s {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// dedupAttrs devolve attrs sem as chaves já presentes em seen nem repetições
+// internas, e registra as chaves aceitas em seen. Atributos vazios (que o
+// slog descarta) passam intactos; grupos sem chave são examinados pelos
+// filhos, pois o slog os emite inline no nível corrente.
+func dedupAttrs(attrs []slog.Attr, seen keySet) (out []slog.Attr, changed bool) {
+	out = make([]slog.Attr, 0, len(attrs))
+	for _, a := range attrs {
+		if a.Equal(slog.Attr{}) {
+			out = append(out, a)
+			continue
+		}
+		if a.Key == "" && a.Value.Kind() == slog.KindGroup {
+			inner, ch := dedupAttrs(a.Value.Group(), seen)
+			if ch {
+				changed = true
+				a = slog.Attr{Value: slog.GroupValue(inner...)}
+			}
+			out = append(out, a)
+			continue
+		}
+		if seen.has(a.Key) {
+			changed = true
+			continue
+		}
+		seen[a.Key] = struct{}{}
+		out = append(out, a)
+	}
+	return out, changed
 }
 
 func (h *contextHandler) Enabled(ctx context.Context, l slog.Level) bool {
@@ -198,7 +267,32 @@ func (h *contextHandler) Enabled(ctx context.Context, l slog.Level) bool {
 }
 
 func (h *contextHandler) Handle(ctx context.Context, r slog.Record) error {
-	ids := IDsFromContext(ctx).attrs()
+	// 1. Atributos do registro: descarta chaves já emitidas via With no nível
+	//    corrente e repetições dentro do próprio registro.
+	if r.NumAttrs() > 0 {
+		attrs := make([]slog.Attr, 0, r.NumAttrs())
+		r.Attrs(func(a slog.Attr) bool { attrs = append(attrs, a); return true })
+		seen := h.levelKeys.clone(len(attrs))
+		filtered, changed := dedupAttrs(attrs, seen)
+		if changed {
+			nr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+			nr.AddAttrs(filtered...)
+			r = nr
+		}
+		if !h.grouped {
+			// Sem grupo, os atributos do registro também ocupam a raiz.
+			h = &contextHandler{root: h.root, derived: h.derived, ops: h.ops,
+				rootKeys: seen, levelKeys: seen}
+		}
+	}
+
+	// 2. IDs do contexto: só os que ainda não existem na raiz.
+	var ids []slog.Attr
+	for _, a := range IDsFromContext(ctx).attrs() {
+		if !h.rootKeys.has(a.Key) {
+			ids = append(ids, a)
+		}
+	}
 	if len(ids) == 0 {
 		return h.derived.Handle(ctx, r)
 	}
@@ -217,24 +311,41 @@ func (h *contextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	return h.with(handlerOp{attrs: attrs})
+	level := h.levelKeys.clone(len(attrs))
+	filtered, _ := dedupAttrs(attrs, level)
+	if len(filtered) == 0 {
+		return h
+	}
+	derived := h.derived.WithAttrs(filtered)
+	c := h.derive(handlerOp{attrs: filtered}, derived)
+	c.levelKeys = level
+	if !h.grouped {
+		c.rootKeys = level
+	}
+	return c
 }
 
 func (h *contextHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
-	return h.with(handlerOp{group: name})
+	c := h.derive(handlerOp{group: name}, h.derived.WithGroup(name))
+	if !h.grouped {
+		// O grupo ocupa a chave name na raiz: um ID de contexto homônimo não
+		// é injetado.
+		c.rootKeys = h.rootKeys.clone(1)
+		c.rootKeys[name] = struct{}{}
+	}
+	c.grouped = true
+	c.levelKeys = keySet{}
+	return c
 }
 
-func (h *contextHandler) with(op handlerOp) *contextHandler {
+func (h *contextHandler) derive(op handlerOp, derived slog.Handler) *contextHandler {
 	ops := make([]handlerOp, len(h.ops), len(h.ops)+1)
 	copy(ops, h.ops)
-	derived := h.derived
-	if op.group != "" {
-		derived = derived.WithGroup(op.group)
-	} else {
-		derived = derived.WithAttrs(op.attrs)
+	return &contextHandler{
+		root: h.root, derived: derived, ops: append(ops, op),
+		rootKeys: h.rootKeys, levelKeys: h.levelKeys, grouped: h.grouped,
 	}
-	return &contextHandler{root: h.root, derived: derived, ops: append(ops, op)}
 }

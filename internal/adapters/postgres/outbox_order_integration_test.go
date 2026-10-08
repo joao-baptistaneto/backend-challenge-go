@@ -2,7 +2,7 @@
 
 package postgres_test
 
-// Claim da outbox com ordem por agregado (head-of-line, T22, ADR-024),
+// Claim da outbox com ordem por agregado (head-of-line, ADR-024),
 // Release e Backlog.
 
 import (

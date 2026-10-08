@@ -2,7 +2,7 @@
 
 package app_test
 
-// Integração do caso de uso OpenWallet (T14) com o adapter postgres real:
+// Integração do caso de uso OpenWallet (ADR-016) com o adapter postgres real:
 // carteira, OPENING, ledger e outbox no mesmo commit; saldo zero; conflito;
 // atomicidade (rollback em falha de qualquer passo).
 

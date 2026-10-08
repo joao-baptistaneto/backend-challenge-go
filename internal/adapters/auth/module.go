@@ -35,7 +35,7 @@ type authenticatorParams struct {
 }
 
 // newAuthenticatorFx cria o Authenticator com um transporte HTTP próprio
-// (JWKS/discovery) e fecha as conexões ociosas dele no OnStop (T23,
+// (JWKS/discovery) e fecha as conexões ociosas dele no OnStop (ADR-025,
 // ADR-025): sem isso, a conexão keep-alive com o IdP sobreviveria ao Stop
 // (goroutines de leitura/escrita do net/http). Como o Authenticator é
 // construído antes do servidor HTTP que o usa, este OnStop roda depois do
@@ -59,7 +59,7 @@ func newAuthorizerFx(p componentParams) *Authorizer {
 }
 
 // Module provê Settings, *Authenticator e *Authorizer. Depende de
-// config.Config; *slog.Logger é opcional. A API HTTP (T18) monta
+// config.Config; *slog.Logger é opcional. A API HTTP (ADR-020) monta
 // authenticator.Middleware("/health/live", "/health/ready") na frente do
 // roteador e usa o Authorizer por rota.
 var Module = fx.Module("auth",

@@ -2,7 +2,7 @@
 
 package outboxpublisher
 
-// Integração do publisher (T22) com PostgreSQL real e fila FIFO falsa
+// Integração do publisher (ADR-024) com PostgreSQL real e fila FIFO falsa
 // (fakeQueue): disputa entre dois publishers sem perda, crash entre o commit
 // e a publicação, crash entre a publicação e a marcação (mesmo eventId),
 // lease perdido durante o envio (fencing), ordem por agregado sob falha com

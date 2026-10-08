@@ -8,7 +8,7 @@
 -- isso toda comparação com coluna anulável vem acompanhada de IS [NOT] NULL ou
 -- IS DISTINCT FROM.
 --
--- Decisões que afetam T12/T15:
+-- Decisões que afetam os repositórios e o caso de uso (ADR-014/ADR-017):
 --  * wallet_id/player_id NÃO têm FK para wallets: rejeições WALLET_NOT_FOUND,
 --    WALLET_PLAYER_MISMATCH e CURRENCY_MISMATCH precisam ser persistidas para
 --    replay idempotente e apontam para carteira inexistente ou divergente. A
@@ -42,7 +42,7 @@ CREATE TABLE wager_transactions (
     failure_code                      TEXT,
     balance_after                     BIGINT,
 
-    -- Retomada durável (worker de referências/PENDING órfãos, T21).
+    -- Retomada durável (worker de referências/PENDING órfãos, ADR-023).
     attempts                          INTEGER     NOT NULL DEFAULT 0,
     next_attempt_at                   TIMESTAMPTZ,
 
@@ -102,7 +102,7 @@ CREATE TABLE wager_transactions (
         AND (game_id IS NULL OR octet_length(game_id) BETWEEN 1 AND 255)
         AND (reference_external_transaction_id IS NULL
              OR octet_length(reference_external_transaction_id) BETWEEN 1 AND 255)),
-    -- SHA-256 em hex minúsculo (T08).
+    -- SHA-256 em hex minúsculo (ADR-010).
     CONSTRAINT wager_transactions_request_hash_format
         CHECK (request_hash IS NULL OR request_hash ~ '^[0-9a-f]{64}$'),
 
@@ -194,7 +194,7 @@ CREATE UNIQUE INDEX wager_transactions_opening_per_wallet_key
     WHERE kind = 'OPENING';
 
 -- Uma referência recebe no máximo UMA reversão bem-sucedida, de qualquer tipo
--- (política REFUND x ROLLBACK do ADR-009/T06): REFUND + ROLLBACK da mesma BET
+-- (política REFUND x ROLLBACK do ADR-009): REFUND + ROLLBACK da mesma BET
 -- devolveriam o mesmo débito duas vezes. Isso implica a exigência do README §7
 -- ("não duas reversões bem-sucedidas do mesmo tipo"), que seria um índice em
 -- (reference_transaction_id, kind), e é mais restritivo. ROLLBACK de um REFUND
@@ -205,12 +205,12 @@ CREATE UNIQUE INDEX wager_transactions_reversal_once_key
     ON wager_transactions (reference_transaction_id)
     WHERE status = 'PROCESSED' AND kind IN ('REFUND', 'ROLLBACK');
 
--- Worker de referências (T21): PENDING_REFERENCE vencidos por next_attempt_at.
+-- Worker de referências (ADR-023): PENDING_REFERENCE vencidos por next_attempt_at.
 CREATE INDEX wager_transactions_pending_reference_due_idx
     ON wager_transactions (next_attempt_at, id)
     WHERE status = 'PENDING_REFERENCE';
 
--- Worker de PENDING órfãos (T21): PENDING mais antigos primeiro.
+-- Worker de PENDING órfãos (ADR-023): PENDING mais antigos primeiro.
 CREATE INDEX wager_transactions_pending_idx
     ON wager_transactions (created_at, id)
     WHERE status = 'PENDING';

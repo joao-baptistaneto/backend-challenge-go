@@ -20,7 +20,7 @@ import (
 // validado contra um JWKS servido por httptest) para provar a integração do
 // middleware com as rotas: 401 sem token/expirado/assinatura errada, rotas
 // públicas e o providerId vindo da claim do token. A integração com o
-// Keycloak real fica em auth/keycloak_integration_test.go (T24/T27).
+// Keycloak real fica em auth/keycloak_integration_test.go (ADR-026/ADR-029).
 func TestRealAuthenticator(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

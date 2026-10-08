@@ -15,7 +15,7 @@ import (
 //     (Money e uuid.UUID são tipos-valor; time.Time é copiado). Não existe
 //     setter nem método que altere o lançamento. Correções financeiras exigem
 //     novos lançamentos (README, regra 5); a proteção contra UPDATE/DELETE no
-//     banco é responsabilidade do schema (T10).
+//     banco é responsabilidade do schema (ADR-011).
 //   - Invariantes (verificadas em TODA construção, nova ou reidratada):
 //     ids não nulos; direção DEBIT|CREDIT; amount, balanceBefore e balanceAfter
 //     inicializados e na mesma moeda; amount > 0 (LOSS/rejeições não geram
@@ -74,7 +74,7 @@ type NewWalletLedgerEntryParams struct {
 	// WalletID da carteira movimentada.
 	WalletID uuid.UUID
 	// TransactionID da transação interna que originou o movimento.
-	// (WalletID, TransactionID) é único no banco (T10).
+	// (WalletID, TransactionID) é único no banco (ADR-011).
 	TransactionID uuid.UUID
 	// Direction é DEBIT ou CREDIT.
 	Direction LedgerDirection
@@ -215,7 +215,7 @@ func (e WalletLedgerEntry) ID() uuid.UUID { return e.id }
 func (e WalletLedgerEntry) WalletID() uuid.UUID { return e.walletID }
 
 // TransactionID devolve a transação interna que originou o lançamento.
-// (WalletID, TransactionID) é único no banco (T10).
+// (WalletID, TransactionID) é único no banco (ADR-011).
 func (e WalletLedgerEntry) TransactionID() uuid.UUID { return e.transactionID }
 
 // Direction devolve DEBIT ou CREDIT.

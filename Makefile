@@ -94,7 +94,7 @@ COMPOSE_TEST_ENV = \
 test-integration-compose:
 	$(COMPOSE_TEST_ENV) CGO_ENABLED=1 $(GO) test -race -tags=integration -p 1 -count=1 $(PKGS)
 
-# Multi-instância e recuperação de falhas (T26, ADR-028): o teste compila o
+# Multi-instância e recuperação de falhas (ADR-028): o teste compila o
 # cmd/server com a tag failpoint (e -race) e sobe processos reais contra o
 # PostgreSQL e o LocalStack do Compose (docker compose up -d --wait postgres
 # localstack). Build tag própria (multiinstance) para não rodar junto com

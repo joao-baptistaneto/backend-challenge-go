@@ -2,7 +2,7 @@
 
 package pendingworker
 
-// Integração do wake-up de pendências quando a referência chega (T31,
+// Integração do wake-up de pendências quando a referência chega (ADR-032,
 // ADR-032) contra PostgreSQL real: a reversão aceita antes da referência
 // fica PENDING_REFERENCE com backoff de 1h; quando a referência é gravada, a
 // mesma transação antecipa o next_attempt_at e o worker a resolve no ciclo
@@ -139,7 +139,7 @@ func TestIntegrationWorker_WakesPendingWhenReferenceArrives(t *testing.T) {
 }
 
 // Um item reivindicado por um worker (lease vigente e contador de falhas da
-// T30) é acordado só no agendamento: lease, attempts, resume_failures e
+// retomada, ADR-031) é acordado só no agendamento: lease, attempts, resume_failures e
 // updated_at ficam intactos, outro worker não o reivindica enquanto o lease
 // vale, e o dono do lease o resolve com o mesmo token.
 func TestIntegrationWake_ClaimedItemUndisturbed(t *testing.T) {
@@ -215,7 +215,7 @@ func TestIntegrationWake_SkipsLockedRowWithoutBlocking(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Pulada: mantém o backoff que já tinha (no pior caso a resolução espera
-	// por ele, como antes da T31).
+	// por ele, como antes do wake-up do ADR-032).
 	if after := inst.schedule(t, rb.TransactionID); !after.nextAttemptAt.Equal(*before.nextAttemptAt) {
 		t.Fatalf("locked row was updated: before %v after %v", before.nextAttemptAt, after.nextAttemptAt)
 	}

@@ -19,7 +19,7 @@ import (
 //   - Faixa representável: [-92233720368547758.08, 92233720368547758.07]
 //     (math.MinInt64 / math.MaxInt64 centavos). Qualquer operação que sairia da
 //     faixa retorna ErrMoneyOverflow em vez de dar wrap-around silencioso.
-//   - A persistência (T12) mapeia diretamente para BIGINT (MinorUnits) + CHAR(3)
+//   - A persistência (ADR-014) mapeia diretamente para BIGINT (MinorUnits) + CHAR(3)
 //     (Currency), preservando exatamente valor e moeda.
 //   - Money é imutável: campos privados e todas as operações devolvem um novo
 //     valor. É comparável com == (int64 + string), o que facilita testes.
@@ -107,7 +107,7 @@ type Money struct {
 //	int    := "0" | [1-9][0-9]*
 //	frac   := [0-9]{1,2}
 //
-// Normalização documentada (anterior ao hash de idempotência, T08): as formas
+// Normalização documentada (anterior ao hash de idempotência, ADR-010): as formas
 // "25", "25.5" e "25.50" são equivalentes e produzem 2550 centavos; a forma
 // canônica é sempre a de String()/Amount() ("25.50"). Rejeitados: vazio, NaN,
 // Infinity, notação científica, "+", espaços, zeros à esquerda ("01.00"),

@@ -460,7 +460,7 @@ const jsonBackslash = "\x5c"
 func esc(hex string) string { return jsonBackslash + "u" + hex }
 
 // TestJSONUnmarshalEscapes cobre escapes unicode reais em chaves e valores
-// (T32): caixa e repetição valem para a chave já decodificada.
+// (ADR-033): caixa e repetição valem para a chave já decodificada.
 func TestJSONUnmarshalEscapes(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -519,8 +519,8 @@ func TestJSONUnmarshalEmbedded(t *testing.T) {
 	}
 }
 
-// TestJSONUnmarshalStrict cobre as regras de objeto estritas (T32, lacuna
-// L4): as mesmas do adapter strictjson, sem importá-lo.
+// TestJSONUnmarshalStrict cobre as regras de objeto estritas (ADR-033): as
+// mesmas do adapter strictjson, sem importá-lo.
 func TestJSONUnmarshalStrict(t *testing.T) {
 	accepted := []struct {
 		name      string

@@ -22,12 +22,12 @@ import (
 //     adapter aparece aqui. O adapter postgres implementa estas interfaces
 //     (postgres.UnitOfWork) e traduz seus erros para as sentinelas desta
 //     camada (ErrWalletAlreadyExists, ErrUnavailable).
-//   - Cada store expõe só os métodos que algum caso de uso já usa; as
-//     próximas tarefas (T16/T21) acrescentam o que precisarem. A T15
-//     acrescentou GetForUpdate/Update da carteira, as consultas de
-//     idempotência e de referência, Update da transação e a inbox (ADR-017).
-//     A T16 acrescentou as leituras sem lock (Wallets.Get, Ledger.List,
-//     Ledger.Summarize) e o isolamento/modo de acesso em TxOptions (ADR-018).
+//   - Cada store expõe só os métodos que algum caso de uso usa.
+//     ProcessWagerTransaction (ADR-017) acrescentou GetForUpdate/Update da
+//     carteira, as consultas de idempotência e de referência, Update da
+//     transação e a inbox. Reconciliação e consultas (ADR-018) acrescentaram
+//     as leituras sem lock (Wallets.Get, Ledger.List, Ledger.Summarize) e o
+//     isolamento/modo de acesso em TxOptions.
 
 // Operation* são os rótulos de operação das transações (métricas e logs do
 // adapter). Os valores coincidem com metrics.Operation* (teste no adapter).
@@ -36,7 +36,7 @@ const (
 	OperationProcessTransaction = "process_transaction"
 	OperationReconcile          = "reconcile"
 	OperationQuery              = "query"
-	// OperationPendingReference: claim e retomada do worker de pendências (T21).
+	// OperationPendingReference: claim e retomada do worker de pendências (ADR-023).
 	OperationPendingReference = "pending_reference"
 )
 
@@ -139,7 +139,7 @@ type WagerTransactionStore interface {
 	// gravando na linha o token e o fim do lease (p.Now + p.Lease). Instâncias
 	// concorrentes recebem conjuntos disjuntos (SKIP LOCKED). O lease é
 	// persistido: se o worker morrer, a linha volta a ser elegível quando ele
-	// expirar. Usado pelo worker (T21, ADR-023) numa transação própria e curta.
+	// expirar. Usado pelo worker (ADR-023) numa transação própria e curta.
 	ClaimDue(ctx context.Context, p ClaimDueParams) ([]ClaimedWager, error)
 	// GetClaimedForUpdate lê e trava a transação SE ela ainda estiver
 	// reivindicada por token (fencing). Reassumida por outro token (lease
@@ -149,7 +149,7 @@ type WagerTransactionStore interface {
 	// por token (mesmo fencing de GetClaimedForUpdate) e devolve o estado
 	// operacional usado pela contagem de falhas da retomada, SEM reidratar o
 	// agregado (funciona na linha que não reidrata). Perdeu o lease ou
-	// inexistente: ErrRecordNotFound. (T30, ADR-031.)
+	// inexistente: ErrRecordNotFound. (ADR-031.)
 	LockClaimedForFailure(ctx context.Context, id, token uuid.UUID) (ResumeFailureState, error)
 	// RecordResumeFailure grava o contador de falhas consecutivas e estende o
 	// lease até p.HoldUntil (backoff), sem tocar em colunas do agregado.
@@ -178,7 +178,7 @@ type WagerTransactionStore interface {
 	// WakePendingReferences antecipa para now (nunca antes da criação) o
 	// nextAttemptAt das transações PENDING_REFERENCE do provedor providerID
 	// que citam externalTransactionID e ainda aguardam o backoff, para o
-	// worker resolvê-las no próximo ciclo (T31, ADR-032). Só o agendamento
+	// worker resolvê-las no próximo ciclo (ADR-032). Só o agendamento
 	// muda: attempts, lease e contador de falhas ficam intactos. Linhas
 	// travadas por outra transação são puladas (nunca espera). Devolve
 	// quantas foram acordadas. Contrato: na mesma transação que grava a

@@ -2,7 +2,7 @@
 
 package main
 
-// Testes de concorrência obrigatórios (T25, README §8 e "Testes de
+// Testes de concorrência obrigatórios (ADR-027, README §8 e "Testes de
 // concorrência e recuperação"), pela aplicação completa (cmd/server.Options):
 // HTTP real (servidor + middleware OIDC com o IdP de teste deste pacote),
 // casos de uso e repositórios PostgreSQL reais, consumidor SQS real.

@@ -30,7 +30,7 @@ type memUoW struct {
 	// failInsertOnce devolve este erro no primeiro Insert de transação.
 	failInsertOnce error
 	txErr          error
-	// poison simula linhas que não reidratam (T30): GetByID e
+	// poison simula linhas que não reidratam (ADR-031): GetByID e
 	// GetClaimedForUpdate da transação devolvem o erro.
 	poison map[uuid.UUID]error
 	// walletErr, se definido, é devolvido por Wallets.GetForUpdate.
@@ -57,11 +57,11 @@ type memState struct {
 	ledger  []domain.WalletLedgerEntry
 	events  []domain.IntegrationEvent
 	inbox   map[string]memInbox
-	// claims é o lease do worker (T21) por transação.
+	// claims é o lease do worker (ADR-023) por transação.
 	claims map[uuid.UUID]memClaim
-	// failures é resume_failures (T30) por transação.
+	// failures é resume_failures (ADR-031) por transação.
 	failures map[uuid.UUID]int32
-	// woken é o next_attempt_at antecipado por WakePendingReferences (T31);
+	// woken é o next_attempt_at antecipado por WakePendingReferences (ADR-032);
 	// ClaimDue usa o menor entre ele e o do agregado, e Update o descarta.
 	woken map[uuid.UUID]time.Time
 	// wakeCalls registra as chamadas confirmadas de WakePendingReferences
@@ -272,7 +272,7 @@ func (s memWagers) GetClaimedForUpdate(_ context.Context, id, token uuid.UUID) (
 	return s.find(func(w *domain.WagerTransaction) bool { return w.ID() == id })
 }
 
-// Contagem de falhas da retomada (T30): espelha o adapter, sem reidratar
+// Contagem de falhas da retomada (ADR-031): espelha o adapter, sem reidratar
 // (ignora poison) e com o mesmo fencing.
 
 func (s memWagers) claimedRow(id, token uuid.UUID) (int, bool) {

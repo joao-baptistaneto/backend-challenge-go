@@ -18,7 +18,7 @@ import (
 //   - O adapter NÃO importa internal/domain. Ele classifica em dois eixos
 //     neutros: (1) transitório x permanente e (2) violação de constraint com
 //     tipo (UNIQUE/CHECK/FK/RESTRICT/...) e NOME da constraint. Os
-//     repositórios (T12/T13) fazem o mapeamento final para erros de domínio
+//     repositórios (ADR-014/ADR-015) fazem o mapeamento final para erros de domínio
 //     com base no nome (ex.: wallets_player_currency_key → conflito de
 //     carteira). O nome é estável porque todas as constraints e todas as
 //     guardas de trigger (RAISE ... USING ERRCODE = 'restrict_violation',

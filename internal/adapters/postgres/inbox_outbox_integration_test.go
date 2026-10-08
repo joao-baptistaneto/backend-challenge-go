@@ -2,7 +2,7 @@
 
 package postgres_test
 
-// Integração dos repositórios de inbox e outbox (T13) contra PostgreSQL real
+// Integração dos repositórios de inbox e outbox (ADR-015) contra PostgreSQL real
 // (TEST_DATABASE_URL ou testcontainers; banco novo por teste).
 
 import (

@@ -2,7 +2,7 @@
 
 package postgres_test
 
-// Integração de WagerTransactionRepository.WakePendingReferences (T31,
+// Integração de WagerTransactionRepository.WakePendingReferences (ADR-032,
 // ADR-032): quais linhas são acordadas, o que muda nelas e o uso do índice.
 
 import (

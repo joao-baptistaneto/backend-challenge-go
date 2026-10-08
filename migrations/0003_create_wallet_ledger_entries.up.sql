@@ -12,7 +12,7 @@
 --
 -- Limitação: o dono da tabela/superusuário pode desabilitar triggers
 -- (ALTER TABLE ... DISABLE TRIGGER, session_replication_role = replica). Em
--- produção a aplicação deve usar um papel que não seja dono do schema (T24).
+-- produção a aplicação deve usar um papel que não seja dono do schema (ADR-026).
 
 CREATE TABLE wallet_ledger_entries (
     id             UUID        NOT NULL,
@@ -42,7 +42,7 @@ CREATE TABLE wallet_ledger_entries (
         OR (direction = 'DEBIT' AND balance_after::NUMERIC = balance_before::NUMERIC - amount::NUMERIC))
 );
 
--- Paginação keyset do extrato (T12): ordem estável (created_at, id) por carteira.
+-- Paginação keyset do extrato (ADR-014): ordem estável (created_at, id) por carteira.
 CREATE INDEX wallet_ledger_entries_wallet_page_idx
     ON wallet_ledger_entries (wallet_id, created_at, id);
 

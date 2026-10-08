@@ -18,7 +18,7 @@ import (
 //
 //   - Register e Complete exigem pgx.Tx (ErrTxRequired): a inbox só protege
 //     contra reprocessamento se o registro, a conclusão e as alterações de
-//     domínio entrarem no MESMO commit (T15/T20). Fora de transação, um crash
+//     domínio entrarem no MESMO commit (ADR-017/ADR-022). Fora de transação, um crash
 //     entre o registro e o efeito deixaria a mensagem "vista" sem efeito.
 //   - Register é INSERT ... ON CONFLICT DO NOTHING. Se outra transação
 //     inseriu a mesma (consumer, messageId) e ainda não confirmou, o INSERT
@@ -139,7 +139,7 @@ func validateInboxMessage(consumer, messageID, hash string, now time.Time) error
 }
 
 // Register registra a recepção da mensagem (consumer, messageID) com o hash
-// canônico do conteúdo (T08). Exige pgx.Tx: o registro deve ser confirmado
+// canônico do conteúdo (ADR-010). Exige pgx.Tx: o registro deve ser confirmado
 // junto com o efeito de domínio.
 //
 //   - Nova: grava e devolve InboxNew.

@@ -13,7 +13,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/domain"
 )
 
-// Testes unitários do limite de falhas da retomada (T30, ADR-031): item
+// Testes unitários do limite de falhas da retomada (ADR-031): item
 // envenenado → FAILED RETRIES_EXHAUSTED, transitórias não contam, sucesso
 // zera o contador, TTL encerra, fencing e replay do estado final.
 

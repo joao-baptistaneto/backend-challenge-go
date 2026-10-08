@@ -2,7 +2,7 @@
 
 package migrate_test
 
-// Infraestrutura dos testes de integração do schema (T10).
+// Infraestrutura dos testes de integração do schema (ADR-011).
 //
 // Banco: se TEST_DATABASE_URL estiver definido, usa esse servidor (precisa de
 // permissão para CREATE/DROP DATABASE); caso contrário sobe um PostgreSQL real

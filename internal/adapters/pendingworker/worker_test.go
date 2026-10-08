@@ -211,7 +211,7 @@ func TestWorker_ItemErrorsDoNotStopTheCycle(t *testing.T) {
 	}
 }
 
-// T30: falha contada (DEFERRED, com erro) e item encerrado (FAILED, sem
+// ADR-031: falha contada (DEFERRED, com erro) e item encerrado (FAILED, sem
 // erro) não param o ciclo; FAILED entra em wager_transactions_total.
 func TestWorker_DeferredAndFailedOutcomes(t *testing.T) {
 	calls := 0

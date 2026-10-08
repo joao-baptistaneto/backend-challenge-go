@@ -9,7 +9,7 @@ import (
 
 // ReferenceRetryDelay é o atraso da primeira nova busca de referência de uma
 // operação aceita como PENDING_REFERENCE (WithReferenceRetryDelay). A
-// composição (cmd/server, T23) o provê a partir de
+// composição (cmd/server, ADR-025) o provê a partir de
 // PENDING_REFERENCE_RETRY_BASE_DELAY, a mesma base do backoff do worker de
 // pendências (ADR-023). Ausente ou zero → DefaultReferenceRetryDelay.
 type ReferenceRetryDelay time.Duration
@@ -22,7 +22,7 @@ type UseCaseParams struct {
 	UoW    UnitOfWork
 	Logger *slog.Logger `optional:"true"`
 	// Reconciliations recebe a métrica de reconciliação. app não importa
-	// platform: a composição (T23) provê *metrics.Metrics como
+	// platform: a composição (ADR-025) provê *metrics.Metrics como
 	// ReconciliationRecorder. Ausente, a reconciliação só loga.
 	Reconciliations ReconciliationRecorder `optional:"true"`
 	// ReferenceRetryDelay é opcional (ver o tipo).

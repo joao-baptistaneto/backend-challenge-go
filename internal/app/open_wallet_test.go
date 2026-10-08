@@ -281,7 +281,7 @@ func TestOpenWallet_InvalidInput(t *testing.T) {
 		{"negative", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: negative, CorrelationID: "c"}, app.CodeInvalidInitialBalance},
 		{"no correlation", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "1.00")}, app.CodeInvalidCorrelationID},
 		{"bad correlation", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "1.00"), CorrelationID: " x"}, app.CodeInvalidCorrelationID},
-		// Pendência da T14 resolvida na T15: o formato é validado mesmo sem
+		// Desde o ADR-017 o formato é validado mesmo sem
 		// eventos (saldo zero), e causationId tem código próprio.
 		{"bad correlation zero balance", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "0.00"), CorrelationID: "c\n"}, app.CodeInvalidCorrelationID},
 		{"long correlation zero balance", app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "0.00"), CorrelationID: strings.Repeat("a", 256)}, app.CodeInvalidCorrelationID},
@@ -384,7 +384,7 @@ func TestModule_Validate(t *testing.T) {
 	}
 }
 
-// Métodos das portas que OpenWallet não usa (acrescentados na T15): o fake
+// Métodos das portas que OpenWallet não usa (acrescentados por ProcessWagerTransaction, ADR-017): o fake
 // falha alto se forem chamados.
 var errUnexpectedCall = errors.New("fake: unexpected call")
 
@@ -424,7 +424,7 @@ func (fakeWagers) ListByProviderReference(context.Context, string, string) ([]*d
 	return nil, errUnexpectedCall
 }
 
-// Leituras acrescentadas na T16 (não usadas por OpenWallet).
+// Leituras de reconciliação e consultas (ADR-018; não usadas por OpenWallet).
 
 func (fakeWallets) Get(context.Context, uuid.UUID) (*domain.Wallet, error) {
 	return nil, errUnexpectedCall
@@ -438,7 +438,7 @@ func (fakeLedger) Summarize(context.Context, uuid.UUID) (app.LedgerSummary, erro
 	return app.LedgerSummary{}, errUnexpectedCall
 }
 
-// Worker de pendências (T21; não usados por OpenWallet).
+// Worker de pendências (ADR-023; não usados por OpenWallet).
 
 func (fakeWagers) ClaimDue(context.Context, app.ClaimDueParams) ([]app.ClaimedWager, error) {
 	return nil, errUnexpectedCall

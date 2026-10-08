@@ -1,4 +1,4 @@
--- 0006: ordem estável do extrato (paginação keyset, T12). ADR-014.
+-- 0006: ordem estável do extrato (paginação keyset). ADR-014.
 --
 -- (created_at, id) não é uma ordem segura para cursor: created_at vem do relógio
 -- de cada instância e o id (UUIDv7) também. Com relógios levemente divergentes,

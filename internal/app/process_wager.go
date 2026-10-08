@@ -15,7 +15,7 @@ import (
 )
 
 // Caso de uso ProcessWagerTransaction (ARCHITECTURE.md, ADR-017). É o mesmo
-// para HTTP (T18) e SQS (T20).
+// para HTTP (ADR-020) e SQS (ADR-022).
 //
 // Decisões:
 //
@@ -55,11 +55,11 @@ import (
 
 // DefaultReferenceRetryDelay é o atraso da primeira nova busca de uma
 // referência ausente ou pendente (next_attempt_at). O backoff seguinte e o
-// limite de tentativas são do worker (T21).
+// limite de tentativas são do worker (ADR-023).
 const DefaultReferenceRetryDelay = 2 * time.Second
 
 // InboxMessageRef identifica a mensagem de entrada (SQS) para a inbox. O hash
-// registrado é o mesmo hash canônico da operação (T08), calculado pelo caso
+// registrado é o mesmo hash canônico da operação (ADR-010), calculado pelo caso
 // de uso; reentregas com o mesmo messageId e outro conteúdo são conflito.
 type InboxMessageRef struct {
 	ConsumerName string
@@ -374,7 +374,7 @@ func (uc *ProcessWagerTransaction) process(ctx context.Context, tx Tx, p wagerPl
 
 // loadReference lê, sob o lock da carteira, a referência de t por (provider,
 // referenceExternalTransactionId) e as reversões já existentes dela. Sem
-// referência (ou ainda não recebida): nil. Compartilhado com o worker (T21).
+// referência (ou ainda não recebida): nil. Compartilhado com o worker (ADR-023).
 func loadReference(ctx context.Context, txs WagerTransactionStore, t *domain.WagerTransaction) (*domain.WagerTransaction, []*domain.WagerTransaction, error) {
 	if !t.HasReference() {
 		return nil, nil, nil
@@ -402,7 +402,7 @@ func loadReference(ctx context.Context, txs WagerTransactionStore, t *domain.Wag
 // GetForUpdate nesta transação), a transação (save = Insert no caso de uso,
 // Update no worker), o lançamento (carteira travada; a transação já existe) e
 // os eventos na outbox; por fim, terminal, acorda as pendências que a citam
-// (wakeDependents, T31).
+// (wakeDependents, ADR-032).
 func persistWagerOutcome(ctx context.Context, tx Tx, t *domain.WagerTransaction, wallet *domain.Wallet,
 	entry domain.WalletLedgerEntry, events []domain.IntegrationEvent,
 	save func(context.Context, *domain.WagerTransaction) error,
@@ -427,7 +427,7 @@ func persistWagerOutcome(ctx context.Context, tx Tx, t *domain.WagerTransaction,
 }
 
 // wakeDependents acorda, na mesma transação, as PENDING_REFERENCE do mesmo
-// provedor que citam t (T31, ADR-032): sem isso elas só veriam a referência
+// provedor que citam t (ADR-032): sem isso elas só veriam a referência
 // no fim do backoff já agendado. Só quando t ficou terminal — qualquer
 // estado terminal resolve a dependente (PROCESSED aplica ou rejeita pelas
 // regras estáticas; REJECTED/FAILED levam a REFERENCE_NOT_PROCESSED). Uma

@@ -434,7 +434,7 @@ func TestLoadErrorNeverLeaksDatabaseURL(t *testing.T) {
 	}
 }
 
-// Regressão (avaliação T09): httpURL/fifoQueueURL ecoavam a URL inválida
+// Regressão (revisão): httpURL/fifoQueueURL ecoavam a URL inválida
 // inteira, inclusive query (token pré-assinado) e fragment.
 func TestLoadErrorEchoesOnlySafeURLParts(t *testing.T) {
 	const tok = "TOKEN-QUE-NAO-PODE-VAZAR"
@@ -499,7 +499,7 @@ func TestConfigFormattingRedactsSecrets(t *testing.T) {
 		t.Fatal("segredo vazio deve formatar vazio (indica ausência sem vazar nada)")
 	}
 
-	// Regressão (avaliação T09): verbos não-string ("%d" → "%!d(config.Secret=
+	// Regressão (revisão): verbos não-string ("%d" → "%!d(config.Secret=
 	// valor)") vazavam o valor bruto, inclusive dentro de Config e *Config.
 	// O segredo também não pode aparecer codificado em hex/base. %p e %w (fora
 	// de Errorf) são resolvidos pelo fmt sem consultar métodos e continuam

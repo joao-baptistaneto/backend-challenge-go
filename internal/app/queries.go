@@ -26,7 +26,7 @@ import (
 //     transação. Carteira inexistente → WALLET_NOT_FOUND (não uma página
 //     vazia). A paginação é a keyset por seq com cursor opaco (ADR-014).
 //   - Autorização por provedor: GetTransaction e GetTransactionByProvider
-//     recebem o providerId EXPLÍCITO, que a borda (T18) preenche com a
+//     recebem o providerId EXPLÍCITO, que a borda (ADR-020) preenche com a
 //     identidade autenticada, nunca com um valor do path ou do corpo sem
 //     conferência. Transação de outro provedor (ou interna, como OPENING) é
 //     respondida exatamente como inexistente (TRANSACTION_NOT_FOUND), sem
@@ -37,7 +37,7 @@ import (
 //     do processamento (ADR-017): referenceTransactionId só em PROCESSED e
 //     saldo omitido em WALLET_NOT_FOUND/WALLET_PLAYER_MISMATCH/
 //     CURRENCY_MISMATCH. A chave de idempotência e o hash não são expostos.
-//   - Autorização de carteira (só serviço interno) é da borda (T17/T18):
+//   - Autorização de carteira (só serviço interno) é da borda (ADR-019/ADR-020):
 //     GetWallet/ListLedger não recebem identidade.
 
 // DefaultLedgerPageLimit é o tamanho de página usado quando o chamador não

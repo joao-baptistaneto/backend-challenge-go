@@ -244,7 +244,7 @@ func TestValidationFailureCode(t *testing.T) {
 		{"generic", fmt.Errorf("%w: roundId is required", ErrInvalidWagerTransaction), FailureCodeInvalidRequest, true},
 		{"corrupted", fmt.Errorf("%w: %w", ErrCorruptedWagerTransaction, ErrInvalidAmount), "", false},
 		{"unrelated", errors.New("boom"), "", false},
-		{"insufficient funds is decided by T06", ErrInsufficientFunds, "", false},
+		{"insufficient funds is decided by the operation rules", ErrInsufficientFunds, "", false},
 	}
 	for _, c := range cases {
 		got, ok := ValidationFailureCode(c.err)
@@ -768,7 +768,7 @@ func TestWagerTransaction_PendingReferenceScheduling(t *testing.T) {
 	if !reflect.DeepEqual(before, *tx) {
 		t.Fatal("failed reschedule mutated the transaction")
 	}
-	// Expiração (T21): REFERENCE_NOT_FOUND encerra e limpa o agendamento.
+	// Expiração (ADR-023): REFERENCE_NOT_FOUND encerra e limpa o agendamento.
 	if err := tx.Reject(RejectWagerParams{Code: FailureCodeReferenceNotFound, Now: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -891,7 +891,7 @@ func TestWagerTransaction_FailRequiresInfrastructureCode(t *testing.T) {
 	}
 }
 
-// ValidateFailTransition (T30) é a regra de Fail sem o agregado: para cada
+// ValidateFailTransition (ADR-031) é a regra de Fail sem o agregado: para cada
 // estado e código, as duas concordam.
 func TestValidateFailTransition_AgreesWithFail(t *testing.T) {
 	now := testT0.Add(time.Minute)
@@ -1074,7 +1074,7 @@ func TestRehydrateWagerTransaction_InvalidRejected(t *testing.T) {
 	}
 }
 
-// --- Ajustes pós-T05: REFERENCE_NOT_FOUND e attempts --------------------------------
+// --- Ajustes posteriores: REFERENCE_NOT_FOUND e attempts --------------------------------
 
 func processedWithoutReference(t *testing.T, k WagerKind) *WagerTransaction {
 	t.Helper()

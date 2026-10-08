@@ -1,6 +1,6 @@
 // Package failpoint injeta falhas em pontos nomeados do código de produção,
 // para os testes de recuperação com processos reais (ARCHITECTURE.md,
-// ADR-028, T26).
+// ADR-028).
 //
 // No build normal Hit é uma função vazia (inlined, custo zero) e nenhuma
 // variável de ambiente é lida: o binário de produção não tem como ativar

@@ -24,7 +24,7 @@ import (
 //     WithinTx), no mesmo commit das alterações que os originaram. Grava
 //     exatamente IntegrationEvent.Payload() (coluna JSON, byte a byte).
 //   - Claim reivindica um lote com LEASE persistido, e não com lock de linha
-//     até o commit: o publisher (T22) faz o claim numa transação curta (ou em
+//     até o commit: o publisher (ADR-024) faz o claim numa transação curta (ou em
 //     autocommit), publica no SQS FORA de transação e depois chama
 //     MarkPublished/MarkFailed. Por isso Claim aceita qualquer Querier. O
 //     lote é escolhido com FOR UPDATE SKIP LOCKED (claimers concorrentes não
@@ -45,7 +45,7 @@ import (
 //     um crash entre claim e mark também conta tentativa e entra no backoff.
 //   - MarkFailed agenda next_attempt_at = agora + OutboxBackoff.Delay(attempts)
 //     (exponencial, com teto obrigatório e sem overflow) e solta o lease.
-//   - Ordem por agregado (T22, ADR-024): o MessageGroupId é o aggregateId e o
+//   - Ordem por agregado (ADR-024): o MessageGroupId é o aggregateId e o
 //     claim só devolve o evento não publicado MAIS ANTIGO (menor seq) de cada
 //     agregado (head-of-line). Enquanto ele estiver em lease, em backoff ou
 //     ainda não marcado como publicado, os eventos seguintes do mesmo agregado

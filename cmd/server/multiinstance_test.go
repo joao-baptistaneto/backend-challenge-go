@@ -2,7 +2,7 @@
 
 package main
 
-// Testes multi-instância e de recuperação de falhas (T26, README §3, §8 e
+// Testes multi-instância e de recuperação de falhas (ADR-028, README §3, §8 e
 // "Testes de concorrência e recuperação" itens 4–8; ARCHITECTURE.md ADR-028).
 // Cada instância é um processo cmd/server independente (ver o harness).
 //

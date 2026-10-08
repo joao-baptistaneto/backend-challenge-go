@@ -2,7 +2,7 @@
 
 package sqs
 
-// Integração do consumidor (T20) com LocalStack (SQS real) e PostgreSQL real.
+// Integração do consumidor (ADR-022) com LocalStack (SQS real) e PostgreSQL real.
 //
 // Dependências:
 //   - SQS: SQS_ENDPOINT (ou AWS_ENDPOINT_URL), ex.: http://localhost:4566.

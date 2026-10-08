@@ -2,7 +2,7 @@
 
 package app_test
 
-// T25 (pendência da avaliação): reversões concorrentes da mesma referência
+// Reversões concorrentes (ADR-027): reversões concorrentes da mesma referência
 // com externalTransactionIds diferentes. A barreira é o lock da carteira
 // (GetForUpdate) + a regra ALREADY_REVERSED do domínio, com o índice
 // wager_transactions_reversal_once_key como última defesa no banco.

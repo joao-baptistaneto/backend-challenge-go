@@ -97,7 +97,7 @@ func newDBFromConfig(pc *pgxpool.Config, logger *slog.Logger) (*DB, error) {
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
 
 // Ping verifica se uma conexão do pool responde, limitado por ctx. É o
-// probe de readiness do PostgreSQL (/health/ready, T18): quem chama deve
+// probe de readiness do PostgreSQL (/health/ready, ADR-020): quem chama deve
 // passar um ctx com prazo curto.
 func (db *DB) Ping(ctx context.Context) error {
 	if err := db.pool.Ping(ctx); err != nil {

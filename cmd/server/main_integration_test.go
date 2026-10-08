@@ -2,7 +2,7 @@
 
 package main
 
-// Integração da composição completa (T23, ADR-025): a aplicação real
+// Integração da composição completa (ADR-025): a aplicação real
 // (cmd/server.Options) sobe contra um PostgreSQL de verdade, com as
 // dependências externas indisponíveis nesta máquina substituídas de forma
 // controlada:
@@ -18,7 +18,7 @@ package main
 // aplicadas. Goroutines vazadas falham o teste (goleak).
 //
 // TestIntegrationRealDependencies usa SQS (LocalStack) e Keycloak reais e só
-// roda com SQS_ENDPOINT e KEYCLOAK_URL definidos (T24).
+// roda com SQS_ENDPOINT e KEYCLOAK_URL definidos (ADR-026).
 
 import (
 	"context"
@@ -64,7 +64,7 @@ const postgresImage = "postgres:17-alpine"
 var adminDSN string
 
 // afterAll são limpezas do pacote executadas depois de todos os testes (ex.:
-// o binário compilado pelos testes multi-instância, T26).
+// o binário compilado pelos testes multi-instância, ADR-028).
 var afterAll []func()
 
 func TestMain(m *testing.M) { os.Exit(runIntegration(m)) }
@@ -760,7 +760,7 @@ func TestIntegrationStartTimeoutRollsBack(t *testing.T) {
 }
 
 // TestIntegrationRealDependencies sobe a aplicação contra SQS (LocalStack) e
-// Keycloak reais, sem substituições. Variáveis (T24):
+// Keycloak reais, sem substituições. Variáveis (ADR-026):
 //
 //	SQS_ENDPOINT            ex.: http://localhost:4566; ausente → Skip
 //	KEYCLOAK_URL            ex.: http://localhost:8081; ausente → Skip
@@ -772,7 +772,7 @@ func TestIntegrationRealDependencies(t *testing.T) {
 	endpoint := strings.TrimSuffix(os.Getenv("SQS_ENDPOINT"), "/")
 	kc := strings.TrimSuffix(os.Getenv("KEYCLOAK_URL"), "/")
 	if endpoint == "" || kc == "" {
-		t.Skip("SQS_ENDPOINT/KEYCLOAK_URL ausentes: LocalStack e Keycloak indisponíveis (roda na T24 com o Docker Compose)")
+		t.Skip("SQS_ENDPOINT/KEYCLOAK_URL ausentes: LocalStack e Keycloak indisponíveis (roda com o Docker Compose, ADR-026)")
 	}
 	secret := os.Getenv("KEYCLOAK_CLIENT_SECRET")
 	if secret == "" {

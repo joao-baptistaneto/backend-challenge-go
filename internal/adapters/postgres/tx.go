@@ -20,14 +20,14 @@ import (
 // Decisões:
 //
 //   - A fronteira transacional é explícita e pertence ao caso de uso: ele
-//     chama WithinTx e passa o pgx.Tx recebido para cada repositório (T12/T13),
+//     chama WithinTx e passa o pgx.Tx recebido para cada repositório (ADR-014/ADR-015),
 //     que aceitam um Querier. Não há transação implícita no context: o tx é um
 //     parâmetro visível, o que torna auditável quais comandos SQL participam do
 //     mesmo commit (wallet + transação + ledger + outbox + inbox).
 //   - Isolamento padrão READ COMMITTED. A consistência por carteira vem do
 //     lock pessimista (SELECT ... FOR UPDATE) somado ao UPDATE ... WHERE
-//     version = $old (T12), não do nível de isolamento. SERIALIZABLE e
-//     REPEATABLE READ (reconciliação, T16) ficam disponíveis por opção.
+//     version = $old (ADR-014), não do nível de isolamento. SERIALIZABLE e
+//     REPEATABLE READ (reconciliação, ADR-018) ficam disponíveis por opção.
 //   - Rollback em qualquer erro de fn, em panic e em runtime.Goexit
 //     (t.FailNow dentro de fn): o defer não depende de recover, então o panic
 //     original continua propagando sem ser engolido e a conexão volta ao pool.
@@ -36,7 +36,7 @@ import (
 //   - Retry: o MECANISMO fica aqui (é preciso reexecutar BEGIN..COMMIT
 //     inteiro, e só este componente sabe se o commit foi ou não enviado), mas
 //     ele é OPT-IN por chamada (WithRetry). Quem decide usar é o caso de uso
-//     (T15/T14/T21), porque só ele sabe que fn é reexecutável: fn não pode ter
+//     (ADR-017/ADR-016/ADR-023), porque só ele sabe que fn é reexecutável: fn não pode ter
 //     efeitos fora do banco (HTTP, SQS, mutação de estado em memória
 //     compartilhado) e deve recalcular tudo a partir do que lê no tx.
 //   - Só se reexecuta quando é garantido que nada foi confirmado
@@ -87,7 +87,7 @@ type RetryPolicy struct {
 	// Operation é o rótulo de métricas (metrics.Operation*).
 	Operation string
 	// RetryIf, se não nil, amplia os erros retentáveis além de IsRetryable.
-	// Uso típico (T15): corrida resolvida por UNIQUE de idempotência, em que
+	// Uso típico (ADR-017): corrida resolvida por UNIQUE de idempotência, em que
 	// a nova tentativa encontra a linha do vencedor e devolve o replay. Nunca
 	// é consultado para ErrCommitOutcomeUnknown.
 	RetryIf func(error) bool

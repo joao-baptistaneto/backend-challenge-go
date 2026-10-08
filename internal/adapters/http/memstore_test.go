@@ -308,7 +308,7 @@ func (memInbox) Complete(context.Context, string, string, string, uuid.UUID, tim
 	return errors.New("mem: inbox not used by HTTP")
 }
 
-// Worker de pendências (T21): não usados pela API HTTP.
+// Worker de pendências (ADR-023): não usados pela API HTTP.
 
 func (memWagers) ClaimDue(context.Context, app.ClaimDueParams) ([]app.ClaimedWager, error) {
 	return nil, errors.New("mem: claim not used by the HTTP API")
@@ -331,7 +331,7 @@ func (memWagers) FailClaimedUnreadable(context.Context, app.FailClaimedParams) e
 }
 
 // WakePendingReferences: os testes HTTP não têm worker; o agendamento das
-// pendências não é observado aqui (T31 é coberto em app e na integração).
+// pendências não é observado aqui (o wake-up, ADR-032, é coberto em app e na integração).
 func (s memWagers) WakePendingReferences(context.Context, string, string, time.Time) (int64, error) {
 	return 0, nil
 }

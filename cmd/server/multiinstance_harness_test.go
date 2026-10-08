@@ -2,7 +2,7 @@
 
 package main
 
-// Harness dos testes multi-instância e de recuperação de falhas (T26,
+// Harness dos testes multi-instância e de recuperação de falhas (ADR-028,
 // ARCHITECTURE.md ADR-028).
 //
 // Cada instância é um PROCESSO do SO: o binário cmd/server é compilado uma

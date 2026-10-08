@@ -13,12 +13,12 @@ import (
 // Decisão arquitetural (ADR-008 em ARCHITECTURE.md): WagerTransaction registra
 // uma operação financeira (externa ou a abertura interna) e sua máquina de
 // estados. Este arquivo tem apenas lógica pura de domínio: as regras que decidem
-// débito, crédito e reversão ficam em T06, a persistência em T10/T12 e a
-// orquestração em T15/T21.
+// débito, crédito e reversão ficam em ADR-009, a persistência em ADR-011/ADR-014 e a
+// orquestração em ADR-017/ADR-023.
 //
 //   - Origem: OPENING é a única operação INTERNAL (abertura de carteira, sem
 //     provedor, ID externo, chave, hash, rodada, jogo nem referência). Todas as
-//     demais são EXTERNAL. Origem e tipo andam juntos e o schema (T10) usa a
+//     demais são EXTERNAL. Origem e tipo andam juntos e o schema (ADR-011) usa a
 //     origem nos CHECKs. OPENING enviado por HTTP/SQS é rejeitado já no
 //     construtor externo (ErrOpeningNotExternal, código INVALID_KIND).
 //   - Construção: NewExternalWagerTransaction nasce em PENDING.
@@ -96,11 +96,11 @@ var (
 
 // MaxWagerIdentifierLength é o tamanho máximo, em bytes, dos identificadores
 // externos (providerId, externalTransactionId, idempotencyKey, roundId, gameId,
-// referenceExternalTransactionId). O schema (T10) usa o mesmo limite.
+// referenceExternalTransactionId). O schema (ADR-011) usa o mesmo limite.
 const MaxWagerIdentifierLength = 255
 
 // RequestHashLength é o tamanho do hash de idempotência: SHA-256 em hex
-// minúsculo (T08).
+// minúsculo (ADR-010).
 const RequestHashLength = 64
 
 // --- Tipo ---------------------------------------------------------------------
@@ -248,7 +248,7 @@ func (s WagerStatus) IsTerminal() bool {
 func (s WagerStatus) String() string { return string(s) }
 
 // wagerStatusTransitions é a máquina de estados. PENDING_REFERENCE ->
-// PENDING_REFERENCE é o reagendamento do worker de referências (T21).
+// PENDING_REFERENCE é o reagendamento do worker de referências (ADR-023).
 // Estados terminais não têm saída.
 var wagerStatusTransitions = map[WagerStatus]map[WagerStatus]bool{
 	WagerStatusPending: {
@@ -474,7 +474,7 @@ type WagerTransaction struct {
 	failureCode            FailureCode
 	balanceAfter           Money // saldo devolvido ao provedor (replay)
 
-	// Retomada durável (T21).
+	// Retomada durável (ADR-023).
 	attempts      int32
 	nextAttemptAt time.Time
 
@@ -494,7 +494,7 @@ type NewExternalWagerTransactionParams struct {
 	ExternalTransactionID string
 	// IdempotencyKey é a chave recebida, usada como está (sem substituição).
 	IdempotencyKey string
-	// RequestHash é o SHA-256 hex minúsculo do JSON canônico (T08).
+	// RequestHash é o SHA-256 hex minúsculo do JSON canônico (ADR-010).
 	RequestHash string
 	WalletID    uuid.UUID
 	PlayerID    uuid.UUID
@@ -551,7 +551,7 @@ type NewOpeningWagerTransactionParams struct {
 	ID       uuid.UUID
 	WalletID uuid.UUID
 	PlayerID uuid.UUID
-	// Amount é o saldo inicial (> 0). Saldo zero não cria OPENING (T14).
+	// Amount é o saldo inicial (> 0). Saldo zero não cria OPENING (ADR-016).
 	Amount Money
 	Now    time.Time
 }
@@ -831,7 +831,7 @@ func (t *WagerTransaction) validateFailureCode(status WagerStatus, code FailureC
 	return nil
 }
 
-// validateScheduling valida attempts/nextAttemptAt (retomada durável, T21).
+// validateScheduling valida attempts/nextAttemptAt (retomada durável, ADR-023).
 func (t *WagerTransaction) validateScheduling() error {
 	if t.attempts < 0 {
 		return fmt.Errorf("%w: negative attempts %d", ErrInvalidWagerTransaction, t.attempts)
@@ -841,7 +841,7 @@ func (t *WagerTransaction) validateScheduling() error {
 	//     OPENING nunca têm attempts > 0);
 	//   - não existe em PENDING, porque só MarkPendingReference/
 	//     RescheduleReferenceRetry incrementam e não há aresta de volta para
-	//     PENDING. A retomada de PENDING órfão (T21) usa apenas nextAttemptAt e
+	//     PENDING. A retomada de PENDING órfão (ADR-023) usa apenas nextAttemptAt e
 	//     não consome attempts.
 	if t.attempts > 0 {
 		if t.referenceExternalTransactionID == "" {
@@ -867,7 +867,7 @@ func (t *WagerTransaction) validateScheduling() error {
 			return fmt.Errorf("%w: terminal transaction must not be scheduled", ErrInvalidWagerTransaction)
 		}
 	}
-	// PENDING pode ter nextAttemptAt (retomada de PENDING órfão, T21).
+	// PENDING pode ter nextAttemptAt (retomada de PENDING órfão, ADR-023).
 	if !t.nextAttemptAt.IsZero() && t.nextAttemptAt.Before(t.createdAt) {
 		return fmt.Errorf("%w: nextAttemptAt before createdAt", ErrInvalidWagerTransaction)
 	}
@@ -896,7 +896,7 @@ func (t *WagerTransaction) validateTimestamps() error {
 
 // validateWagerIdentifier exige identificador não vazio, até
 // MaxWagerIdentifierLength bytes, sem espaços nas bordas e sem caracteres de
-// controle. Não normalizamos (trim/caixa): a mesma string entra no hash (T08) e
+// controle. Não normalizamos (trim/caixa): a mesma string entra no hash (ADR-010) e
 // nas chaves únicas do banco.
 func validateWagerIdentifier(name, v string) error {
 	if v == "" {
@@ -956,7 +956,7 @@ func (t *WagerTransaction) MarkProcessed(p MarkWagerProcessedParams) error {
 // MarkWagerPendingReferenceParams agrupa o agendamento da espera por referência.
 type MarkWagerPendingReferenceParams struct {
 	// NextAttemptAt é quando o worker deve tentar resolver a referência
-	// (backoff calculado pela aplicação, T21). Deve ser >= Now.
+	// (backoff calculado pela aplicação, ADR-023). Deve ser >= Now.
 	NextAttemptAt time.Time
 	Now           time.Time
 }
@@ -1043,7 +1043,7 @@ func (t *WagerTransaction) Fail(p FailWagerParams) error {
 // FAILED, e code precisa ser um código conhecido da categoria INFRASTRUCTURE.
 // Existe para o único caso em que a transação não pode ser reidratada (linha
 // persistida que viola as invariantes do domínio, ErrCorruptedWagerTransaction):
-// o worker de pendências (T30, ADR-031) ainda precisa encerrá-la como FAILED
+// o worker de pendências (ADR-031) ainda precisa encerrá-la como FAILED
 // RETRIES_EXHAUSTED, e a regra da transição continua sendo do domínio. Com o
 // agregado em mãos, use Fail (que aplica esta mesma regra e revalida todas as
 // invariantes).
